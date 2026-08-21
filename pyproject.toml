@@ -1,0 +1,23 @@
+[project]
+name = "concord"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "D4vtz", email = "davidtorrezreyes@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "platformdirs>=4.11.3",
+    "questionary>=2.1.1",
+    "rich>=15.0.0",
+    "tomli-w>=1.2.0",
+    "typer>=0.27.1",
+]
+
+[project.scripts]
+concord = "concord.cli.app:app"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
