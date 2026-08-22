@@ -8,10 +8,10 @@ import shutil
 class TargetManager:
     def __init__(self) -> None:
         self.database = Database()
+        self.database.initialize()
         self.repository = RepositoryManager()
 
     def save(self, target: Target) -> None:
-        self.database.initialize()
         with self.database.connect() as connection:
             cursor = connection.cursor()
             cursor.execute(
@@ -65,7 +65,8 @@ class TargetManager:
                 follow_symlinks=False,
             )
 
-    def add(self, local_path: Path) -> None:
+    def add(self, local_path: Path) -> Target:
         target = Target(local_path)
         self.replicate_target(target)
         self.save(target)
+        return target
