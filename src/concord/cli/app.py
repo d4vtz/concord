@@ -1,7 +1,7 @@
 import typer
-
+from pathlib import Path
 from concord.application.initializer import Initializer
-from concord.application.target import TargetManager
+from concord.application.target_manager import TargetManager
 
 app = typer.Typer()
 commands = typer.Typer()
@@ -22,4 +22,4 @@ def add(path):
     """Add target Concord."""
 
     targetmanager = TargetManager()
-    targetmanager.add(path)
+    targetmanager.add(Path(path))

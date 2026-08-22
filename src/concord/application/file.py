@@ -10,4 +10,4 @@ class File:
 
     @property
     def relative_path(self) -> Path:
-        return self.local_path.relative_to(self.target_path)
+        return self.local_path.relative_to(Path.home())
