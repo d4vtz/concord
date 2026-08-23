@@ -3,13 +3,23 @@ from concord.application.target import Target, TargetType
 from concord.application.repository import RepositoryManager
 from pathlib import Path
 import shutil
+from rich.console import Console
+from rich.panel import Panel
 
 
 class TargetManager:
-    def __init__(self) -> None:
-        self.database = Database()
+    def __init__(
+        self,
+        database: Database | None = None,
+        repository: RepositoryManager | None = None,
+    ) -> None:
+        if database is None:
+            database = Database()
+        if repository is None:
+            repository = RepositoryManager()
+        self.database = database
+        self.repository = repository
         self.database.initialize()
-        self.repository = RepositoryManager()
 
     def save(self, target: Target) -> None:
         with self.database.connect() as connection:
@@ -52,7 +62,6 @@ class TargetManager:
 
         for file in target.get_files():
             destination = target_path / file.relative_path
-            print(destination)
             print(file.relative_path)
             destination.parent.mkdir(
                 parents=True,
@@ -65,8 +74,18 @@ class TargetManager:
                 follow_symlinks=False,
             )
 
-    def add(self, local_path: Path) -> Target:
-        target = Target(local_path)
-        self.replicate_target(target)
-        self.save(target)
-        return target
+    def add(self, local_path: Path) -> Target | None:
+        try:
+            target = Target(local_path)
+            self.replicate_target(target)
+            self.save(target)
+            return target
+        except ValueError:
+            console = Console()
+            console.print(
+                Panel(
+                    "Usar un path dentro de home.",
+                    title="CONCORD",
+                    expand=False,
+                )
+            )
