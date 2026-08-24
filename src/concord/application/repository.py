@@ -1,4 +1,5 @@
 from pathlib import Path
+
 from concord.application.config import ConfigManager
 
 

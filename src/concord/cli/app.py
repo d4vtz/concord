@@ -1,5 +1,7 @@
-import typer
 from pathlib import Path
+
+import typer
+
 from concord.application.initializer import Initializer
 from concord.application.target_manager import TargetManager
 

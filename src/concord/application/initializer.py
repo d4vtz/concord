@@ -1,7 +1,7 @@
 from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
-
 
 from concord import application as concord
 from concord.application.config import ConfigManager

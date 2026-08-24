@@ -1,10 +1,12 @@
-from concord.application.database import Database
-from concord.application.target import Target, TargetType
-from concord.application.repository import RepositoryManager
-from pathlib import Path
 import shutil
+from pathlib import Path
+
 from rich.console import Console
 from rich.panel import Panel
+
+from concord.application.database import Database
+from concord.application.repository import RepositoryManager
+from concord.application.target import Target, TargetType
 
 
 class TargetManager:

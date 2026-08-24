@@ -1,6 +1,7 @@
-from concord import application as concord
 import sqlite3
 from pathlib import Path
+
+from concord import application as concord
 
 
 class Database:

@@ -1,8 +1,10 @@
-from concord.application.target import Target, TargetType
-from concord.application.file import File
-from pathlib import Path
-import pytest
 from datetime import datetime, timezone
+from pathlib import Path
+
+import pytest
+
+from concord.application.file import File
+from concord.application.target import Target, TargetType
 
 
 def test_resolve_path(tmp_path):

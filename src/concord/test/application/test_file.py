@@ -1,6 +1,8 @@
-from concord.application.file import File
 from pathlib import Path
+
 import pytest
+
+from concord.application.file import File
 
 
 def test_target_id(tmp_path):

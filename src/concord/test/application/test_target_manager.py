@@ -1,6 +1,6 @@
-from concord.application.target_manager import TargetManager
 from concord.application.database import Database
 from concord.application.repository import RepositoryManager
+from concord.application.target_manager import TargetManager
 
 
 def test_add_file(tmp_path):
