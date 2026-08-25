@@ -26,6 +26,8 @@ concord add ~/.bashrc
 concord add ~/.config/nvim --name nvim
 concord list
 concord status
+concord diff              # compara todos los targets
+concord diff nvim         # compara un target sin modificar nada
 concord sync              # todos los targets
 concord sync nvim         # solo uno
 concord restore nvim      # exige que la ruta local no exista
@@ -90,6 +92,21 @@ eliminarse.
 - `modified`: hay cambios locales pendientes de `sync`.
 - `missing`: la ruta local ya no existe y puede recuperarse con `restore`.
 - `untracked`: falta la copia almacenada en el repositorio.
+
+## Revisar cambios antes de sincronizar
+
+`concord diff [target]` compara `$HOME` con el repositorio desde la perspectiva
+de `sync`. Informa qué rutas serían agregadas, modificadas o eliminadas:
+
+```text
+● Modificado  .config/nvim/init.lua
++ Agregado    .config/nvim/lua/plugins.lua
+− Eliminado   .config/nvim/lua/old.lua
+```
+
+Sin argumento compara todos los targets. El comando es de solo lectura: no
+copia archivos ni cambia `updated_at`. También compara el destino de los enlaces
+simbólicos y detecta directorios vacíos.
 
 ## Desarrollo
 

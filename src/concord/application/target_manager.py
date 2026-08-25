@@ -1,4 +1,5 @@
 import filecmp
+import os
 import shutil
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,6 +17,22 @@ from concord.application.target import Target, TargetType
 class TargetStatus:
     name: str
     state: str
+
+
+@dataclass(frozen=True)
+class DiffEntry:
+    state: str
+    relative_path: Path
+
+
+@dataclass(frozen=True)
+class TargetDiff:
+    name: str
+    entries: list[DiffEntry]
+
+    @property
+    def clean(self) -> bool:
+        return not self.entries
 
 
 class TargetManager:
@@ -262,6 +279,50 @@ class TargetManager:
                 state = "clean" if self._directories_equal(filecmp.dircmp(target.local_path, copy)) else "modified"
             result.append(TargetStatus(target.name, state))
         return result
+
+    def diff(self, name: str | None = None) -> list[TargetDiff]:
+        targets = [self.get(name)] if name else self.list()
+        return [self._target_diff(target) for target in targets]
+
+    def _target_diff(self, target: Target) -> TargetDiff:
+        local = self._snapshot(target.local_path)
+        stored = self._snapshot(self._destination(target))
+        entries: list[DiffEntry] = []
+        display_root = target.local_path.relative_to(Path.home())
+        for relative_path in sorted(local.keys() | stored.keys(), key=str):
+            display_path = display_root if relative_path == Path(".") else display_root / relative_path
+            if relative_path not in stored:
+                state = "added"
+            elif relative_path not in local:
+                state = "deleted"
+            elif not self._paths_equal(local[relative_path], stored[relative_path]):
+                state = "modified"
+            else:
+                continue
+            entries.append(DiffEntry(state=state, relative_path=display_path))
+        return TargetDiff(name=target.name, entries=entries)
+
+    def _snapshot(self, root: Path) -> dict[Path, Path]:
+        if not os.path.lexists(root):
+            return {}
+        if root.is_symlink() or root.is_file():
+            return {Path("."): root}
+        entries: dict[Path, Path] = {}
+        for path in root.rglob("*"):
+            if path.is_symlink() or path.is_file():
+                entries[path.relative_to(root)] = path
+            elif path.is_dir() and not any(path.iterdir()):
+                entries[path.relative_to(root)] = path
+        if not entries:
+            entries[Path(".")] = root
+        return entries
+
+    def _paths_equal(self, left: Path, right: Path) -> bool:
+        if left.is_symlink() or right.is_symlink():
+            return left.is_symlink() and right.is_symlink() and left.readlink() == right.readlink()
+        if left.is_dir() or right.is_dir():
+            return left.is_dir() and right.is_dir()
+        return left.is_file() and right.is_file() and filecmp.cmp(left, right, shallow=False)
 
     def _directories_equal(self, comparison: filecmp.dircmp) -> bool:
         if comparison.left_only or comparison.right_only or comparison.diff_files or comparison.funny_files:

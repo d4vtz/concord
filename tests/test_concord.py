@@ -222,3 +222,56 @@ def test_database_migrates_updated_at_column(tmp_path):
             "SELECT created_at, updated_at FROM targets WHERE id = '1'"
         ).fetchone()
     assert row == ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00")
+
+
+def test_diff_reports_added_modified_and_deleted_files(manager):
+    instance, home, _ = manager
+    source = home / ".config/nvim"
+    source.mkdir(parents=True)
+    (source / "modified.lua").write_text("before")
+    (source / "deleted.lua").write_text("delete me")
+    instance.add(source, "nvim")
+
+    (source / "modified.lua").write_text("after")
+    (source / "deleted.lua").unlink()
+    (source / "added.lua").write_text("new")
+
+    result = instance.diff("nvim")[0]
+
+    assert {(entry.state, entry.relative_path.as_posix()) for entry in result.entries} == {
+        ("added", ".config/nvim/added.lua"),
+        ("modified", ".config/nvim/modified.lua"),
+        ("deleted", ".config/nvim/deleted.lua"),
+    }
+
+
+def test_diff_is_read_only_and_clean_after_sync(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("one")
+    instance.add(source, "bash")
+    before = instance.get("bash").updated_at
+
+    assert instance.diff("bash")[0].clean
+    assert instance.get("bash").updated_at == before
+    source.write_text("two")
+    assert not instance.diff("bash")[0].clean
+    assert instance.get("bash").updated_at == before
+    instance.sync("bash")
+    assert instance.diff("bash")[0].clean
+
+
+def test_diff_detects_changed_symbolic_link(manager):
+    instance, home, _ = manager
+    source = home / ".config/example"
+    source.mkdir(parents=True)
+    link = source / "current"
+    link.symlink_to("first")
+    instance.add(source, "example")
+
+    link.unlink()
+    link.symlink_to("second")
+
+    entry = instance.diff("example")[0].entries[0]
+    assert entry.state == "modified"
+    assert entry.relative_path == Path(".config/example/current")
