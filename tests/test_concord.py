@@ -1,12 +1,14 @@
 from pathlib import Path
 
 import pytest
+from typer.testing import CliRunner
 
 from concord.application.config import Config
 from concord.application.database import Database
 from concord.application.initializer import Initializer
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
+from concord.cli.app import app
 
 
 @pytest.fixture
@@ -101,3 +103,15 @@ def test_init_does_not_load_configuration_before_creating_it(tmp_path, monkeypat
     assert concord.config_file.exists()
     assert concord.database_file.exists()
     assert repository.is_dir()
+
+
+def test_uninitialized_command_shows_helpful_error_without_traceback(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    monkeypatch.setattr(concord, "config_file", tmp_path / "missing.toml")
+    result = CliRunner().invoke(app, ["list"])
+
+    assert result.exit_code == 1
+    assert "todavía no está inicializado" in result.output
+    assert "concord init" in result.output
+    assert "Traceback" not in result.output

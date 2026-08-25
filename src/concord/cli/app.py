@@ -1,71 +1,168 @@
 from pathlib import Path
 
 import typer
-from rich.console import Console
+from rich import box
 from rich.table import Table
 
 from concord import application as concord
+from concord.application.config import ConfigManager
 from concord.application.initializer import Initializer
 from concord.application.target_manager import TargetManager
+from concord.cli.ui import console, details, execute, heading, success, warning
 
-app = typer.Typer(no_args_is_help=True, help="Gestiona y respalda tus dotfiles.")
-console = Console()
+app = typer.Typer(
+    no_args_is_help=True,
+    rich_markup_mode="rich",
+    help="[bold #88C0D0]Concord[/] — gestiona y respalda tus dotfiles.",
+)
 
 
 def manager() -> TargetManager:
     if not concord.is_initialized():
-        raise typer.BadParameter("Concord no está inicializado. Ejecute: concord init")
+        raise ValueError("Concord todavía no está inicializado.")
     return TargetManager()
 
 
 @app.command()
 def init() -> None:
-    """Inicializa la configuración, el repositorio y la base de datos."""
-    Initializer().initialize()
+    """Prepara la configuración, el repositorio y la base de datos."""
+    heading("INICIALIZACIÓN", "Preparando el espacio de trabajo de tus dotfiles")
+    created = Initializer().initialize()
+    config = ConfigManager().load()
+    if not created:
+        warning("Concord ya estaba inicializado; no se modificó la configuración.")
+    details(
+        [
+            ("Configuración", str(concord.config_file)),
+            ("Base de datos", str(concord.database_file)),
+            ("Repositorio", str(config.repository_path)),
+        ],
+        title="Rutas activas",
+    )
+    success("Concord está listo para usarse.", hint="Agrega tu primer target con: concord add <ruta>")
 
 
 @app.command()
-def add(path: Path, name: str | None = typer.Option(None, "--name", "-n", help="Nombre único del target.")) -> None:
+def add(
+    path: Path,
+    name: str | None = typer.Option(None, "--name", "-n", help="Nombre único del target."),
+) -> None:
     """Registra un archivo o directorio y crea su primera copia."""
-    target = manager().add(path, name=name)
-    console.print(f"[green]Agregado:[/green] {target.name} → {target.local_path}")
+    heading("NUEVO TARGET", "Registrando una configuración en Concord")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    target = execute(
+        lambda: target_manager.add(path, name=name),
+        hint="Usa una ruta existente dentro de HOME y un nombre que no esté registrado.",
+    )
+    destination = target_manager.repository.target_path(target.name) / target.local_path.relative_to(Path.home())
+    details(
+        [
+            ("Nombre", target.name),
+            ("Tipo", "directorio" if target.local_path.is_dir() else "archivo"),
+            ("Origen", str(target.local_path)),
+            ("Copia", str(destination)),
+            ("Archivos", str(len(target.get_files()))),
+        ],
+        title="Target registrado",
+    )
+    success(f"'{target.name}' fue agregado correctamente.", hint=f"Comprueba su estado con: concord status")
 
 
 @app.command("list")
 def list_targets() -> None:
-    """Muestra los targets registrados."""
-    table = Table("Nombre", "Tipo", "Ruta local")
-    for target in manager().list():
-        table.add_row(target.name, target.type.value, str(target.local_path))
+    """Muestra los targets registrados y sus rutas."""
+    heading("TARGETS", "Configuraciones administradas por Concord")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    targets = target_manager.list()
+    if not targets:
+        warning("No hay targets registrados.")
+        console.print("  [concord.muted]Agrega uno con:[/] concord add <ruta>")
+        return
+    table = Table(box=box.ROUNDED, border_style="#4C566A", header_style="bold #88C0D0")
+    table.add_column("Nombre", style="bold #D8DEE9")
+    table.add_column("Tipo")
+    table.add_column("Ruta local", style="concord.path")
+    table.add_column("Repositorio", style="concord.muted")
+    for target in targets:
+        table.add_row(
+            target.name,
+            "directorio" if target.local_path.is_dir() else "archivo",
+            str(target.local_path),
+            str(target_manager.repository.target_path(target.name)),
+        )
     console.print(table)
+    console.print(f"[concord.muted]Total:[/] {len(targets)} target(s)")
 
 
 @app.command()
 def status() -> None:
-    """Compara los archivos locales con el repositorio."""
-    colors = {"clean": "green", "modified": "yellow", "missing": "red", "untracked": "red"}
-    table = Table("Target", "Estado")
-    for item in manager().status():
-        table.add_row(item.name, f"[{colors[item.state]}]{item.state}[/]")
+    """Compara los archivos locales con sus copias del repositorio."""
+    heading("ESTADO", "Comparando HOME con el repositorio de Concord")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    items = target_manager.status()
+    if not items:
+        warning("No hay targets que comprobar.")
+        return
+    labels = {
+        "clean": ("✓ Sin cambios", "#A3BE8C"),
+        "modified": ("● Modificado", "#EBCB8B"),
+        "missing": ("× Falta local", "#BF616A"),
+        "untracked": ("× Falta copia", "#BF616A"),
+    }
+    table = Table(box=box.ROUNDED, border_style="#4C566A", header_style="bold #88C0D0")
+    table.add_column("Target", style="bold #D8DEE9")
+    table.add_column("Estado")
+    table.add_column("Acción sugerida", style="concord.muted")
+    hints = {"clean": "Ninguna", "modified": "concord sync <target>", "missing": "concord restore <target>", "untracked": "concord sync <target>"}
+    for item in items:
+        label, color = labels[item.state]
+        table.add_row(item.name, f"[{color}]{label}[/]", hints[item.state])
     console.print(table)
+    clean = sum(item.state == "clean" for item in items)
+    success(f"Comprobación terminada: {clean}/{len(items)} target(s) sin cambios.")
 
 
 @app.command()
-def sync(name: str | None = typer.Argument(None)) -> None:
+def sync(name: str | None = typer.Argument(None, help="Target concreto; omítelo para sincronizar todos.")) -> None:
     """Actualiza uno o todos los targets desde HOME al repositorio."""
-    targets = manager().sync(name)
-    console.print(f"[green]Sincronizados:[/green] {len(targets)}")
+    heading("SINCRONIZACIÓN", "Copiando cambios locales al repositorio")
+    targets = execute(lambda: manager().sync(name), hint="Consulta los nombres disponibles con: concord list")
+    for target in targets:
+        console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {target.local_path}[/]")
+    success(f"Se sincronizaron {len(targets)} target(s).", hint="Verifica el resultado con: concord status")
 
 
 @app.command()
-def restore(name: str, force: bool = typer.Option(False, "--force", "-f", help="Reemplaza el archivo local existente.")) -> None:
+def restore(
+    name: str,
+    force: bool = typer.Option(False, "--force", "-f", help="Reemplaza la ruta local existente."),
+) -> None:
     """Restaura un target del repositorio a HOME."""
-    target = manager().restore(name, force=force)
-    console.print(f"[green]Restaurado:[/green] {target.local_path}")
+    heading("RESTAURACIÓN", "Recuperando una configuración desde el repositorio")
+    target = execute(
+        lambda: manager().restore(name, force=force),
+        hint="Si la ruta local ya existe y quieres reemplazarla, agrega --force.",
+    )
+    details([("Target", target.name), ("Destino", str(target.local_path))], title="Restauración completada")
+    success(f"'{target.name}' fue restaurado correctamente.")
 
 
 @app.command()
-def remove(name: str, keep_repository: bool = typer.Option(False, "--keep-repository", help="Conserva la copia del repositorio.")) -> None:
-    """Deja de gestionar un target; no borra el archivo local."""
-    manager().remove(name, keep_repository=keep_repository)
-    console.print(f"[green]Eliminado:[/green] {name}")
+def remove(
+    name: str,
+    keep_repository: bool = typer.Option(False, "--keep-repository", help="Conserva la copia del repositorio."),
+) -> None:
+    """Deja de gestionar un target sin borrar su archivo local."""
+    heading("ELIMINAR TARGET", "Quitando una configuración del registro de Concord")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    target = execute(lambda: target_manager.get(name), hint="Consulta los nombres disponibles con: concord list")
+    execute(lambda: target_manager.remove(name, keep_repository=keep_repository))
+    details(
+        [
+            ("Target", name),
+            ("Archivo local", f"conservado en {target.local_path}"),
+            ("Copia", "conservada" if keep_repository else "eliminada"),
+        ],
+        title="Resultado",
+    )
+    success(f"Concord dejó de administrar '{name}'.")
