@@ -1,12 +1,12 @@
 [project]
 name = "concord"
-version = "0.1.0"
-description = "Add your description here"
+version = "1.0.0"
+description = "Un gestor de dotfiles simple, explícito y seguro"
 readme = "README.md"
 authors = [
     { name = "D4vtz", email = "davidtorrezreyes@gmail.com" }
 ]
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "platformdirs>=4.11.3",
     "questionary>=2.1.1",
@@ -27,3 +27,6 @@ dev = [
     "isort>=8.0.1",
     "pytest>=9.1.1",
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

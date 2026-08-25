@@ -3,13 +3,13 @@ from rich.panel import Panel
 
 from concord import application as concord
 from concord.application.config import ConfigManager
+from concord.application.database import Database
 from concord.application.repository import RepositoryManager
 
 
 class Initializer:
     def __init__(self) -> None:
         self.config_manager = ConfigManager()
-        self.repository_manager = RepositoryManager()
 
     def initialize(self) -> None:
         if concord.is_initialized():
@@ -17,8 +17,10 @@ class Initializer:
             return
 
         config = self.config_manager.request_configuration()
-        self.repository_manager.create(path=config.repository_path)
+        repository_manager = RepositoryManager(config.repository_path)
+        repository_manager.create(path=config.repository_path)
         self.config_manager.save(config)
+        Database().initialize()
 
     def _already_initialized(self) -> None:
         console = Console()

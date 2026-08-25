@@ -11,6 +11,7 @@ class Database:
         self.database_path = database_path
 
     def connect(self) -> sqlite3.Connection:
+        self.database_path.parent.mkdir(parents=True, exist_ok=True)
         return sqlite3.connect(self.database_path)
 
     def initialize(self) -> None:
@@ -22,5 +23,13 @@ class Database:
                     local_path TEXT NOT NULL,
                     type TEXT NOT NULL,
                     created_at TEXT NOT NULL
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS files (
+                    target_id TEXT NOT NULL,
+                    relative_path TEXT NOT NULL,
+                    PRIMARY KEY (target_id, relative_path),
+                    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE
                 )
                 """)

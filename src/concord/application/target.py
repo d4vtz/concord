@@ -12,12 +12,18 @@ class TargetType(Enum):
 
 
 class Target:
-    def __init__(self, local_path: Path, name: str | None = None) -> None:
+    def __init__(self, local_path: Path, name: str | None = None, *, target_id: str | None = None, created_at: datetime | None = None, target_type: TargetType | None = None) -> None:
         self.local_path = local_path.expanduser().resolve()
-        self.created_at = datetime.now(UTC)
-        self.type = self._type
-        self.id = str(uuid.uuid4())
+        try:
+            self.local_path.relative_to(Path.home().resolve())
+        except ValueError as error:
+            raise ValueError("El target debe estar dentro de HOME.") from error
+        self.created_at = created_at or datetime.now(UTC)
+        self.type = target_type or self._type
+        self.id = target_id or str(uuid.uuid4())
         self.name = name or self._default_name
+        if not self.name or self.name in {".", ".."} or "/" in self.name or "\\" in self.name:
+            raise ValueError("El nombre del target no es válido.")
 
     @property
     def _default_name(self) -> str:
@@ -38,6 +44,8 @@ class Target:
             return TargetType.FILE
 
     def get_files(self) -> list[File]:
+        if self.type is TargetType.FILE:
+            return [File(self.id, self.local_path, self.local_path)]
         files = []
         for path in self.local_path.rglob("*"):
             if path.is_file():

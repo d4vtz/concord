@@ -1,3 +1,4 @@
+import shutil
 from pathlib import Path
 
 from concord.application.config import ConfigManager
@@ -11,3 +12,11 @@ class RepositoryManager:
 
     def create(self, path: Path) -> None:
         path.mkdir(parents=True, exist_ok=True)
+
+    def target_path(self, name: str) -> Path:
+        return self.repository_path / name
+
+    def remove(self, name: str) -> None:
+        path = self.target_path(name)
+        if path.exists():
+            shutil.rmtree(path)
