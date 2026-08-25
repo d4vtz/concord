@@ -24,10 +24,17 @@ def manager() -> TargetManager:
 
 
 @app.command()
-def init() -> None:
+def init(
+    repository: Path | None = typer.Option(
+        None,
+        "--repository",
+        "-r",
+        help="Repositorio existente o ruta donde se creará uno nuevo.",
+    ),
+) -> None:
     """Prepara la configuración, el repositorio y la base de datos."""
     heading("INICIALIZACIÓN", "Preparando el espacio de trabajo de tus dotfiles")
-    created = Initializer().initialize()
+    created = execute(lambda: Initializer().initialize(repository))
     config = ConfigManager().load()
     if not created:
         warning("Concord ya estaba inicializado; no se modificó la configuración.")
@@ -134,17 +141,48 @@ def sync(name: str | None = typer.Argument(None, help="Target concreto; omítelo
 
 @app.command()
 def restore(
-    name: str,
+    name: str | None = typer.Argument(None, help="Target que se restaurará."),
+    all_targets: bool = typer.Option(False, "--all", "-a", help="Restaura todos los targets del manifiesto."),
     force: bool = typer.Option(False, "--force", "-f", help="Reemplaza la ruta local existente."),
 ) -> None:
     """Restaura un target del repositorio a HOME."""
     heading("RESTAURACIÓN", "Recuperando una configuración desde el repositorio")
+    if (name is None) == (not all_targets):
+        execute(lambda: (_ for _ in ()).throw(ValueError("Indique un target o use --all, pero no ambos.")))
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    if all_targets:
+        targets = execute(
+            lambda: target_manager.restore_all(force=force),
+            hint="Usa --force si deseas reemplazar configuraciones locales existentes.",
+        )
+        for target in targets:
+            console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]→ {target.local_path}[/]")
+        success(f"Se restauraron {len(targets)} target(s).")
+        return
     target = execute(
-        lambda: manager().restore(name, force=force),
+        lambda: target_manager.restore(name, force=force),
         hint="Si la ruta local ya existe y quieres reemplazarla, agrega --force.",
     )
     details([("Target", target.name), ("Destino", str(target.local_path))], title="Restauración completada")
     success(f"'{target.name}' fue restaurado correctamente.")
+
+
+@app.command("import")
+def import_targets(
+    replace: bool = typer.Option(False, "--replace", help="Reconstruye una base de datos que ya contiene targets."),
+) -> None:
+    """Reconstruye SQLite usando los targets declarados en concord.toml."""
+    heading("IMPORTAR MANIFIESTO", "Reconstruyendo el índice local desde concord.toml")
+    targets = execute(
+        lambda: manager().import_manifest(replace=replace),
+        hint="Usa --replace para reemplazar el índice local actual.",
+    )
+    for target in targets:
+        console.print(
+            f"[concord.success]✓[/] {target.name}  "
+            f"[concord.muted]→ {target.local_path.relative_to(Path.home())}[/]"
+        )
+    success(f"Se importaron {len(targets)} target(s).", hint="Restaura tus archivos con: concord restore --all")
 
 
 @app.command()
