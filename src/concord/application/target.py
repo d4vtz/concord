@@ -12,18 +12,22 @@ class TargetType(Enum):
 
 
 class Target:
-    def __init__(self, local_path: Path, name: str | None = None, *, target_id: str | None = None, created_at: datetime | None = None, target_type: TargetType | None = None) -> None:
+    def __init__(self, local_path: Path, name: str | None = None, *, target_id: str | None = None, created_at: datetime | None = None, updated_at: datetime | None = None, target_type: TargetType | None = None) -> None:
         self.local_path = local_path.expanduser().resolve()
         try:
             self.local_path.relative_to(Path.home().resolve())
         except ValueError as error:
             raise ValueError("El target debe estar dentro de HOME.") from error
         self.created_at = created_at or datetime.now(UTC)
+        self.updated_at = updated_at or self.created_at
         self.type = target_type or self._type
         self.id = target_id or str(uuid.uuid4())
         self.name = name or self._default_name
         if not self.name or self.name in {".", ".."} or "/" in self.name or "\\" in self.name:
             raise ValueError("El nombre del target no es válido.")
+
+    def touch(self) -> None:
+        self.updated_at = datetime.now(UTC)
 
     @property
     def _default_name(self) -> str:

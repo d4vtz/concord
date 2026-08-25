@@ -1,3 +1,4 @@
+from datetime import UTC, datetime
 from pathlib import Path
 
 from concord import application as concord
@@ -33,12 +34,15 @@ class Initializer:
 
         repository = RepositoryManager(config.repository_path)
         repository.create(config.repository_path)
+        now = datetime.now(UTC)
         self.config_manager.register(
             config,
             TargetConfig(
                 name=CONCORD_TARGET,
                 relative_path=concord.config_dir.relative_to(Path.home()),
                 type="directory",
+                created_at=now,
+                updated_at=now,
             ),
         )
         self.config_manager.save(config)

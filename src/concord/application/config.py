@@ -1,5 +1,6 @@
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
 import questionary
@@ -17,6 +18,8 @@ class TargetConfig:
     name: str
     relative_path: Path
     type: str
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
 
 
 @dataclass
@@ -55,6 +58,16 @@ class ConfigManager:
                     "name": target.name,
                     "relative_path": target.relative_path.as_posix(),
                     "type": target.type,
+                    **(
+                        {"created_at": target.created_at.isoformat()}
+                        if target.created_at
+                        else {}
+                    ),
+                    **(
+                        {"updated_at": target.updated_at.isoformat()}
+                        if target.updated_at
+                        else {}
+                    ),
                 }
                 for target in config.targets
             ],
@@ -76,6 +89,8 @@ class ConfigManager:
                 name=item["name"],
                 relative_path=Path(item["relative_path"]),
                 type=item["type"],
+                created_at=(datetime.fromisoformat(item["created_at"]) if item.get("created_at") else None),
+                updated_at=(datetime.fromisoformat(item["updated_at"]) if item.get("updated_at") else None),
             )
             for item in settings.get("targets", [])
         ]

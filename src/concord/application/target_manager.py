@@ -55,8 +55,22 @@ class TargetManager:
     def _save_row(self, target: Target) -> None:
         with self.database.connect() as connection:
             connection.execute(
-                "INSERT INTO targets (id, name, local_path, type, created_at) VALUES (?, ?, ?, ?, ?)",
-                (target.id, target.name, str(target.local_path), target.type.value, target.created_at.isoformat()),
+                "INSERT INTO targets (id, name, local_path, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    target.id,
+                    target.name,
+                    str(target.local_path),
+                    target.type.value,
+                    target.created_at.isoformat(),
+                    target.updated_at.isoformat(),
+                ),
+            )
+
+    def _update_timestamp(self, target: Target) -> None:
+        with self.database.connect() as connection:
+            connection.execute(
+                "UPDATE targets SET updated_at = ? WHERE id = ?",
+                (target.updated_at.isoformat(), target.id),
             )
 
     def _manifest_target(self, target: Target) -> TargetConfig:
@@ -64,14 +78,22 @@ class TargetManager:
             name=target.name,
             relative_path=target.local_path.relative_to(Path.home()),
             type=target.type.value,
+            created_at=target.created_at,
+            updated_at=target.updated_at,
         )
 
     def _persist_manifest(self) -> None:
         config = self.config_manager.load()
+        try:
+            concord_target = self.get(CONCORD_TARGET)
+        except KeyError:
+            concord_target = None
+        if concord_target is not None:
+            concord_target.touch()
+            self._update_timestamp(concord_target)
         config.targets = [self._manifest_target(target) for target in self.list()]
         config.targets.sort(key=lambda item: (item.name != CONCORD_TARGET, item.name))
         self.config_manager.save(config)
-        concord_target = next((target for target in self.list() if target.name == CONCORD_TARGET), None)
         if concord_target is not None:
             self._write_target(concord_target)
 
@@ -83,7 +105,10 @@ class TargetManager:
         if CONCORD_TARGET not in names:
             self._save_row(Target(concord.config_dir, CONCORD_TARGET))
             names.add(CONCORD_TARGET)
-        if not config.targets:
+        if not config.targets or any(
+            target.created_at is None or target.updated_at is None
+            for target in config.targets
+        ):
             self._persist_manifest()
         elif len(names) == 1 and len(config.targets) > 1:
             self.import_manifest(replace=True)
@@ -91,7 +116,7 @@ class TargetManager:
     def get(self, name: str) -> Target:
         with self.database.connect() as connection:
             row = connection.execute(
-                "SELECT id, name, local_path, type, created_at FROM targets WHERE name = ?", (name,)
+                "SELECT id, name, local_path, type, created_at, updated_at FROM targets WHERE name = ?", (name,)
             ).fetchone()
         if row is None:
             raise KeyError(f"No existe un target llamado '{name}'.")
@@ -101,12 +126,13 @@ class TargetManager:
             target_id=row[0],
             target_type=TargetType(row[3]),
             created_at=datetime.fromisoformat(row[4]),
+            updated_at=datetime.fromisoformat(row[5]),
         )
 
     def list(self) -> list[Target]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT id, name, local_path, type, created_at FROM targets ORDER BY CASE WHEN name = 'concord' THEN 0 ELSE 1 END, name"
+                "SELECT id, name, local_path, type, created_at, updated_at FROM targets ORDER BY CASE WHEN name = 'concord' THEN 0 ELSE 1 END, name"
             ).fetchall()
         return [
             Target(
@@ -115,6 +141,7 @@ class TargetManager:
                 target_id=row[0],
                 target_type=TargetType(row[3]),
                 created_at=datetime.fromisoformat(row[4]),
+                updated_at=datetime.fromisoformat(row[5]),
             )
             for row in rows
         ]
@@ -143,8 +170,9 @@ class TargetManager:
         targets = [self.get(name)] if name else self.list()
         for target in targets:
             self._write_target(target)
-        if name != CONCORD_TARGET:
-            self._write_target(self.get(CONCORD_TARGET))
+            target.touch()
+            self._update_timestamp(target)
+        self._persist_manifest()
         return targets
 
     def restore(self, name: str, *, force: bool = False) -> Target:
@@ -194,7 +222,8 @@ class TargetManager:
                     Path.home() / item.relative_path,
                     item.name,
                     target_type=TargetType(item.type),
-                    created_at=datetime.now(UTC),
+                    created_at=item.created_at or datetime.now(UTC),
+                    updated_at=item.updated_at or item.created_at or datetime.now(UTC),
                 )
             )
         with self.database.connect() as connection:
@@ -204,9 +233,16 @@ class TargetManager:
             connection.execute("DELETE FROM files")
             connection.execute("DELETE FROM targets")
             connection.executemany(
-                "INSERT INTO targets (id, name, local_path, type, created_at) VALUES (?, ?, ?, ?, ?)",
+                "INSERT INTO targets (id, name, local_path, type, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                 [
-                    (target.id, target.name, str(target.local_path), target.type.value, target.created_at.isoformat())
+                    (
+                        target.id,
+                        target.name,
+                        str(target.local_path),
+                        target.type.value,
+                        target.created_at.isoformat(),
+                        target.updated_at.isoformat(),
+                    )
                     for target in targets
                 ],
             )

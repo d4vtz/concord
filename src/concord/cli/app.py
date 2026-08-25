@@ -1,3 +1,4 @@
+from datetime import datetime
 from pathlib import Path
 
 import typer
@@ -21,6 +22,10 @@ def manager() -> TargetManager:
     if not concord.is_initialized():
         raise ValueError("Concord todavía no está inicializado.")
     return TargetManager()
+
+
+def format_date(value: datetime) -> str:
+    return value.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
 @app.command()
@@ -69,6 +74,8 @@ def add(
             ("Origen", str(target.local_path)),
             ("Copia", str(destination)),
             ("Archivos", str(len(target.get_files()))),
+            ("Creado", format_date(target.created_at)),
+            ("Actualizado", format_date(target.updated_at)),
         ],
         title="Target registrado",
     )
@@ -89,13 +96,15 @@ def list_targets() -> None:
     table.add_column("Nombre", style="bold #D8DEE9")
     table.add_column("Tipo")
     table.add_column("Ruta local", style="concord.path")
-    table.add_column("Repositorio", style="concord.muted")
+    table.add_column("Creado", style="concord.muted", no_wrap=True)
+    table.add_column("Actualizado", style="concord.muted", no_wrap=True)
     for target in targets:
         table.add_row(
             target.name,
             "directorio" if target.local_path.is_dir() else "archivo",
             str(target.local_path),
-            str(target_manager.repository.target_path(target.name)),
+            format_date(target.created_at),
+            format_date(target.updated_at),
         )
     console.print(table)
     console.print(f"[concord.muted]Total:[/] {len(targets)} target(s)")

@@ -169,6 +169,7 @@ def test_repository_bootstraps_a_new_home(tmp_path, monkeypatch):
     source = first_home / ".bashrc"
     source.write_text("alias ll='ls -lah'\n")
     TargetManager().add(source, "bash")
+    original = TargetManager().get("bash")
 
     configure_environment(second_home, monkeypatch)
     Initializer().initialize(repository)
@@ -177,3 +178,47 @@ def test_repository_bootstraps_a_new_home(tmp_path, monkeypatch):
     assert [target.name for target in restored] == ["bash"]
     assert (second_home / ".bashrc").read_text() == "alias ll='ls -lah'\n"
     assert ConfigManager().load().repository_path == repository.resolve()
+    imported = TargetManager().get("bash")
+    assert imported.created_at == original.created_at
+    assert imported.updated_at == original.updated_at
+
+
+def test_sync_updates_last_modification_without_changing_creation(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("one")
+    created = instance.add(source, "bash")
+    source.write_text("two")
+
+    instance.sync("bash")
+    synchronized = instance.get("bash")
+
+    assert synchronized.created_at == created.created_at
+    assert synchronized.updated_at > created.updated_at
+
+
+def test_database_migrates_updated_at_column(tmp_path):
+    database = Database(tmp_path / "legacy.db")
+    with database.connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE targets (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                local_path TEXT NOT NULL,
+                type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO targets VALUES ('1', 'bash', '/tmp/.bashrc', 'file', '2026-01-01T00:00:00+00:00')"
+        )
+
+    database.initialize()
+
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT created_at, updated_at FROM targets WHERE id = '1'"
+        ).fetchone()
+    assert row == ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00")

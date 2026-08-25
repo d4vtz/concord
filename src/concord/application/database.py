@@ -22,9 +22,18 @@ class Database:
                     name TEXT NOT NULL UNIQUE,
                     local_path TEXT NOT NULL,
                     type TEXT NOT NULL,
-                    created_at TEXT NOT NULL
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT
                 )
                 """)
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(targets)").fetchall()
+            }
+            if "updated_at" not in columns:
+                connection.execute("ALTER TABLE targets ADD COLUMN updated_at TEXT")
+            connection.execute(
+                "UPDATE targets SET updated_at = created_at WHERE updated_at IS NULL"
+            )
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS files (
                     target_id TEXT NOT NULL,

@@ -50,8 +50,8 @@ version = 1
 repository_path = "~/.local/share/concord/repository"
 
 targets = [
-    { name = "concord", relative_path = ".config/concord", type = "directory" },
-    { name = "nvim", relative_path = ".config/nvim", type = "directory" },
+    { name = "concord", relative_path = ".config/concord", type = "directory", created_at = "2026-08-25T12:00:00+00:00", updated_at = "2026-08-25T12:00:00+00:00" },
+    { name = "nvim", relative_path = ".config/nvim", type = "directory", created_at = "2026-08-25T12:05:00+00:00", updated_at = "2026-08-25T14:30:00+00:00" },
 ]
 ```
 
@@ -59,6 +59,10 @@ Concord se registra automáticamente como el primer target. Después de agregar
 o eliminar una configuración, actualiza el manifiesto y sincroniza su propia
 copia en `repository/concord/.config/concord/concord.toml`. La base SQLite es un
 índice local reconstruible, no la fuente de verdad.
+
+Cada target conserva `created_at`, la fecha en que fue registrado, y
+`updated_at`, la última vez que Concord lo sincronizó. `concord list` muestra
+ambas fechas en la zona horaria local.
 
 ## Recuperar configuraciones en otra máquina
 
