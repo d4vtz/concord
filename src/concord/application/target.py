@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 
@@ -12,12 +12,21 @@ class TargetType(Enum):
 
 
 class Target:
-    def __init__(self, local_path: Path) -> None:
+    def __init__(self, local_path: Path, name: str | None = None) -> None:
         self.local_path = local_path.expanduser().resolve()
-        self.created_at = datetime.now(timezone.utc)
+        self.created_at = datetime.now(UTC)
         self.type = self._type
         self.id = str(uuid.uuid4())
-        self.name = self.local_path.name
+        self.name = name or self._default_name
+
+    @property
+    def _default_name(self) -> str:
+        name = self.local_path.name
+
+        if name.startswith("."):
+            return f"dot_{name[1:]}"
+
+        return name
 
     @property
     def _type(self) -> TargetType:

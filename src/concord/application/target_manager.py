@@ -46,10 +46,22 @@ class TargetManager:
                 ),
             )
 
+    def exist_name(self, name: str) -> bool:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                """
+            SELECT name
+            FROM targets
+            WHERE name = ?
+            LIMIT 1
+            """,
+                (name,),
+            ).fetchone()
+        return row is not None
+
     def replicate_target(self, target: Target) -> None:
         target_path = self.repository.repository_path / target.name
         self.repository.create(target_path)
-        print(target_path)
 
         if target.type is TargetType.FILE:
             destination = target_path / target.local_path.name
@@ -64,7 +76,6 @@ class TargetManager:
 
         for file in target.get_files():
             destination = target_path / file.relative_path
-            print(file.relative_path)
             destination.parent.mkdir(
                 parents=True,
                 exist_ok=True,
@@ -76,9 +87,12 @@ class TargetManager:
                 follow_symlinks=False,
             )
 
-    def add(self, local_path: Path) -> Target | None:
+    def add(self, local_path: Path, name: str | None = None) -> Target | None:
+        target = Target(local_path, name)
+        if self.exist_name(target.name):
+            raise ValueError(f"Ya existe un target llamado '{target.name}'.")
+
         try:
-            target = Target(local_path)
             self.replicate_target(target)
             self.save(target)
             return target

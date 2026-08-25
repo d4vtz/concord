@@ -18,7 +18,7 @@ class Database:
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS targets (
                     id TEXT PRIMARY KEY,
-                    name TEXT NOT NULL,
+                    name TEXT NOT NULL UNIQUE,
                     local_path TEXT NOT NULL,
                     type TEXT NOT NULL,
                     created_at TEXT NOT NULL

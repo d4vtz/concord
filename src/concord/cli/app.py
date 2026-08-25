@@ -20,8 +20,13 @@ def init():
 
 
 @commands.command()
-def add(path):
+def add(
+    path,
+    name: str | None = typer.Option(
+        None, "--name", "-n", help="Nombre del target dentro del repositorio."
+    ),
+):
     """Add target Concord."""
 
     targetmanager = TargetManager()
-    targetmanager.add(Path(path))
+    targetmanager.add(Path(path), name=name)

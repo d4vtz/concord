@@ -1,5 +1,3 @@
-from pathlib import Path
-
 from rich.console import Console
 from rich.panel import Panel
 
@@ -9,7 +7,6 @@ from concord.application.repository import RepositoryManager
 
 
 class Initializer:
-
     def __init__(self) -> None:
         self.config_manager = ConfigManager()
         self.repository_manager = RepositoryManager()
@@ -35,6 +32,5 @@ class Initializer:
         )
 
         console.print(
-            "\nUse [bold]concord --help[/bold] "
-            "para consultar los comandos disponibles."
+            "\nUse [bold]concord --help[/bold] para consultar los comandos disponibles."
         )
