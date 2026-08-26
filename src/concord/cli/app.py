@@ -12,6 +12,7 @@ from rich.table import Table
 
 from concord import application as concord
 from concord.application.config import CONCORD_TARGET, ConfigManager, GitConfig
+from concord.application.doctor import Doctor
 from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
 from concord.application.target_manager import TargetManager
@@ -373,6 +374,57 @@ def render_git_status(git_status) -> None:
         ],
         title="Repositorio Git",
     )
+
+
+@app.command()
+def doctor(
+    fetch: bool = typer.Option(False, "--fetch", help="Comprueba también el estado remoto."),
+    strict: bool = typer.Option(False, "--strict", help="Trata las advertencias como errores."),
+) -> None:
+    """Diagnostica la instalación de Concord sin modificarla."""
+    heading("DIAGNÓSTICO", "Comprobando que Concord está listo para trabajar")
+    report = Doctor().run(fetch=fetch)
+    labels = {
+        "pass": ("✓ Correcto", "#A3BE8C"),
+        "warning": ("! Advertencia", "#EBCB8B"),
+        "failure": ("× Error", "#BF616A"),
+    }
+    sections = list(dict.fromkeys(check.section for check in report.checks))
+    for section in sections:
+        table = Table(
+            box=box.ROUNDED,
+            border_style="#4C566A",
+            header_style="bold #88C0D0",
+            title=section,
+        )
+        table.add_column("Estado", no_wrap=True)
+        table.add_column("Comprobación", style="bold #D8DEE9", no_wrap=True)
+        table.add_column("Resultado", style="concord.path")
+        for check in (item for item in report.checks if item.section == section):
+            label, color = labels[check.state]
+            result = check.message
+            if check.hint:
+                result += f"\n[concord.muted]Sugerencia: {check.hint}[/]"
+            table.add_row(f"[{color}]{label}[/]", check.name, result)
+        console.print(table)
+    details(
+        [
+            ("Correctas", str(report.passed)),
+            ("Advertencias", str(report.warnings)),
+            ("Errores", str(report.failures)),
+        ],
+        title="Resumen del diagnóstico",
+    )
+    if report.failures:
+        warning("Concord necesita correcciones antes de probar el flujo completo.")
+        raise typer.Exit(1)
+    if strict and report.warnings:
+        warning("El diagnóstico estricto encontró advertencias.")
+        raise typer.Exit(1)
+    if report.warnings:
+        success("Concord funciona, pero conviene revisar las advertencias.")
+    else:
+        success("Concord está listo para probarse.")
 
 
 @app.command()

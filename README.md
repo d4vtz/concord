@@ -47,6 +47,7 @@ concord restore --all     # restaura todos los targets
 concord restore --all --dry-run  # simula la restauración completa
 concord repo status       # estado del repositorio Git
 concord repo push         # publica commits locales
+concord doctor            # diagnostica la instalación sin modificarla
 ```
 
 `add` acepta únicamente rutas dentro de `$HOME`. Tanto el nombre como la ruta
@@ -199,6 +200,36 @@ concord repo init               # inicializa o repara Git
 
 `concord status` también muestra la rama, remoto, último commit y divergencia
 con el upstream. Solo `--fetch` consulta la red.
+
+## Diagnóstico
+
+Antes de probar o después de migrar una instalación, ejecuta:
+
+```bash
+concord doctor
+```
+
+El diagnóstico es de solo lectura y comprueba:
+
+- Validez de `concord.toml` y seguridad de sus rutas.
+- Integridad de SQLite y coincidencia con el manifiesto.
+- Existencia y sincronización de los targets.
+- Instalación, identidad, rama y estado de Git.
+- Configuración del remoto y seguimiento de la rama.
+- Presencia de GitHub CLI y posibles archivos sensibles.
+
+Por defecto no consulta la red. Para actualizar primero las referencias remotas:
+
+```bash
+concord doctor --fetch
+```
+
+Los errores producen un código de salida distinto de cero. Las advertencias son
+informativas, salvo que se utilice el modo estricto:
+
+```bash
+concord doctor --strict
+```
 
 ## Bootstrap desde GitHub
 

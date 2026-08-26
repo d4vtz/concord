@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from concord.application.config import Config, ConfigManager, GitConfig
 from concord.application.database import Database
+from concord.application.doctor import Doctor
 from concord.application.git import GitManager
 from concord.application.initializer import Initializer
 from concord.application.repository import RepositoryManager
@@ -452,3 +453,71 @@ def test_sensitive_files_are_detected_before_first_push(tmp_path):
     git = GitManager(repository)
 
     assert git.sensitive_files() == [Path("app/.env")]
+
+
+def test_doctor_reports_uninitialized_installation_without_creating_files(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+
+    report = Doctor().run()
+
+    assert report.failures == 1
+    assert report.checks[0].name == "Configuración"
+    assert not (home / ".config/concord").exists()
+    assert not (home / ".local/share/concord").exists()
+
+
+def test_doctor_accepts_a_healthy_local_installation(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = tmp_path / "repository"
+    Initializer().initialize(
+        repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+
+    report = Doctor().run()
+
+    assert report.failures == 0
+    assert report.passed >= 10
+    assert any(check.name == "Remoto" and check.state == "warning" for check in report.checks)
+
+
+def test_doctor_detects_database_manifest_mismatch(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    Initializer().initialize(
+        tmp_path / "repository",
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    with Database(concord.database_file).connect() as connection:
+        connection.execute("DELETE FROM targets WHERE name = 'concord'")
+
+    report = Doctor().run()
+
+    check = next(item for item in report.checks if item.name == "Índice local")
+    assert check.state == "failure"
+    assert "concord import --replace" in check.hint
+
+
+def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    Initializer().initialize(
+        tmp_path / "repository",
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+
+    result = CliRunner().invoke(app, ["doctor"])
+    strict = CliRunner().invoke(app, ["doctor", "--strict"])
+
+    assert result.exit_code == 0
+    assert "Resumen del diagnóstico" in result.output
+    assert "Concord funciona" in result.output
+    assert strict.exit_code == 1
