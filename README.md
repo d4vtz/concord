@@ -19,6 +19,36 @@ uv tool install .
 concord init
 ```
 
+### Arch Linux
+
+Concord incluye un `PKGBUILD` para instalar el ejecutable mediante `pacman`. La
+dependencia `python-questionary` está disponible en AUR, por lo que debe
+instalarse primero con un helper:
+
+```bash
+sudo pacman -S --needed base-devel git
+yay -S python-questionary
+```
+
+Después, desde el repositorio de Concord:
+
+```bash
+makepkg -si
+concord --help
+concord doctor
+```
+
+El paquete instala `concord` en `/usr/bin`, pero la configuración sigue siendo
+individual para cada usuario. Ejecuta `concord init` sin `sudo`; usar `sudo`
+crearía una configuración separada para `root`.
+
+Para reconstruir el paquete después de actualizar el repositorio:
+
+```bash
+git pull origin master
+makepkg -Csi
+```
+
 Durante `init`, Concord puede inicializar Git, configurar los commits
 automáticos y crear un repositorio remoto con GitHub CLI (`gh`). Los repositorios
 nuevos usan la rama `main`. Si falta la identidad global de Git, Concord solicita

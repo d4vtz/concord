@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -521,3 +522,18 @@ def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch
     assert "Resumen del diagnóstico" in result.output
     assert "Concord funciona" in result.output
     assert strict.exit_code == 1
+
+
+def test_pkgbuild_matches_project_metadata():
+    root = Path(__file__).parents[1]
+    with (root / "pyproject.toml").open("rb") as file:
+        project = tomllib.load(file)["project"]
+    pkgbuild = (root / "PKGBUILD").read_text()
+    srcinfo = (root / ".SRCINFO").read_text()
+
+    assert f"pkgver={project['version']}" in pkgbuild
+    assert "license=('MIT')" in pkgbuild
+    assert "'python-questionary>=2.1.1'" in pkgbuild
+    assert "'github-cli: crear y autenticar repositorios remotos en GitHub'" in pkgbuild
+    assert f"\tpkgver = {project['version']}" in srcinfo
+    assert "\tdepends = python-questionary>=2.1.1" in srcinfo
