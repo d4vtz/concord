@@ -2,7 +2,7 @@
 
 pkgname=concord
 pkgver=2.1.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
 url='https://github.com/d4vtz/concord'
@@ -34,7 +34,7 @@ build() {
 
 check() {
     cd "$pkgname"
-    python -m pytest -o addopts=''
+    PYTHONPATH=src python -m pytest -o addopts=''
 }
 
 package() {
