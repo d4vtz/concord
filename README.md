@@ -268,6 +268,12 @@ concord doctor --strict
   no existe, el comando deberá crearlo de forma segura. Abrir o guardar el
   archivo no deberá crear un commit automáticamente; los cambios podrán
   revisarse y confirmarse después con los comandos `concord repo`.
+- Diferenciar los mensajes predeterminados según la operación. Al registrar un
+  target nuevo, `add` conservará `concord: add <target>`. Al sincronizar un
+  target existente, `sync` utilizará `<target>: sync target`, por ejemplo
+  `nvim: sync target`, para que el nombre de la configuración destaque en el
+  historial. Una sincronización de todos los targets conservará el mensaje
+  general `concord: sync all targets`.
 
 ## Bootstrap desde GitHub
 
