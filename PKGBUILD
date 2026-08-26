@@ -2,19 +2,19 @@
 
 pkgname=concord
 pkgver=2.1.0
-pkgrel=1
+pkgrel=2
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
 url='https://github.com/d4vtz/concord'
 license=('MIT')
 depends=(
     'git'
-    'python>=3.12'
-    'python-platformdirs>=4.11.3'
-    'python-questionary>=2.1.1'
-    'python-rich>=15.0.0'
-    'python-tomli-w>=1.2.0'
-    'python-typer>=0.27.1'
+    'python'
+    'python-platformdirs'
+    'python-questionary'
+    'python-rich'
+    'python-tomli-w'
+    'python-typer'
 )
 makedepends=(
     'python-build'

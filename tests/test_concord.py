@@ -533,7 +533,7 @@ def test_pkgbuild_matches_project_metadata():
 
     assert f"pkgver={project['version']}" in pkgbuild
     assert "license=('MIT')" in pkgbuild
-    assert "'python-questionary>=2.1.1'" in pkgbuild
+    assert "'python-questionary'" in pkgbuild
     assert "'github-cli: crear y autenticar repositorios remotos en GitHub'" in pkgbuild
     assert f"\tpkgver = {project['version']}" in srcinfo
-    assert "\tdepends = python-questionary>=2.1.1" in srcinfo
+    assert "\tdepends = python-questionary" in srcinfo
