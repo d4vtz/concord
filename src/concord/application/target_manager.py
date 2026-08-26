@@ -284,7 +284,18 @@ class TargetManager:
         targets = [self.get(name)] if name else self.list()
         return [self._target_diff(target) for target in targets]
 
-    def _target_diff(self, target: Target) -> TargetDiff:
+    def preview_sync(self, name: str | None = None) -> list[TargetDiff]:
+        return self.diff(name)
+
+    def preview_restore(self, name: str | None = None) -> list[TargetDiff]:
+        targets = (
+            [self.get(name)]
+            if name
+            else [target for target in self.list() if target.name != CONCORD_TARGET]
+        )
+        return [self._target_diff(target, reverse=True) for target in targets]
+
+    def _target_diff(self, target: Target, *, reverse: bool = False) -> TargetDiff:
         local = self._snapshot(target.local_path)
         stored = self._snapshot(self._destination(target))
         entries: list[DiffEntry] = []
@@ -299,6 +310,8 @@ class TargetManager:
                 state = "modified"
             else:
                 continue
+            if reverse:
+                state = {"added": "deleted", "deleted": "added"}.get(state, state)
             entries.append(DiffEntry(state=state, relative_path=display_path))
         return TargetDiff(name=target.name, entries=entries)
 

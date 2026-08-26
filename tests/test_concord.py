@@ -275,3 +275,61 @@ def test_diff_detects_changed_symbolic_link(manager):
     entry = instance.diff("example")[0].entries[0]
     assert entry.state == "modified"
     assert entry.relative_path == Path(".config/example/current")
+
+
+def test_sync_preview_is_read_only(manager):
+    instance, home, repository = manager
+    source = home / ".bashrc"
+    source.write_text("before")
+    instance.add(source, "bash")
+    source.write_text("after")
+    before_timestamp = instance.get("bash").updated_at
+    before_copy = (repository / "bash/.bashrc").read_text()
+
+    preview = instance.preview_sync("bash")[0]
+
+    assert [(entry.state, entry.relative_path) for entry in preview.entries] == [
+        ("modified", Path(".bashrc"))
+    ]
+    assert (repository / "bash/.bashrc").read_text() == before_copy
+    assert instance.get("bash").updated_at == before_timestamp
+
+
+def test_restore_preview_reverses_changes_and_is_read_only(manager):
+    instance, home, repository = manager
+    source = home / ".config/nvim"
+    source.mkdir(parents=True)
+    (source / "modified.lua").write_text("before")
+    (source / "repo-only.lua").write_text("stored")
+    instance.add(source, "nvim")
+    (source / "modified.lua").write_text("after")
+    (source / "repo-only.lua").unlink()
+    (source / "local-only.lua").write_text("local")
+    before_timestamp = instance.get("nvim").updated_at
+
+    preview = instance.preview_restore("nvim")[0]
+
+    assert {(entry.state, entry.relative_path.as_posix()) for entry in preview.entries} == {
+        ("deleted", ".config/nvim/local-only.lua"),
+        ("modified", ".config/nvim/modified.lua"),
+        ("added", ".config/nvim/repo-only.lua"),
+    }
+    assert (source / "modified.lua").read_text() == "after"
+    assert (repository / "nvim/.config/nvim/modified.lua").read_text() == "before"
+    assert instance.get("nvim").updated_at == before_timestamp
+
+
+def test_restore_all_preview_excludes_concord(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("one")
+    instance.add(source, "bash")
+
+    assert [item.name for item in instance.preview_restore()] == ["bash"]
+
+
+def test_sync_and_restore_help_include_dry_run():
+    runner = CliRunner()
+
+    assert "--dry-run" in runner.invoke(app, ["sync", "--help"]).output
+    assert "--dry-run" in runner.invoke(app, ["restore", "--help"]).output

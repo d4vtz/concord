@@ -30,11 +30,14 @@ concord diff              # compara todos los targets
 concord diff nvim         # compara un target sin modificar nada
 concord sync              # todos los targets
 concord sync nvim         # solo uno
+concord sync nvim --dry-run  # simula HOME → repositorio
 concord restore nvim      # exige que la ruta local no exista
 concord restore nvim -f   # reemplaza la ruta local
+concord restore nvim --dry-run  # simula repositorio → HOME
 concord remove nvim       # conserva los archivos locales
 concord import --replace  # reconstruye SQLite desde el manifiesto
 concord restore --all     # restaura todos los targets
+concord restore --all --dry-run  # simula la restauración completa
 ```
 
 `add` acepta únicamente rutas dentro de `$HOME`. Tanto el nombre como la ruta
@@ -107,6 +110,21 @@ de `sync`. Informa qué rutas serían agregadas, modificadas o eliminadas:
 Sin argumento compara todos los targets. El comando es de solo lectura: no
 copia archivos ni cambia `updated_at`. También compara el destino de los enlaces
 simbólicos y detecta directorios vacíos.
+
+## Simular operaciones
+
+Agrega `--dry-run` a `sync` o `restore` para ver la operación completa antes de
+aplicarla. La salida muestra los archivos que el comando agregaría, modificaría
+o eliminaría, siempre desde la perspectiva del destino:
+
+- `concord sync --dry-run`: `$HOME` → repositorio.
+- `concord restore <target> --dry-run`: repositorio → `$HOME`.
+- `concord restore --all --dry-run`: simula todos los targets restaurables sin
+  incluir el target interno `concord`.
+
+La simulación no copia ni elimina archivos, no modifica el manifiesto y no
+actualiza `updated_at`. `--force` puede combinarse con `restore --dry-run` para
+construir y revisar exactamente el comando que después se ejecutará.
 
 ## Desarrollo
 

@@ -28,6 +28,52 @@ def format_date(value: datetime) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M")
 
 
+def render_differences(differences, *, command: str) -> None:
+    changed = 0
+    totals = {"added": 0, "modified": 0, "deleted": 0}
+    labels = {
+        "added": ("+ Agregado", "#A3BE8C"),
+        "modified": ("● Modificado", "#EBCB8B"),
+        "deleted": ("− Eliminado", "#BF616A"),
+    }
+    for target_diff in differences:
+        if target_diff.clean:
+            console.print(
+                f"[concord.success]✓[/] [bold]{target_diff.name}[/]  "
+                "[concord.muted]sin cambios[/]"
+            )
+            continue
+        changed += 1
+        table = Table(
+            box=box.ROUNDED,
+            border_style="#4C566A",
+            header_style="bold #88C0D0",
+            title=target_diff.name,
+        )
+        table.add_column("Cambio", no_wrap=True)
+        table.add_column("Ruta relativa a HOME", style="concord.path")
+        for entry in target_diff.entries:
+            label, color = labels[entry.state]
+            totals[entry.state] += 1
+            table.add_row(f"[{color}]{label}[/]", entry.relative_path.as_posix())
+        console.print(table)
+    total_changes = sum(totals.values())
+    if total_changes == 0:
+        success("No hay cambios que aplicar.")
+        return
+    details(
+        [
+            ("Targets con cambios", str(changed)),
+            ("Agregados", str(totals["added"])),
+            ("Modificados", str(totals["modified"])),
+            ("Eliminados", str(totals["deleted"])),
+        ],
+        title="Resumen",
+    )
+    warning("Esta es una simulación; no se modificó ningún archivo ni metadato.")
+    console.print(f"  [concord.muted]Para aplicar los cambios:[/] {command}")
+
+
 @app.command()
 def init(
     repository: Path | None = typer.Option(
@@ -150,54 +196,26 @@ def diff_targets(
         lambda: manager().diff(name),
         hint="Consulta los nombres disponibles con: concord list",
     )
-    changed = 0
-    totals = {"added": 0, "modified": 0, "deleted": 0}
-    labels = {
-        "added": ("+ Agregado", "#A3BE8C"),
-        "modified": ("● Modificado", "#EBCB8B"),
-        "deleted": ("− Eliminado", "#BF616A"),
-    }
-    for target_diff in differences:
-        if target_diff.clean:
-            console.print(
-                f"[concord.success]✓[/] [bold]{target_diff.name}[/]  "
-                "[concord.muted]sin cambios[/]"
-            )
-            continue
-        changed += 1
-        table = Table(
-            box=box.ROUNDED,
-            border_style="#4C566A",
-            header_style="bold #88C0D0",
-            title=target_diff.name,
-        )
-        table.add_column("Cambio", no_wrap=True)
-        table.add_column("Ruta relativa a HOME", style="concord.path")
-        for entry in target_diff.entries:
-            label, color = labels[entry.state]
-            totals[entry.state] += 1
-            table.add_row(f"[{color}]{label}[/]", entry.relative_path.as_posix())
-        console.print(table)
-    total_changes = sum(totals.values())
-    if total_changes == 0:
-        success("HOME y el repositorio están sincronizados.")
-        return
-    details(
-        [
-            ("Targets con cambios", str(changed)),
-            ("Agregados", str(totals["added"])),
-            ("Modificados", str(totals["modified"])),
-            ("Eliminados", str(totals["deleted"])),
-        ],
-        title="Resumen",
-    )
-    warning("Esta es una vista previa; no se modificó ningún archivo.")
-    console.print("  [concord.muted]Para aplicar los cambios:[/] concord sync" + (f" {name}" if name else ""))
+    render_differences(differences, command="concord sync" + (f" {name}" if name else ""))
 
 
 @app.command()
-def sync(name: str | None = typer.Argument(None, help="Target concreto; omítelo para sincronizar todos.")) -> None:
+def sync(
+    name: str | None = typer.Argument(None, help="Target concreto; omítelo para sincronizar todos."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Simula la operación sin modificar archivos."),
+) -> None:
     """Actualiza uno o todos los targets desde HOME al repositorio."""
+    if dry_run:
+        heading("SIMULACIÓN DE SINCRONIZACIÓN", "Vista previa de HOME → repositorio")
+        differences = execute(
+            lambda: manager().preview_sync(name),
+            hint="Consulta los nombres disponibles con: concord list",
+        )
+        render_differences(
+            differences,
+            command="concord sync" + (f" {name}" if name else ""),
+        )
+        return
     heading("SINCRONIZACIÓN", "Copiando cambios locales al repositorio")
     targets = execute(lambda: manager().sync(name), hint="Consulta los nombres disponibles con: concord list")
     for target in targets:
@@ -210,12 +228,24 @@ def restore(
     name: str | None = typer.Argument(None, help="Target que se restaurará."),
     all_targets: bool = typer.Option(False, "--all", "-a", help="Restaura todos los targets del manifiesto."),
     force: bool = typer.Option(False, "--force", "-f", help="Reemplaza la ruta local existente."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Simula la operación sin modificar archivos."),
 ) -> None:
     """Restaura un target del repositorio a HOME."""
-    heading("RESTAURACIÓN", "Recuperando una configuración desde el repositorio")
     if (name is None) == (not all_targets):
         execute(lambda: (_ for _ in ()).throw(ValueError("Indique un target o use --all, pero no ambos.")))
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    if dry_run:
+        heading("SIMULACIÓN DE RESTAURACIÓN", "Vista previa de repositorio → HOME")
+        differences = execute(
+            lambda: target_manager.preview_restore(None if all_targets else name),
+            hint="Consulta los nombres disponibles con: concord list",
+        )
+        command = "concord restore --all" if all_targets else f"concord restore {name}"
+        if force:
+            command += " --force"
+        render_differences(differences, command=command)
+        return
+    heading("RESTAURACIÓN", "Recuperando una configuración desde el repositorio")
     if all_targets:
         targets = execute(
             lambda: target_manager.restore_all(force=force),
