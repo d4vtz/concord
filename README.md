@@ -275,6 +275,21 @@ concord doctor --strict
   historial. Una sincronización de todos los targets conservará el mensaje
   general `concord: sync all targets`.
 
+### Targets con múltiples rutas
+
+```bash
+concord add ~/.config/zsh --name zsh
+concord add ~/.zshenv --name zsh
+```
+
+Comportamiento esperado:
+
+- Crear el target si todavía no existe.
+- Reutilizar el target cuando el valor de `--name` coincida.
+- Permitir que un target contenga varias rutas.
+- Impedir que una misma ruta pertenezca a dos targets distintos.
+- Replicar todas las rutas conservando su ubicación relativa a `$HOME`.
+
 ## Bootstrap desde GitHub
 
 Para reconstruir Concord en otra máquina directamente desde el remoto:
