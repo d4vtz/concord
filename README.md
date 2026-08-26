@@ -19,6 +19,11 @@ uv tool install .
 concord init
 ```
 
+Durante `init`, Concord puede inicializar Git, configurar los commits
+automáticos y crear un repositorio remoto con GitHub CLI (`gh`). Los repositorios
+nuevos usan la rama `main`. Si falta la identidad global de Git, Concord solicita
+un nombre y correo y los guarda únicamente en el repositorio de dotfiles.
+
 ## Uso
 
 ```bash
@@ -31,6 +36,8 @@ concord diff nvim         # compara un target sin modificar nada
 concord sync              # todos los targets
 concord sync nvim         # solo uno
 concord sync nvim --dry-run  # simula HOME → repositorio
+concord sync nvim -m "nvim: configura LSP"
+concord sync nvim --no-push
 concord restore nvim      # exige que la ruta local no exista
 concord restore nvim -f   # reemplaza la ruta local
 concord restore nvim --dry-run  # simula repositorio → HOME
@@ -38,6 +45,8 @@ concord remove nvim       # conserva los archivos locales
 concord import --replace  # reconstruye SQLite desde el manifiesto
 concord restore --all     # restaura todos los targets
 concord restore --all --dry-run  # simula la restauración completa
+concord repo status       # estado del repositorio Git
+concord repo push         # publica commits locales
 ```
 
 `add` acepta únicamente rutas dentro de `$HOME`. Tanto el nombre como la ruta
@@ -125,6 +134,87 @@ o eliminaría, siempre desde la perspectiva del destino:
 La simulación no copia ni elimina archivos, no modifica el manifiesto y no
 actualiza `updated_at`. `--force` puede combinarse con `restore --dry-run` para
 construir y revisar exactamente el comando que después se ejecutará.
+
+## Integración con Git
+
+El repositorio de Concord se inicializa automáticamente con Git. `init`, `add`,
+`sync` y `remove` crean commits cuando producen cambios. Antes de cada commit
+interactivo, Concord permite editar un mensaje predeterminado como:
+
+```text
+concord: add nvim
+concord: sync nvim
+concord: sync all targets
+concord: remove nvim
+```
+
+Cada commit prepara exclusivamente las rutas afectadas por la operación actual;
+los cambios pendientes de otros targets no se mezclan. Las opciones disponibles
+son:
+
+```bash
+concord sync nvim --message "nvim: configura Python"
+concord sync nvim --yes       # acepta el mensaje predeterminado
+concord sync nvim --no-commit # deja los cambios sin commit
+concord sync nvim --push      # fuerza push en esta operación
+concord sync nvim --no-push   # omite push en esta operación
+```
+
+La configuración se guarda en el mismo manifiesto portable:
+
+```toml
+[git]
+enabled = true
+auto_commit = true
+auto_push = true
+remote = "origin"
+```
+
+En una ejecución sin terminal interactiva, Git y los commits quedan activos,
+pero `auto_push` se configura inicialmente como `false`. Si un commit o push
+falla, los archivos y commits completados se conservan. Concord nunca ejecuta
+force-push, merge ni rebase automáticamente.
+
+Antes del primer push se detectan nombres habituales de secretos, como `.env`,
+claves privadas, credenciales y tokens. En modo interactivo se solicita
+confirmación; en modo no interactivo el push se bloquea para permitir una
+revisión manual.
+
+## Administrar el repositorio
+
+```bash
+concord repo status             # estado local
+concord repo status --fetch     # consulta también el remoto
+concord repo log --limit 20
+concord repo diff
+concord repo diff --staged
+concord repo commit -m "mensaje"
+concord repo push
+concord repo pull               # usa exclusivamente pull --ff-only
+concord repo remote
+concord repo remote set <URL>
+concord repo remote remove
+concord repo init               # inicializa o repara Git
+```
+
+`concord status` también muestra la rama, remoto, último commit y divergencia
+con el upstream. Solo `--fetch` consulta la red.
+
+## Bootstrap desde GitHub
+
+Para reconstruir Concord en otra máquina directamente desde el remoto:
+
+```bash
+concord bootstrap https://github.com/usuario/dotfiles.git
+```
+
+El comando clona el repositorio, recupera `concord.toml`, reconstruye SQLite y
+ofrece restaurar todos los targets. También puede controlarse explícitamente:
+
+```bash
+concord bootstrap https://github.com/usuario/dotfiles.git --restore
+concord bootstrap https://github.com/usuario/dotfiles.git --no-restore
+```
 
 ## Desarrollo
 

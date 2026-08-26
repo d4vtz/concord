@@ -3,8 +3,9 @@ from pathlib import Path
 
 from concord import application as concord
 from concord.application.config import (CONCORD_TARGET, Config, ConfigManager,
-                                        TargetConfig)
+                                        GitConfig, TargetConfig)
 from concord.application.database import Database
+from concord.application.git import GitManager
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
 
@@ -13,7 +14,14 @@ class Initializer:
     def __init__(self) -> None:
         self.config_manager = ConfigManager()
 
-    def initialize(self, repository_path: Path | None = None) -> bool:
+    def initialize(
+        self,
+        repository_path: Path | None = None,
+        *,
+        git_config: GitConfig | None = None,
+        git_identity: tuple[str, str] | None = None,
+        commit_message: str = "concord: initialize repository",
+    ) -> bool:
         if concord.is_initialized():
             return False
 
@@ -31,6 +39,11 @@ class Initializer:
                 else Config(repository_path=repository_path)
             )
             config.repository_path = repository_path
+
+        if git_config is not None:
+            config.git = git_config
+        if config.git.enabled and not GitManager.available():
+            config.git.enabled = False
 
         repository = RepositoryManager(config.repository_path)
         repository.create(config.repository_path)
@@ -52,4 +65,12 @@ class Initializer:
         manager = TargetManager(database, repository, self.config_manager)
         manager.import_manifest(replace=True)
         manager.sync(CONCORD_TARGET)
+        if config.git.enabled:
+            git = GitManager(config.repository_path)
+            git.initialize()
+            git.ensure_gitignore()
+            if git_identity is not None:
+                git.set_identity(*git_identity)
+            if config.git.auto_commit and all(git.identity()):
+                git.commit([Path(".")], commit_message)
         return True

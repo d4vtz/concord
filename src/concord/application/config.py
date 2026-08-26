@@ -23,10 +23,19 @@ class TargetConfig:
 
 
 @dataclass
+class GitConfig:
+    enabled: bool = True
+    auto_commit: bool = True
+    auto_push: bool = False
+    remote: str = "origin"
+
+
+@dataclass
 class Config:
     repository_path: Path
     version: int = MANIFEST_VERSION
     targets: list[TargetConfig] = field(default_factory=list)
+    git: GitConfig = field(default_factory=GitConfig)
 
     @classmethod
     def defaults(cls) -> "Config":
@@ -53,6 +62,12 @@ class ConfigManager:
         settings = {
             "version": config.version,
             "repository_path": self._portable_path(config.repository_path),
+            "git": {
+                "enabled": config.git.enabled,
+                "auto_commit": config.git.auto_commit,
+                "auto_push": config.git.auto_push,
+                "remote": config.git.remote,
+            },
             "targets": [
                 {
                     "name": target.name,
@@ -98,6 +113,7 @@ class ConfigManager:
             repository_path=Path(settings["repository_path"]).expanduser(),
             version=version,
             targets=targets,
+            git=GitConfig(**settings.get("git", {})),
         )
 
     def repository_manifest_path(self, repository_path: Path) -> Path:

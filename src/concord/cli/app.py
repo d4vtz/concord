@@ -1,12 +1,18 @@
+import shutil
+import subprocess
+import sys
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+import questionary
 import typer
 from rich import box
 from rich.table import Table
 
 from concord import application as concord
-from concord.application.config import ConfigManager
+from concord.application.config import CONCORD_TARGET, ConfigManager, GitConfig
+from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
 from concord.application.target_manager import TargetManager
 from concord.cli.ui import console, details, execute, heading, success, warning
@@ -16,6 +22,10 @@ app = typer.Typer(
     rich_markup_mode="rich",
     help="[bold #88C0D0]Concord[/] — gestiona y respalda tus dotfiles.",
 )
+repo_app = typer.Typer(no_args_is_help=True, help="Administra el repositorio Git de Concord.")
+remote_app = typer.Typer(no_args_is_help=False, help="Consulta o configura el remoto Git.")
+app.add_typer(repo_app, name="repo")
+repo_app.add_typer(remote_app, name="remote")
 
 
 def manager() -> TargetManager:
@@ -26,6 +36,92 @@ def manager() -> TargetManager:
 
 def format_date(value: datetime) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+@dataclass(frozen=True)
+class GitOptions:
+    message: str | None
+    yes: bool
+    commit: bool
+    push: bool | None
+
+
+def request_text(message: str, default: str = "") -> str:
+    answer = questionary.text(message, default=default).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return answer.strip()
+
+
+def request_commit_message(default: str, options: GitOptions) -> str | None:
+    if options.message:
+        return options.message
+    if options.yes or not sys.stdin.isatty():
+        return default
+    answer = questionary.text("Mensaje del commit:", default=default).ask()
+    return answer.strip() if answer is not None else None
+
+
+def git_paths(*names: str) -> list[Path]:
+    return sorted({Path(name) for name in (*names, "concord")}, key=str)
+
+
+def finalize_git(
+    paths: list[Path],
+    default_message: str,
+    options: GitOptions,
+) -> GitCommit | None:
+    config = ConfigManager().load()
+    if not config.git.enabled or not config.git.auto_commit or not options.commit:
+        warning("Los cambios quedaron en el repositorio sin commit.")
+        return None
+    git = GitManager(config.repository_path)
+    if not git.initialized:
+        git.initialize()
+    if not git.changed(paths):
+        console.print("[concord.muted]Git: no hay cambios nuevos para confirmar.[/]")
+        return None
+    message = request_commit_message(default_message, options)
+    if message is None:
+        warning("Commit cancelado; los cambios permanecen pendientes en Git.")
+        return None
+    commit = git.commit(paths, message)
+    if commit:
+        success(f"Commit creado: {commit.sha}  {commit.message}")
+    should_push = config.git.auto_push if options.push is None else options.push
+    if commit and should_push:
+        push_with_secret_check(git, config.git.remote, assume_yes=options.yes)
+    return commit
+
+
+def push_with_secret_check(
+    git: GitManager,
+    remote: str,
+    *,
+    assume_yes: bool = False,
+) -> None:
+    first_push = git.status(remote=remote).upstream is None
+    sensitive = git.sensitive_files() if first_push else []
+    if sensitive:
+        warning("Se detectaron archivos que podrían contener secretos:")
+        for path in sensitive:
+            console.print(f"  [concord.path]{path.as_posix()}[/]")
+        if not sys.stdin.isatty():
+            raise ValueError("Push bloqueado: revise los archivos sensibles y ejecute concord repo push.")
+        if not assume_yes and not questionary.confirm("¿Deseas continuar con el push?", default=False).ask():
+            warning("Push cancelado; el commit permanece guardado localmente.")
+            return
+    git.push(remote)
+    success(f"Cambios enviados a {remote}/{git.status(remote=remote).branch}.")
+
+
+def git_command_options(
+    message: str | None,
+    yes: bool,
+    no_commit: bool,
+    push: bool | None,
+) -> GitOptions:
+    return GitOptions(message=message, yes=yes, commit=not no_commit, push=push)
 
 
 def render_differences(differences, *, command: str) -> None:
@@ -85,10 +181,100 @@ def init(
 ) -> None:
     """Prepara la configuración, el repositorio y la base de datos."""
     heading("INICIALIZACIÓN", "Preparando el espacio de trabajo de tus dotfiles")
-    created = execute(lambda: Initializer().initialize(repository))
-    config = ConfigManager().load()
-    if not created:
+    if concord.is_initialized():
         warning("Concord ya estaba inicializado; no se modificó la configuración.")
+        config = ConfigManager().load()
+        details(
+            [
+                ("Configuración", str(concord.config_file)),
+                ("Base de datos", str(concord.database_file)),
+                ("Repositorio", str(config.repository_path)),
+            ],
+            title="Rutas activas",
+        )
+        return
+
+    interactive = sys.stdin.isatty()
+    if repository is None:
+        repository = ConfigManager().request_repository_path()
+    repository = repository.expanduser().resolve()
+    git_config = GitConfig(enabled=True, auto_commit=True, auto_push=False)
+    create_remote = False
+    github_name = "dotfiles"
+    github_private = True
+    identity: tuple[str, str] | None = None
+    commit_message = "concord: initialize repository"
+
+    if interactive:
+        enabled = bool(questionary.confirm("¿Inicializar Git?", default=True).ask())
+        auto_commit = enabled and bool(
+            questionary.confirm("¿Crear commits automáticos?", default=True).ask()
+        )
+        auto_push = auto_commit and bool(
+            questionary.confirm("¿Enviar commits automáticamente?", default=True).ask()
+        )
+        git_config = GitConfig(enabled=enabled, auto_commit=auto_commit, auto_push=auto_push)
+        if enabled:
+            name_result = subprocess.run(
+                ["git", "config", "--global", "user.name"], text=True, capture_output=True, check=False
+            ) if shutil.which("git") else None
+            email_result = subprocess.run(
+                ["git", "config", "--global", "user.email"], text=True, capture_output=True, check=False
+            ) if shutil.which("git") else None
+            git_name = name_result.stdout.strip() if name_result and name_result.returncode == 0 else ""
+            git_email = email_result.stdout.strip() if email_result and email_result.returncode == 0 else ""
+            if not git_name:
+                git_name = request_text("Nombre para los commits:")
+            if not git_email:
+                git_email = request_text("Correo para los commits:")
+            identity = (git_name, git_email)
+            if auto_commit:
+                commit_message = request_text("Mensaje del commit inicial:", commit_message)
+            create_remote = bool(
+                questionary.confirm("¿Crear ahora el repositorio remoto en GitHub?", default=True).ask()
+            )
+            if create_remote:
+                github_name = request_text("Nombre del repositorio de GitHub:", "dotfiles")
+                visibility = questionary.select(
+                    "Visibilidad del repositorio:", choices=["Privado", "Público"], default="Privado"
+                ).ask()
+                if visibility is None:
+                    raise KeyboardInterrupt
+                github_private = visibility == "Privado"
+
+    requested_git = git_config.enabled
+    execute(
+        lambda: Initializer().initialize(
+            repository,
+            git_config=git_config,
+            git_identity=identity,
+            commit_message=commit_message,
+        )
+    )
+    config = ConfigManager().load()
+    git = GitManager(config.repository_path)
+    if requested_git and not config.git.enabled:
+        warning("Git no está instalado; Concord continuará administrando archivos sin commits.")
+    if config.git.enabled:
+        if not all(git.identity()):
+            warning("Git no tiene identidad; los cambios iniciales quedaron sin commit.")
+            console.print("  [concord.muted]Configúrala con concord repo init.[/]")
+        if create_remote:
+            try:
+                url = git.create_github_repository(github_name, private=github_private)
+                success(f"Repositorio remoto creado: {url}")
+            except (FileNotFoundError, ValueError) as error:
+                warning(str(error))
+                console.print("  [concord.muted]La instalación local está completa; conecta después con concord repo init.[/]")
+        if config.git.auto_push and git.has_remote(config.git.remote):
+            try:
+                push_with_secret_check(git, config.git.remote)
+            except (FileNotFoundError, ValueError) as error:
+                warning(str(error))
+                console.print("  [concord.muted]El commit local se conservó. Reintenta con: concord repo push[/]")
+        elif config.git.auto_push:
+            warning("auto_push está activo, pero todavía no existe un remoto configurado.")
+            console.print("  [concord.muted]Conéctalo con: concord repo remote set <URL>[/]")
     details(
         [
             ("Configuración", str(concord.config_file)),
@@ -104,6 +290,10 @@ def init(
 def add(
     path: Path,
     name: str | None = typer.Option(None, "--name", "-n", help="Nombre único del target."),
+    message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Acepta el mensaje predeterminado."),
+    no_commit: bool = typer.Option(False, "--no-commit", help="No crea el commit automático."),
+    push: bool | None = typer.Option(None, "--push/--no-push", help="Sobrescribe auto_push para esta operación."),
 ) -> None:
     """Registra un archivo o directorio y crea su primera copia."""
     heading("NUEVO TARGET", "Registrando una configuración en Concord")
@@ -124,6 +314,14 @@ def add(
             ("Actualizado", format_date(target.updated_at)),
         ],
         title="Target registrado",
+    )
+    execute(
+        lambda: finalize_git(
+            git_paths(target.name),
+            f"concord: add {target.name}",
+            git_command_options(message, yes, no_commit, push),
+        ),
+        hint="Los archivos se conservaron. Revisa Git con: concord repo status",
     )
     success(f"'{target.name}' fue agregado correctamente.", hint=f"Comprueba su estado con: concord status")
 
@@ -156,8 +354,31 @@ def list_targets() -> None:
     console.print(f"[concord.muted]Total:[/] {len(targets)} target(s)")
 
 
+def render_git_status(git_status) -> None:
+    if not git_status.initialized:
+        warning("El repositorio de Concord todavía no está inicializado con Git.")
+        return
+    divergence = "sin upstream"
+    if git_status.ahead is not None and git_status.behind is not None:
+        divergence = f"{git_status.ahead} por publicar · {git_status.behind} por descargar"
+    details(
+        [
+            ("Estado", "limpio" if git_status.clean else "cambios pendientes"),
+            ("Rama", git_status.branch or "sin rama"),
+            ("Remoto", git_status.remote or "no configurado"),
+            ("Seguimiento", git_status.upstream or "no configurado"),
+            ("Divergencia", divergence),
+            ("Commit", git_status.commit or "sin commits"),
+            ("Último mensaje", git_status.message or "sin commits"),
+        ],
+        title="Repositorio Git",
+    )
+
+
 @app.command()
-def status() -> None:
+def status(
+    fetch: bool = typer.Option(False, "--fetch", help="Actualiza la información del remoto."),
+) -> None:
     """Compara los archivos locales con sus copias del repositorio."""
     heading("ESTADO", "Comparando HOME con el repositorio de Concord")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
@@ -182,6 +403,13 @@ def status() -> None:
     console.print(table)
     clean = sum(item.state == "clean" for item in items)
     success(f"Comprobación terminada: {clean}/{len(items)} target(s) sin cambios.")
+    config = ConfigManager().load()
+    if config.git.enabled:
+        git_status = execute(
+            lambda: GitManager(config.repository_path).status(fetch=fetch, remote=config.git.remote),
+            hint="Comprueba Git con: concord repo status",
+        )
+        render_git_status(git_status)
 
 
 @app.command("diff")
@@ -203,6 +431,10 @@ def diff_targets(
 def sync(
     name: str | None = typer.Argument(None, help="Target concreto; omítelo para sincronizar todos."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simula la operación sin modificar archivos."),
+    message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Acepta el mensaje predeterminado."),
+    no_commit: bool = typer.Option(False, "--no-commit", help="No crea el commit automático."),
+    push: bool | None = typer.Option(None, "--push/--no-push", help="Sobrescribe auto_push para esta operación."),
 ) -> None:
     """Actualiza uno o todos los targets desde HOME al repositorio."""
     if dry_run:
@@ -215,11 +447,38 @@ def sync(
             differences,
             command="concord sync" + (f" {name}" if name else ""),
         )
+        config = ConfigManager().load()
+        default_message = f"concord: sync {name}" if name else "concord: sync all targets"
+        if (
+            any(not target_diff.clean for target_diff in differences)
+            and config.git.enabled
+            and config.git.auto_commit
+            and not no_commit
+        ):
+            will_push = config.git.auto_push if push is None else push
+            details(
+                [
+                    ("Commit", message or default_message),
+                    ("Push", f"sí, a {config.git.remote}" if will_push else "no"),
+                ],
+                title="Git (simulación)",
+            )
         return
     heading("SINCRONIZACIÓN", "Copiando cambios locales al repositorio")
     targets = execute(lambda: manager().sync(name), hint="Consulta los nombres disponibles con: concord list")
     for target in targets:
         console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {target.local_path}[/]")
+    if targets:
+        target_names = [target.name for target in targets]
+        default_message = f"concord: sync {name}" if name else "concord: sync all targets"
+        execute(
+            lambda: finalize_git(
+                git_paths(*target_names),
+                default_message,
+                git_command_options(message, yes, no_commit, push),
+            ),
+            hint="El commit local se conservó. Si el remoto avanzó, ejecuta concord repo pull y después concord repo push.",
+        )
     success(f"Se sincronizaron {len(targets)} target(s).", hint="Verifica el resultado con: concord status")
 
 
@@ -263,6 +522,233 @@ def restore(
     success(f"'{target.name}' fue restaurado correctamente.")
 
 
+@app.command()
+def bootstrap(
+    remote_url: str = typer.Argument(..., help="URL del repositorio remoto de dotfiles."),
+    repository: Path | None = typer.Option(None, "--repository", "-r", help="Directorio local del repositorio."),
+    restore_files: bool | None = typer.Option(
+        None,
+        "--restore/--no-restore",
+        help="Restaura todos los targets después de importar el manifiesto.",
+    ),
+) -> None:
+    """Reconstruye Concord desde un repositorio remoto existente."""
+    heading("BOOTSTRAP", "Recuperando Concord desde un repositorio remoto")
+    if concord.is_initialized():
+        execute(lambda: (_ for _ in ()).throw(ValueError("Concord ya está inicializado.")))
+    if not GitManager.available():
+        execute(lambda: (_ for _ in ()).throw(FileNotFoundError("Git no está instalado.")))
+    destination = (repository or concord.default_repository_dir).expanduser().resolve()
+    if destination.exists() and any(destination.iterdir()):
+        execute(
+            lambda: (_ for _ in ()).throw(
+                FileExistsError(f"El directorio de destino no está vacío: {destination}")
+            )
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    clone = subprocess.run(
+        ["git", "clone", remote_url, str(destination)],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if clone.returncode:
+        execute(lambda: (_ for _ in ()).throw(ValueError(clone.stderr.strip() or "No fue posible clonar.")))
+    config_manager = ConfigManager()
+    config = execute(
+        lambda: config_manager.load_from_repository(destination),
+        hint="El repositorio debe contener el manifiesto administrado por Concord.",
+    )
+    config.repository_path = destination
+    config_manager.save(config)
+    targets = execute(lambda: TargetManager().import_manifest(replace=True))
+    success(f"Se importaron {len(targets)} target(s) desde el manifiesto.")
+    should_restore = restore_files
+    if should_restore is None and sys.stdin.isatty():
+        should_restore = bool(questionary.confirm("¿Restaurar ahora todos los targets?", default=True).ask())
+    if should_restore:
+        restored = execute(
+            lambda: TargetManager().restore_all(),
+            hint="Usa concord restore --all --force si existen configuraciones locales.",
+        )
+        success(f"Se restauraron {len(restored)} target(s).")
+    else:
+        warning("Los targets fueron importados pero todavía no se restauraron.")
+        console.print("  [concord.muted]Cuando estés listo:[/] concord restore --all")
+    render_git_status(GitManager(destination).status(remote=config.git.remote))
+
+
+def active_git() -> tuple[GitManager, GitConfig]:
+    config = ConfigManager().load()
+    return GitManager(config.repository_path), config.git
+
+
+@repo_app.command("status")
+def repo_status(
+    fetch: bool = typer.Option(False, "--fetch", help="Consulta el remoto antes de mostrar el estado."),
+) -> None:
+    """Muestra el estado Git del repositorio de Concord."""
+    heading("REPOSITORIO", "Estado del historial y del remoto Git")
+    git, settings = execute(active_git, hint="Ejecuta primero: concord init")
+    render_git_status(execute(lambda: git.status(fetch=fetch, remote=settings.remote)))
+
+
+@repo_app.command("log")
+def repo_log(
+    limit: int = typer.Option(10, "--limit", "-n", min=1, help="Número máximo de commits."),
+) -> None:
+    """Muestra el historial reciente de Concord."""
+    heading("HISTORIAL GIT", "Commits recientes del repositorio")
+    git, _ = execute(active_git, hint="Ejecuta primero: concord init")
+    commits = execute(lambda: git.log(limit))
+    if not commits:
+        warning("El repositorio todavía no contiene commits.")
+        return
+    table = Table(box=box.ROUNDED, border_style="#4C566A", header_style="bold #88C0D0")
+    table.add_column("Commit", style="concord.accent", no_wrap=True)
+    table.add_column("Fecha", style="concord.muted", no_wrap=True)
+    table.add_column("Mensaje", style="concord.path")
+    for sha, date, message in commits:
+        table.add_row(sha, date, message)
+    console.print(table)
+
+
+@repo_app.command("diff")
+def repo_diff(
+    staged: bool = typer.Option(False, "--staged", help="Muestra solamente cambios preparados."),
+) -> None:
+    """Muestra las diferencias Git del repositorio."""
+    heading("DIFERENCIAS GIT", "Cambios dentro del repositorio de Concord")
+    git, _ = execute(active_git, hint="Ejecuta primero: concord init")
+    output = execute(lambda: git.diff(staged=staged))
+    if output:
+        console.print(output, markup=False)
+    else:
+        success("No hay diferencias que mostrar.")
+
+
+@repo_app.command("commit")
+def repo_commit(
+    message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Usa el mensaje predeterminado."),
+    push: bool | None = typer.Option(None, "--push/--no-push", help="Sobrescribe auto_push."),
+) -> None:
+    """Crea manualmente un commit con todos los cambios pendientes."""
+    heading("COMMIT MANUAL", "Confirmando cambios pendientes del repositorio")
+    git, settings = execute(active_git, hint="Ejecuta primero: concord init")
+    if not git.changed():
+        success("No hay cambios pendientes.")
+        return
+    commit_message = request_commit_message(
+        "concord: update repository", GitOptions(message, yes, True, push)
+    )
+    if commit_message is None:
+        warning("Commit cancelado; los cambios permanecen pendientes.")
+        return
+    commit = execute(lambda: git.commit([Path(".")], commit_message))
+    if commit:
+        success(f"Commit creado: {commit.sha}  {commit.message}")
+    should_push = settings.auto_push if push is None else push
+    if commit and should_push:
+        execute(
+            lambda: push_with_secret_check(git, settings.remote, assume_yes=yes),
+            hint="El commit se conservó. Reintenta con: concord repo push",
+        )
+
+
+@repo_app.command("push")
+def repo_push(
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirma archivos sensibles sin preguntar."),
+) -> None:
+    """Envía los commits locales al remoto configurado."""
+    heading("PUSH", "Publicando commits del repositorio")
+    git, settings = execute(active_git, hint="Ejecuta primero: concord init")
+    execute(
+        lambda: push_with_secret_check(git, settings.remote, assume_yes=yes),
+        hint="El historial local no fue modificado.",
+    )
+
+
+@repo_app.command("pull")
+def repo_pull() -> None:
+    """Descarga cambios usando exclusivamente fast-forward."""
+    heading("PULL", "Actualizando el repositorio de forma segura")
+    git, settings = execute(active_git, hint="Ejecuta primero: concord init")
+    execute(
+        lambda: git.pull(settings.remote),
+        hint="Concord no realizará merges ni rebases automáticos.",
+    )
+    success("Repositorio actualizado mediante fast-forward.")
+
+
+@repo_app.command("init")
+def repo_init() -> None:
+    """Inicializa o repara la integración Git del repositorio."""
+    heading("INICIALIZAR GIT", "Preparando el repositorio de Concord")
+    config_manager = ConfigManager()
+    config = execute(config_manager.load, hint="Ejecuta primero: concord init")
+    if not config.git.enabled:
+        config.git.enabled = True
+        config_manager.save(config)
+        TargetManager().sync(CONCORD_TARGET)
+    git, settings = execute(active_git, hint="Ejecuta primero: concord init")
+    created = execute(lambda: git.initialize())
+    git.ensure_gitignore()
+    name, email = git.identity()
+    if not name:
+        name = request_text("Nombre para los commits:")
+    if not email:
+        email = request_text("Correo para los commits:")
+    git.set_identity(name, email)
+    if git.changed():
+        message = request_commit_message(
+            "concord: initialize repository", GitOptions(None, False, True, None)
+        )
+        if message:
+            commit = execute(lambda: git.commit([Path(".")], message))
+            if commit:
+                success(f"Commit creado: {commit.sha}  {commit.message}")
+    if not git.has_remote(settings.remote) and sys.stdin.isatty():
+        if questionary.confirm("¿Crear el repositorio remoto en GitHub?", default=True).ask():
+            repo_name = request_text("Nombre del repositorio de GitHub:", "dotfiles")
+            visibility = questionary.select(
+                "Visibilidad:", choices=["Privado", "Público"], default="Privado"
+            ).ask()
+            execute(lambda: git.create_github_repository(repo_name, private=visibility != "Público"))
+            if settings.auto_push:
+                execute(
+                    lambda: push_with_secret_check(git, settings.remote),
+                    hint="El commit local se conservó. Reintenta con: concord repo push",
+                )
+    success("Integración Git preparada." if created else "La integración Git ya estaba inicializada.")
+
+
+@remote_app.callback(invoke_without_command=True)
+def repo_remote(ctx: typer.Context) -> None:
+    """Muestra el remoto Git configurado."""
+    if ctx.invoked_subcommand is not None:
+        return
+    git, settings = execute(active_git, hint="Ejecuta primero: concord init")
+    url = git.remote_url(settings.remote)
+    details([("Nombre", settings.remote), ("URL", url or "no configurado")], title="Remoto Git")
+
+
+@remote_app.command("set")
+def repo_remote_set(url: str, name: str = typer.Option("origin", "--name")) -> None:
+    """Crea o reemplaza el remoto configurado."""
+    git, _ = execute(active_git, hint="Ejecuta primero: concord init")
+    execute(lambda: git.set_remote(url, name))
+    success(f"Remoto '{name}' configurado: {url}")
+
+
+@remote_app.command("remove")
+def repo_remote_remove(name: str = typer.Option("origin", "--name")) -> None:
+    """Elimina un remoto Git."""
+    git, _ = execute(active_git, hint="Ejecuta primero: concord init")
+    execute(lambda: git.remove_remote(name))
+    success(f"Remoto '{name}' eliminado.")
+
+
 @app.command("import")
 def import_targets(
     replace: bool = typer.Option(False, "--replace", help="Reconstruye una base de datos que ya contiene targets."),
@@ -285,6 +771,10 @@ def import_targets(
 def remove(
     name: str,
     keep_repository: bool = typer.Option(False, "--keep-repository", help="Conserva la copia del repositorio."),
+    message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Acepta el mensaje predeterminado."),
+    no_commit: bool = typer.Option(False, "--no-commit", help="No crea el commit automático."),
+    push: bool | None = typer.Option(None, "--push/--no-push", help="Sobrescribe auto_push para esta operación."),
 ) -> None:
     """Deja de gestionar un target sin borrar su archivo local."""
     heading("ELIMINAR TARGET", "Quitando una configuración del registro de Concord")
@@ -298,5 +788,13 @@ def remove(
             ("Copia", "conservada" if keep_repository else "eliminada"),
         ],
         title="Resultado",
+    )
+    execute(
+        lambda: finalize_git(
+            git_paths(*(() if keep_repository else (name,))),
+            f"concord: remove {name}",
+            git_command_options(message, yes, no_commit, push),
+        ),
+        hint="La eliminación se conservó. Revisa Git con: concord repo status",
     )
     success(f"Concord dejó de administrar '{name}'.")

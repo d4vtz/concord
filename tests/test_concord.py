@@ -3,8 +3,9 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from concord.application.config import Config, ConfigManager
+from concord.application.config import Config, ConfigManager, GitConfig
 from concord.application.database import Database
+from concord.application.git import GitManager
 from concord.application.initializer import Initializer
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
@@ -333,3 +334,121 @@ def test_sync_and_restore_help_include_dry_run():
 
     assert "--dry-run" in runner.invoke(app, ["sync", "--help"]).output
     assert "--dry-run" in runner.invoke(app, ["restore", "--help"]).output
+
+
+def test_git_configuration_round_trip(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    expected = Config(
+        repository_path=home / "dotfiles",
+        git=GitConfig(enabled=True, auto_commit=False, auto_push=True, remote="upstream"),
+    )
+
+    ConfigManager().save(expected)
+    actual = ConfigManager().load()
+
+    assert actual.git == expected.git
+
+
+def test_initializer_creates_git_repository_and_initial_commit(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = tmp_path / "repository"
+
+    Initializer().initialize(
+        repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+
+    git = GitManager(repository)
+    status = git.status()
+    assert git.initialized
+    assert status.branch == "main"
+    assert status.message == "concord: initialize repository"
+    assert status.clean
+    assert (repository / ".gitignore").exists()
+    assert concord.config_file.exists()
+
+
+def test_git_commit_only_stages_paths_from_current_operation(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git = GitManager(repository)
+    git.initialize()
+    git.set_identity("Concord Test", "concord@example.com")
+    (repository / "bash").mkdir()
+    (repository / "nvim").mkdir()
+    (repository / "bash/config").write_text("one")
+    (repository / "nvim/config").write_text("one")
+    git.commit([Path(".")], "initial")
+    (repository / "bash/config").write_text("pending")
+    (repository / "nvim/config").write_text("committed")
+
+    commit = git.commit([Path("nvim")], "concord: sync nvim")
+
+    assert commit is not None
+    changed = git._run("show", "--name-only", "--pretty=", "HEAD").stdout.splitlines()
+    assert changed == ["nvim/config"]
+    assert git._run("status", "--porcelain", "--", "bash").stdout.startswith(" M")
+
+
+def test_sync_does_not_create_metadata_changes_when_target_is_clean(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("one")
+    instance.add(source, "bash")
+    before = instance.get("bash").updated_at
+
+    synchronized = instance.sync("bash")
+
+    assert synchronized == []
+    assert instance.get("bash").updated_at == before
+
+
+def test_repo_commands_and_bootstrap_are_exposed():
+    runner = CliRunner()
+    root_help = runner.invoke(app, ["--help"]).output
+    repo_help = runner.invoke(app, ["repo", "--help"]).output
+
+    assert "bootstrap" in root_help
+    for command in ("status", "log", "diff", "commit", "push", "pull", "remote", "init"):
+        assert command in repo_help
+
+
+def test_cli_init_and_add_create_automatic_commits(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    git_config = tmp_path / "gitconfig"
+    git_config.write_text(
+        "[user]\n\tname = Concord Test\n\temail = concord@example.com\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    repository = tmp_path / "repository"
+    runner = CliRunner()
+
+    initialized = runner.invoke(app, ["init", "--repository", str(repository)])
+    source = home / ".bashrc"
+    source.write_text("alias ll='ls -la'\n")
+    added = runner.invoke(app, ["add", str(source), "--name", "bash", "--yes"])
+
+    assert initialized.exit_code == 0, initialized.output
+    assert added.exit_code == 0, added.output
+    assert [message for _, _, message in GitManager(repository).log()] == [
+        "concord: add bash",
+        "concord: initialize repository",
+    ]
+
+
+def test_sensitive_files_are_detected_before_first_push(tmp_path):
+    repository = tmp_path / "repository"
+    (repository / "app").mkdir(parents=True)
+    (repository / "app/.env").write_text("TOKEN=secret")
+    (repository / "app/settings.toml").write_text("theme = 'nord'")
+    git = GitManager(repository)
+
+    assert git.sensitive_files() == [Path("app/.env")]

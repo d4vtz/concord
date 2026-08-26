@@ -185,12 +185,15 @@ class TargetManager:
 
     def sync(self, name: str | None = None) -> list[Target]:
         targets = [self.get(name)] if name else self.list()
-        for target in targets:
+        changed_targets = [target for target in targets if not self._target_diff(target).clean]
+        if not changed_targets:
+            return []
+        for target in changed_targets:
             self._write_target(target)
             target.touch()
             self._update_timestamp(target)
         self._persist_manifest()
-        return targets
+        return changed_targets
 
     def restore(self, name: str, *, force: bool = False) -> Target:
         target = self.get(name)
