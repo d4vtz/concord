@@ -261,6 +261,14 @@ informativas, salvo que se utilice el modo estricto:
 concord doctor --strict
 ```
 
+## Implementaciones pendientes
+
+- `concord edit gitignore`: abrir el archivo `.gitignore` del repositorio de
+  Concord en el editor configurado mediante `$VISUAL` o `$EDITOR`. Si el archivo
+  no existe, el comando deberá crearlo de forma segura. Abrir o guardar el
+  archivo no deberá crear un commit automáticamente; los cambios podrán
+  revisarse y confirmarse después con los comandos `concord repo`.
+
 ## Bootstrap desde GitHub
 
 Para reconstruir Concord en otra máquina directamente desde el remoto:
