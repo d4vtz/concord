@@ -339,6 +339,68 @@ La primera versión utilizará cifrado por destinatario de `age`; el cifrado con
 contraseña podrá evaluarse después, ya que dificulta la automatización segura de
 `sync`, `restore` y `bootstrap`.
 
+### Perfiles de configuración
+
+Implementar perfiles para agrupar targets que forman parte de una misma
+configuración. Esto permitirá instalar primero una configuración base y después
+componer sobre ella un entorno específico, como KDE, Qtile o un servidor.
+
+Ejemplo propuesto:
+
+```bash
+concord profile create base
+concord profile add base git ssh zsh
+
+concord profile create kde --include base
+concord profile add kde konsole plasma chrome
+
+concord profile restore kde
+```
+
+En este ejemplo, restaurar `kde` aplicará los targets de `base` y luego los
+targets propios de `kde`.
+
+Comandos previstos:
+
+```bash
+concord profile list
+concord profile show <profile>
+concord profile create <profile>
+concord profile add <profile> <target>...
+concord profile remove <profile> <target>...
+concord profile include <profile> <profile-base>...
+concord profile sync <profile>
+concord profile restore <profile>
+concord profile delete <profile>
+```
+
+Comportamiento esperado:
+
+- Un perfil contendrá referencias a targets existentes, no copias de sus
+  archivos ni targets nuevos.
+- Un mismo target podrá pertenecer a varios perfiles para reutilizar una
+  configuración común, sin permitir que una ruta pertenezca a dos targets.
+- Los perfiles podrán incluir otros perfiles para componer configuraciones por
+  capas, como `base` + `kde` o `base` + `qtile`.
+- Concord rechazará inclusiones circulares entre perfiles.
+- La composición tendrá un orden determinista: primero los perfiles incluidos,
+  en el orden declarado, y después los targets propios.
+- Si un target aparece más de una vez durante la composición, se procesará una
+  sola vez.
+- `profile sync` y `profile restore` admitirán `--dry-run` y mostrarán el orden
+  exacto de los targets antes de modificar archivos.
+- `profile restore` conservará las mismas confirmaciones y protecciones del
+  comando `restore`, incluido el tratamiento de archivos cifrados.
+- El manifiesto guardará la definición de los perfiles para que `bootstrap`
+  pueda reconstruirlos; SQLite seguirá siendo un índice local regenerable.
+- Eliminar un perfil no eliminará sus targets ni sus archivos.
+- `status` y `doctor` comprobarán targets inexistentes, perfiles vacíos y ciclos
+  de composición.
+
+Más adelante podrá añadirse un perfil activo por máquina, pero la primera
+versión no sincronizará automáticamente el nombre del equipo ni decidirá qué
+perfil restaurar sin confirmación.
+
 ## Bootstrap desde GitHub
 
 Para reconstruir Concord en otra máquina directamente desde el remoto:
