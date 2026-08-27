@@ -290,6 +290,55 @@ Comportamiento esperado:
 - Impedir que una misma ruta pertenezca a dos targets distintos.
 - Replicar todas las rutas conservando su ubicación relativa a `$HOME`.
 
+### Cifrado de archivos sensibles
+
+Implementar cifrado mediante `age`, evitando algoritmos o formatos propios.
+El archivo original permanecerá descifrado en el sistema del usuario, pero el
+repositorio almacenará únicamente su versión cifrada con la extensión `.age`.
+
+Flujo propuesto:
+
+```bash
+concord add ~/.ssh/config --name ssh --encrypt
+concord sync ssh
+concord restore ssh
+```
+
+También deberá ser posible cambiar el estado de un archivo ya registrado:
+
+```bash
+concord encrypt ssh .ssh/config
+concord decrypt ssh .ssh/config
+```
+
+Comportamiento esperado:
+
+- Registrar en el manifiesto qué rutas están cifradas y los destinatarios
+  públicos de `age` utilizados, pero nunca una identidad o clave privada.
+- Cifrar antes de copiar al repositorio durante `add` y `sync`; ningún archivo
+  temporal en texto plano deberá quedar dentro del repositorio.
+- Descifrar durante `restore` directamente hacia un archivo temporal seguro y
+  reemplazar el destino solamente cuando la operación termine correctamente.
+- Conservar permisos, ruta relativa a `$HOME` y pertenencia al target.
+- Admitir uno o varios destinatarios para poder restaurar desde distintas
+  máquinas y permitir rotación de claves.
+- Obtener la identidad privada desde una ruta configurada fuera del repositorio
+  o desde un agente compatible; nunca solicitar que se confirme en Git.
+- Hacer que `bootstrap` detecte archivos cifrados, compruebe la identidad antes
+  de restaurarlos y continúe con los archivos no cifrados si el usuario decide
+  omitirlos.
+- Mostrar en `status`, `doctor` y `--dry-run` qué archivos están cifrados sin
+  revelar su contenido ni material criptográfico privado.
+- Bloquear `decrypt` si convertiría el repositorio a texto plano sin una
+  confirmación explícita del usuario.
+- Mantener la detección de secretos como una defensa adicional: un archivo
+  sensible que no esté cifrado debe seguir generando una advertencia antes del
+  primer push.
+
+La primera versión utilizará cifrado por destinatario de `age`; el cifrado con
+contraseña podrá evaluarse después, ya que dificulta la automatización segura de
+`sync`, `restore` y `bootstrap`.
+
 ## Bootstrap desde GitHub
 
 Para reconstruir Concord en otra máquina directamente desde el remoto:
