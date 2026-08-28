@@ -73,6 +73,10 @@ def relative_to_home(path: Path) -> Path:
         raise ValueError("La ruta debe estar dentro de HOME.") from error
 
 
+def format_home_path(path: Path) -> str:
+    return str(Path("~") / relative_to_home(path))
+
+
 @dataclass(frozen=True)
 class GitOptions:
     message: str | None
@@ -465,17 +469,16 @@ def list_targets() -> None:
         return
     table = Table(box=box.ROUNDED, border_style="#4C566A", header_style="bold #88C0D0")
     table.add_column("Nombre", style="bold #D8DEE9")
-    table.add_column("Rutas", justify="right")
     table.add_column("Rutas locales", style="concord.path")
     table.add_column("Creado", style="concord.muted", no_wrap=True)
     table.add_column("Actualizado", style="concord.muted", no_wrap=True)
-    for target in targets:
+    for index, target in enumerate(targets):
         table.add_row(
             target.name,
-            str(len(target.paths)),
-            "\n".join(str(path.local_path) for path in target.paths),
+            "\n".join(format_home_path(path.local_path) for path in target.paths),
             format_date(target.created_at),
             format_date(target.updated_at),
+            end_section=index < len(targets) - 1,
         )
     console.print(table)
     console.print(f"[concord.muted]Total:[/] {len(targets)} target(s)")
@@ -685,8 +688,7 @@ def status(
     hints = {"clean": "Ninguna", "modified": "concord sync <target>", "missing": "concord restore <target>", "untracked": "concord sync <target>"}
     for item in items:
         label, color = labels[item.state]
-        counter = f" · {item.changed_paths}/{item.total_paths} rutas" if item.total_paths > 1 else ""
-        table.add_row(item.name, f"[{color}]{label}{counter}[/]", hints[item.state])
+        table.add_row(item.name, f"[{color}]{label}[/]", hints[item.state])
     console.print(table)
     clean = sum(item.state == "clean" for item in items)
     success(f"Comprobación terminada: {clean}/{len(items)} target(s) sin cambios.")

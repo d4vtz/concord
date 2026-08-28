@@ -162,7 +162,8 @@ copia en `repository/concord/.config/concord/concord.toml`. La base SQLite es un
 
 Cada target conserva `created_at`, la fecha en que fue registrado, y
 `updated_at`, la última vez que Concord lo sincronizó. `concord list` muestra
-ambas fechas en la zona horaria local, el número de rutas y cada ubicación.
+ambas fechas en la zona horaria local y cada ubicación relativa a `$HOME`. Los
+targets se separan horizontalmente para distinguir sus grupos de rutas.
 
 Al abrir por primera vez una instalación anterior, Concord migra
 automáticamente el manifiesto v1 y SQLite al esquema v2. Antes de escribir crea
@@ -196,9 +197,9 @@ eliminarse.
 - `missing`: la ruta local ya no existe y puede recuperarse con `restore`.
 - `untracked`: falta la copia almacenada en el repositorio.
 
-Para targets con varias rutas, `status` muestra cuántas están afectadas, por
-ejemplo `2/3 rutas`. El estado general usa esta prioridad: falta local, falta
-copia, modificado y limpio.
+`status` representa cada target como una sola unidad, aunque contenga varias
+rutas. El estado general usa esta prioridad: falta local, falta copia,
+modificado y limpio.
 
 `sync` y `restore` validan todas las rutas antes de escribir. Al operar sobre
 todos los targets, un fallo impide modificar cualquiera. `restore` sin

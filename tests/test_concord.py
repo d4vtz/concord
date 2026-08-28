@@ -188,6 +188,33 @@ def test_status_counts_changed_paths_and_prioritizes_missing(manager):
     assert (status.changed_paths, status.total_paths) == (2, 2)
 
 
+def test_list_groups_relative_paths_and_status_hides_path_counts(manager, monkeypatch):
+    instance, home, _ = manager
+    first = home / ".zshenv"
+    second = home / ".config/zsh"
+    first.write_text("one")
+    second.mkdir(parents=True)
+    (second / ".zshrc").write_text("two")
+    instance.add(first, "zsh")
+    instance.add_path("zsh", second)
+    monkeypatch.setattr("concord.cli.app.manager", lambda: instance)
+
+    listed = CliRunner().invoke(app, ["list"])
+
+    assert listed.exit_code == 0, listed.output
+    assert "~/.zshenv" in listed.output
+    assert "~/.config/zsh" in listed.output
+    assert str(home) not in listed.output
+    assert listed.output.count("├") >= len(instance.list())
+
+    first.write_text("changed")
+    status_result = CliRunner().invoke(app, ["status"])
+
+    assert status_result.exit_code == 0, status_result.output
+    assert "Modificado" in status_result.output
+    assert "1/2 rutas" not in status_result.output
+
+
 def test_status_sync_and_restore(manager):
     instance, home, _ = manager
     source = home / ".bashrc"
