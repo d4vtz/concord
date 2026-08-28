@@ -110,6 +110,9 @@ class GitManager:
     def commit(self, paths: list[Path], message: str) -> GitCommit | None:
         normalized = [path.as_posix() for path in paths]
         self._run("add", "-A", "--", *normalized)
+        return self.commit_staged(message)
+
+    def commit_staged(self, message: str) -> GitCommit | None:
         staged = self._run("diff", "--cached", "--quiet", check=False)
         if staged.returncode == 0:
             return None
@@ -117,6 +120,24 @@ class GitManager:
             raise ValueError(staged.stderr.strip() or "No fue posible comprobar el índice de Git.")
         self._run("commit", "-m", message)
         return GitCommit(self._run("rev-parse", "--short", "HEAD").stdout.strip(), message)
+
+    def tracked_ignored_files(self) -> list[Path]:
+        result = self._run("ls-files", "-ci", "--exclude-standard", "-z")
+        return sorted(
+            (Path(name) for name in result.stdout.split("\0") if name),
+            key=str,
+        )
+
+    def stage_ignore_update(self, ignored: list[Path]) -> None:
+        self._run("add", "--", ".gitignore")
+        if ignored:
+            self._run(
+                "rm",
+                "--cached",
+                "--ignore-unmatch",
+                "--",
+                *[path.as_posix() for path in ignored],
+            )
 
     def status(self, *, fetch: bool = False, remote: str = "origin") -> GitStatus:
         if not self.initialized:

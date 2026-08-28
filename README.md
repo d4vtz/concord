@@ -59,6 +59,9 @@ un nombre y correo y los guarda únicamente en el repositorio de dotfiles.
 ```bash
 concord add ~/.bashrc
 concord add ~/.config/nvim --name nvim
+concord edit nvim         # abre el target local sin sincronizarlo
+concord edit ignore       # edita .gitignore, confirma y publica el cambio
+concord edit ignore --no-push  # conserva localmente el commit
 concord list
 concord status
 concord diff              # compara todos los targets
@@ -84,6 +87,27 @@ concord doctor            # diagnostica la instalación sin modificarla
 local son únicos: una misma configuración no puede registrarse dos veces con
 nombres distintos. Los nombres que empiezan con punto se normalizan con el
 prefijo `dot_`.
+
+Los nombres `ignore`, `manifest` y `config` están reservados para recursos
+internos de Concord y no pueden utilizarse como nombres de targets.
+
+## Editar configuraciones
+
+`concord edit <target>` abre la ruta local original. Los directorios se abren
+como raíz del editor y los archivos desde su directorio padre. Este comando no
+ejecuta `sync`, no cambia la copia del repositorio y no crea commits; permite
+probar una configuración antes de sincronizarla explícitamente.
+
+Concord usa `$VISUAL`, después `$EDITOR` y, si ninguna variable está definida,
+busca `nvim`, `vim`, `vi` o `nano`. Los comandos configurados pueden incluir
+argumentos, por ejemplo `VISUAL="nvim -f"` o `EDITOR="code --wait"`.
+
+`concord edit ignore` es una operación especial. Exige un repositorio limpio,
+abre o crea `.gitignore` y, si cambia, deja de rastrear los archivos que ahora
+coincidan con sus reglas sin borrarlos del disco. Después crea el commit
+`concord: update ignore rules` y lo envía al remoto configurado. No utiliza
+force-push ni integra automáticamente cambios remotos. `--no-push` conserva el
+commit únicamente en la máquina local.
 
 ## Manifiesto portable
 
@@ -267,30 +291,6 @@ concord doctor --strict
 
 ## Implementaciones pendientes
 
-- `concord edit gitignore`: abrir el archivo `.gitignore` del repositorio de
-  Concord en el editor configurado mediante `$VISUAL` o `$EDITOR`. Si el archivo
-  no existe, el comando deberá crearlo de forma segura. Abrir o guardar el
-  archivo no deberá crear un commit automáticamente; los cambios podrán
-  revisarse y confirmarse después con los comandos `concord repo`.
-- `concord edit <target>`: abrir la ruta local original de un target en el
-  editor configurado mediante `$VISUAL` o `$EDITOR`. Si el target representa un
-  directorio, el editor deberá iniciarse usando ese directorio como carpeta de
-  trabajo y raíz del proyecto; si representa un archivo, deberá abrir el archivo
-  desde su directorio padre. El comando no editará directamente la copia del
-  repositorio ni ejecutará `sync` o creará commits al cerrar el editor.
-
-  ```bash
-  concord edit nvim
-  concord edit zsh --path ~/.zshenv
-  ```
-
-  Cuando un target contenga varias rutas, Concord deberá mostrar una selección
-  interactiva o permitir elegirla explícitamente mediante `--path`. En una
-  sesión sin TTY, una selección ambigua producirá un error descriptivo. Si no
-  están definidos `$VISUAL` ni `$EDITOR`, el comando deberá detenerse explicando
-  cómo configurarlos. Concord cambiará el directorio de trabajo únicamente para
-  el proceso del editor: al cerrarlo, la terminal del usuario permanecerá en el
-  directorio desde el que ejecutó el comando.
 - Implementar completado dinámico de shell para los nombres registrados. Al
   completar argumentos de comandos como `sync`, `restore`, `remove`, `diff` o
   `edit`, Concord deberá consultar los targets locales y mostrar únicamente los

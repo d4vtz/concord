@@ -36,6 +36,8 @@ class TargetDiff:
 
 
 class TargetManager:
+    RESERVED_NAMES = {"ignore", "manifest", "config"}
+
     def __init__(
         self,
         database: Database | None = None,
@@ -165,6 +167,10 @@ class TargetManager:
 
     def add(self, local_path: Path, name: str | None = None) -> Target:
         target = Target(local_path, name)
+        if target.name in self.RESERVED_NAMES:
+            raise ValueError(
+                f"'{target.name}' es un nombre reservado por Concord. Use otro nombre."
+            )
         with self.database.connect() as connection:
             duplicate = connection.execute(
                 "SELECT name FROM targets WHERE name = ? OR local_path = ? LIMIT 1",

@@ -1,3 +1,5 @@
+import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -73,6 +75,30 @@ def sync_commit_message(target_names: list[str]) -> str:
     if len(target_names) == 1:
         return f"{target_names[0]}: sync target"
     return "concord: sync all targets"
+
+
+def editor_command() -> list[str]:
+    configured = os.environ.get("VISUAL") or os.environ.get("EDITOR")
+    if configured:
+        command = shlex.split(configured)
+        if not command:
+            raise ValueError("La variable del editor está vacía.")
+        if shutil.which(command[0]) is None:
+            raise FileNotFoundError(f"No se encontró el editor configurado: {command[0]}")
+        return command
+    for candidate in ("nvim", "vim", "vi", "nano"):
+        if shutil.which(candidate):
+            return [candidate]
+    raise FileNotFoundError(
+        "No se encontró un editor. Define VISUAL o EDITOR, por ejemplo: export EDITOR=nvim"
+    )
+
+
+def open_in_editor(path: Path) -> int:
+    path = path.expanduser().resolve()
+    cwd = path if path.is_dir() else path.parent
+    argument = "." if path.is_dir() else path.name
+    return subprocess.run([*editor_command(), argument], cwd=cwd, check=False).returncode
 
 
 def finalize_git(
@@ -361,6 +387,83 @@ def list_targets() -> None:
         )
     console.print(table)
     console.print(f"[concord.muted]Total:[/] {len(targets)} target(s)")
+
+
+@app.command()
+def edit(
+    name: str = typer.Argument(..., help="Target o recurso especial que se abrirá."),
+    no_push: bool = typer.Option(
+        False,
+        "--no-push",
+        help="Conserva localmente el commit generado al editar ignore.",
+    ),
+) -> None:
+    """Abre un target local o edita un recurso especial de Concord."""
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    if name != "ignore":
+        if name in TargetManager.RESERVED_NAMES:
+            execute(
+                lambda: (_ for _ in ()).throw(
+                    ValueError(f"El recurso especial '{name}' todavía no está implementado.")
+                )
+            )
+        target = execute(
+            lambda: target_manager.get(name),
+            hint="Consulta los nombres disponibles con: concord list",
+        )
+        heading("EDITAR TARGET", "Abriendo la configuración local sin sincronizarla")
+        result = execute(lambda: open_in_editor(target.local_path))
+        if result:
+            raise typer.Exit(result)
+        success(
+            f"Se cerró el editor de '{name}'.",
+            hint=f"Cuando termines de probar los cambios: concord sync {name}",
+        )
+        return
+
+    heading("EDITAR IGNORE", "Actualizando las exclusiones del repositorio")
+    config = ConfigManager().load()
+    if not config.git.enabled:
+        execute(lambda: (_ for _ in ()).throw(ValueError("Git está desactivado en Concord.")))
+    git = GitManager(config.repository_path)
+    if not git.initialized:
+        execute(lambda: (_ for _ in ()).throw(ValueError("El repositorio Git no está inicializado.")))
+    if git.changed():
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("El repositorio tiene cambios pendientes; confírmalos o descártalos antes de editar ignore.")
+            ),
+            hint="Revisa el estado con: concord repo status",
+        )
+    ignore_path = config.repository_path / ".gitignore"
+    before = ignore_path.read_bytes() if ignore_path.exists() else None
+    ignore_path.touch(exist_ok=True)
+    result = execute(lambda: open_in_editor(ignore_path))
+    if result:
+        raise typer.Exit(result)
+    after = ignore_path.read_bytes()
+    if before == after:
+        success(".gitignore no cambió; no se creó ningún commit.")
+        return
+    ignored = execute(git.tracked_ignored_files)
+    if ignored:
+        warning("Estos archivos dejarán de estar rastreados por Git:")
+        for path in ignored:
+            console.print(f"  [concord.path]{path.as_posix()}[/]")
+    execute(lambda: git.stage_ignore_update(ignored))
+    commit = execute(lambda: git.commit_staged("concord: update ignore rules"))
+    if commit is None:
+        success("No hubo cambios que confirmar.")
+        return
+    success(f"Commit creado: {commit.sha}  {commit.message}")
+    if no_push:
+        warning("El commit se conservó localmente por solicitud del usuario.")
+        return
+    execute(
+        lambda: git.push(config.git.remote),
+        hint="El commit local se conservó. Reintenta con: concord repo push",
+    )
+    success(f"Cambios enviados a {config.git.remote}/{git.status(remote=config.git.remote).branch}.")
 
 
 def render_git_status(git_status) -> None:

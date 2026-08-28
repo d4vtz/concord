@@ -11,7 +11,7 @@ from concord.application.git import GitManager
 from concord.application.initializer import Initializer
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
-from concord.cli.app import app, sync_commit_message
+from concord.cli.app import app, editor_command, sync_commit_message
 
 
 def configure_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -422,6 +422,79 @@ def test_sync_commit_message_stays_general_for_multiple_targets():
 def test_sync_commit_message_rejects_empty_changes():
     with pytest.raises(ValueError, match="No hay targets modificados"):
         sync_commit_message([])
+
+
+def test_editor_command_prefers_visual_and_preserves_arguments(monkeypatch):
+    monkeypatch.setenv("VISUAL", "nvim -f")
+    monkeypatch.setenv("EDITOR", "vim")
+    monkeypatch.setattr("concord.cli.app.shutil.which", lambda name: f"/usr/bin/{name}")
+
+    assert editor_command() == ["nvim", "-f"]
+
+
+def test_reserved_target_names_are_rejected(manager):
+    instance, home, _ = manager
+    source = home / ".config/example"
+    source.mkdir(parents=True)
+
+    for name in ("ignore", "manifest", "config"):
+        with pytest.raises(ValueError, match="reservado"):
+            instance.add(source, name)
+
+
+def test_edit_target_opens_local_path_without_syncing(manager, monkeypatch):
+    instance, home, repository = manager
+    source = home / ".bashrc"
+    source.write_text("before")
+    instance.add(source, "bash")
+
+    def fake_editor(path: Path) -> int:
+        assert path == source.resolve()
+        path.write_text("after")
+        return 0
+
+    monkeypatch.setattr("concord.cli.app.open_in_editor", fake_editor)
+    monkeypatch.setattr("concord.cli.app.manager", lambda: instance)
+    result = CliRunner().invoke(app, ["edit", "bash"])
+
+    assert result.exit_code == 0, result.output
+    assert source.read_text() == "after"
+    assert (repository / "bash/.bashrc").read_text() == "before"
+
+
+def test_edit_ignore_untracks_commits_and_pushes(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = tmp_path / "repository"
+    remote = tmp_path / "remote.git"
+    remote.mkdir()
+    GitManager(remote)._run("init", "--bare")
+    Initializer().initialize(
+        repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    git = GitManager(repository)
+    git.set_remote(str(remote))
+    secret = repository / "private.env"
+    secret.write_text("TOKEN=test\n")
+    git.commit([Path("private.env")], "add fixture")
+
+    def fake_editor(path: Path) -> int:
+        path.write_text(path.read_text() + "private.env\n")
+        return 0
+
+    monkeypatch.setattr("concord.cli.app.open_in_editor", fake_editor)
+    result = CliRunner().invoke(app, ["edit", "ignore"])
+
+    assert result.exit_code == 0, result.output
+    assert secret.exists()
+    assert "private.env" not in git._run("ls-files").stdout.splitlines()
+    assert git.log()[0][2] == "concord: update ignore rules"
+    remote_head = git._run(
+        "--git-dir", str(remote), "log", "--all", "-1", "--pretty=%s"
+    ).stdout.strip()
+    assert remote_head == "concord: update ignore rules"
 
 
 def test_repo_commands_and_bootstrap_are_exposed():
