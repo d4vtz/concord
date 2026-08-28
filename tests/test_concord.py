@@ -11,7 +11,7 @@ from concord.application.git import GitManager
 from concord.application.initializer import Initializer
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
-from concord.cli.app import app
+from concord.cli.app import app, sync_commit_message
 
 
 def configure_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -411,6 +411,19 @@ def test_sync_does_not_create_metadata_changes_when_target_is_clean(manager):
     assert instance.get("bash").updated_at == before
 
 
+def test_sync_commit_message_highlights_single_changed_target():
+    assert sync_commit_message(["nvim"]) == "nvim: sync target"
+
+
+def test_sync_commit_message_stays_general_for_multiple_targets():
+    assert sync_commit_message(["nvim", "zsh"]) == "concord: sync all targets"
+
+
+def test_sync_commit_message_rejects_empty_changes():
+    with pytest.raises(ValueError, match="No hay targets modificados"):
+        sync_commit_message([])
+
+
 def test_repo_commands_and_bootstrap_are_exposed():
     runner = CliRunner()
     root_help = runner.invoke(app, ["--help"]).output
@@ -444,6 +457,53 @@ def test_cli_init_and_add_create_automatic_commits(tmp_path, monkeypatch):
         "concord: add bash",
         "concord: initialize repository",
     ]
+
+
+def test_cli_global_sync_highlights_only_changed_target(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    git_config = tmp_path / "gitconfig"
+    git_config.write_text(
+        "[user]\n\tname = Concord Test\n\temail = concord@example.com\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    repository = tmp_path / "repository"
+    runner = CliRunner()
+
+    runner.invoke(app, ["init", "--repository", str(repository)])
+    source = home / ".bashrc"
+    source.write_text("one\n")
+    runner.invoke(app, ["add", str(source), "--name", "bash", "--yes"])
+    source.write_text("two\n")
+
+    synchronized = runner.invoke(app, ["sync", "--yes"])
+
+    assert synchronized.exit_code == 0, synchronized.output
+    assert GitManager(repository).log()[0][2] == "bash: sync target"
+
+
+def test_cli_sync_dry_run_previews_message_for_changed_targets(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = tmp_path / "repository"
+    runner = CliRunner()
+
+    initialized = runner.invoke(app, ["init", "--repository", str(repository)])
+    assert initialized.exit_code == 0, initialized.output
+    source = home / ".bashrc"
+    source.write_text("one\n")
+    runner.invoke(app, ["add", str(source), "--name", "bash"])
+    config = ConfigManager().load()
+    config.git = GitConfig(enabled=True, auto_commit=True)
+    ConfigManager().save(config)
+    source.write_text("two\n")
+
+    preview = runner.invoke(app, ["sync", "--dry-run"])
+
+    assert preview.exit_code == 0, preview.output
+    assert "bash: sync target" in preview.output
 
 
 def test_sensitive_files_are_detected_before_first_push(tmp_path):

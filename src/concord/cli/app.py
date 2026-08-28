@@ -67,6 +67,14 @@ def git_paths(*names: str) -> list[Path]:
     return sorted({Path(name) for name in (*names, "concord")}, key=str)
 
 
+def sync_commit_message(target_names: list[str]) -> str:
+    if not target_names:
+        raise ValueError("No hay targets modificados para crear el mensaje del commit.")
+    if len(target_names) == 1:
+        return f"{target_names[0]}: sync target"
+    return "concord: sync all targets"
+
+
 def finalize_git(
     paths: list[Path],
     default_message: str,
@@ -500,9 +508,9 @@ def sync(
             command="concord sync" + (f" {name}" if name else ""),
         )
         config = ConfigManager().load()
-        default_message = f"concord: sync {name}" if name else "concord: sync all targets"
+        changed_names = [target_diff.name for target_diff in differences if not target_diff.clean]
         if (
-            any(not target_diff.clean for target_diff in differences)
+            changed_names
             and config.git.enabled
             and config.git.auto_commit
             and not no_commit
@@ -510,7 +518,7 @@ def sync(
             will_push = config.git.auto_push if push is None else push
             details(
                 [
-                    ("Commit", message or default_message),
+                    ("Commit", message or sync_commit_message(changed_names)),
                     ("Push", f"sí, a {config.git.remote}" if will_push else "no"),
                 ],
                 title="Git (simulación)",
@@ -522,7 +530,7 @@ def sync(
         console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {target.local_path}[/]")
     if targets:
         target_names = [target.name for target in targets]
-        default_message = f"concord: sync {name}" if name else "concord: sync all targets"
+        default_message = sync_commit_message(target_names)
         execute(
             lambda: finalize_git(
                 git_paths(*target_names),

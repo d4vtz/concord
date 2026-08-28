@@ -174,10 +174,14 @@ interactivo, Concord permite editar un mensaje predeterminado como:
 
 ```text
 concord: add nvim
-concord: sync nvim
+nvim: sync target
 concord: sync all targets
 concord: remove nvim
 ```
+
+El mensaje de `sync` depende de los targets realmente modificados: si solo uno
+cambia se utiliza `<target>: sync target`; si cambian dos o más se utiliza
+`concord: sync all targets`. Una sincronización limpia no crea ningún commit.
 
 Cada commit prepara exclusivamente las rutas afectadas por la operación actual;
 los cambios pendientes de otros targets no se mezclan. Las opciones disponibles
@@ -314,13 +318,6 @@ concord doctor --strict
   ejemplo, `profile add` sugerirá targets y `profile restore` sugerirá perfiles.
   La consulta deberá ser suficientemente ligera para ejecutarse en cada
   pulsación de tabulador y cerrar siempre sus conexiones a SQLite.
-- Diferenciar los mensajes predeterminados según la operación. Al registrar un
-  target nuevo, `add` conservará `concord: add <target>`. Al sincronizar un
-  target existente, `sync` utilizará `<target>: sync target`, por ejemplo
-  `nvim: sync target`, para que el nombre de la configuración destaque en el
-  historial. Una sincronización de todos los targets conservará el mensaje
-  general `concord: sync all targets`.
-
 ### Targets con múltiples rutas
 
 ```bash
