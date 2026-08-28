@@ -59,6 +59,9 @@ un nombre y correo y los guarda únicamente en el repositorio de dotfiles.
 ```bash
 concord add ~/.bashrc
 concord add ~/.config/nvim --name nvim
+concord add ~/.config/zsh --name zsh
+concord add-path zsh ~/.zshenv
+concord remove-path zsh ~/.zshenv
 concord edit nvim         # abre el target local sin sincronizarlo
 concord edit ignore       # edita .gitignore, confirma y publica el cambio
 concord edit ignore --no-push  # conserva localmente el commit
@@ -84,10 +87,11 @@ concord repo push         # publica commits locales
 concord doctor            # diagnostica la instalación sin modificarla
 ```
 
-`add` acepta únicamente rutas dentro de `$HOME`. Tanto el nombre como la ruta
-local son únicos: una misma configuración no puede registrarse dos veces con
-nombres distintos. Los nombres que empiezan con punto se normalizan con el
-prefijo `dot_`.
+`add` crea un target nuevo y acepta únicamente rutas dentro de `$HOME`. Para
+agregar otra ruta a un target existente se usa `add-path`; `remove-path` deja de
+administrarla sin borrarla de HOME. Ninguna ruta puede ser igual, padre o
+descendiente de otra ruta registrada, incluso dentro del mismo target. Los
+nombres que empiezan con punto se normalizan con el prefijo `dot_`.
 
 Los nombres `ignore`, `manifest` y `config` están reservados para recursos
 internos de Concord y no pueden utilizarse como nombres de targets.
@@ -138,12 +142,16 @@ concord --install-completion
 configuración y la lista portable de targets:
 
 ```toml
-version = 1
+version = 2
 repository_path = "~/.local/share/concord/repository"
 
-targets = [
-    { name = "concord", relative_path = ".config/concord", type = "directory", created_at = "2026-08-25T12:00:00+00:00", updated_at = "2026-08-25T12:00:00+00:00" },
-    { name = "nvim", relative_path = ".config/nvim", type = "directory", created_at = "2026-08-25T12:05:00+00:00", updated_at = "2026-08-25T14:30:00+00:00" },
+[[targets]]
+name = "zsh"
+created_at = "2026-08-25T12:05:00+00:00"
+updated_at = "2026-08-25T14:30:00+00:00"
+paths = [
+    { relative_path = ".config/zsh", type = "directory" },
+    { relative_path = ".zshenv", type = "file" },
 ]
 ```
 
@@ -154,7 +162,12 @@ copia en `repository/concord/.config/concord/concord.toml`. La base SQLite es un
 
 Cada target conserva `created_at`, la fecha en que fue registrado, y
 `updated_at`, la última vez que Concord lo sincronizó. `concord list` muestra
-ambas fechas en la zona horaria local.
+ambas fechas en la zona horaria local, el número de rutas y cada ubicación.
+
+Al abrir por primera vez una instalación anterior, Concord migra
+automáticamente el manifiesto v1 y SQLite al esquema v2. Antes de escribir crea
+un respaldo fechado en `~/.local/share/concord/backups/`, actualiza la copia del
+manifiesto y genera `concord: migrate manifest v2`, respetando `auto_push`.
 
 ## Recuperar configuraciones en otra máquina
 
@@ -182,6 +195,16 @@ eliminarse.
 - `modified`: hay cambios locales pendientes de `sync`.
 - `missing`: la ruta local ya no existe y puede recuperarse con `restore`.
 - `untracked`: falta la copia almacenada en el repositorio.
+
+Para targets con varias rutas, `status` muestra cuántas están afectadas, por
+ejemplo `2/3 rutas`. El estado general usa esta prioridad: falta local, falta
+copia, modificado y limpio.
+
+`sync` y `restore` validan todas las rutas antes de escribir. Al operar sobre
+todos los targets, un fallo impide modificar cualquiera. `restore` sin
+`--force` aborta si existe al menos uno de los destinos; con `--force` reemplaza
+el target completo. Las instalaciones físicas usan temporales y respaldos para
+revertir cambios si falla el reemplazo.
 
 ## Revisar cambios antes de sincronizar
 
@@ -313,21 +336,6 @@ concord doctor --strict
 ```
 
 ## Implementaciones pendientes
-
-### Targets con múltiples rutas
-
-```bash
-concord add ~/.config/zsh --name zsh
-concord add ~/.zshenv --name zsh
-```
-
-Comportamiento esperado:
-
-- Crear el target si todavía no existe.
-- Reutilizar el target cuando el valor de `--name` coincida.
-- Permitir que un target contenga varias rutas.
-- Impedir que una misma ruta pertenezca a dos targets distintos.
-- Replicar todas las rutas conservando su ubicación relativa a `$HOME`.
 
 ### Cifrado de archivos sensibles
 

@@ -72,6 +72,122 @@ def test_duplicate_path_is_rejected(manager):
         instance.add(source, "shell")
 
 
+def test_target_can_add_multiple_paths(manager):
+    instance, home, repository = manager
+    directory = home / ".config/zsh"
+    directory.mkdir(parents=True)
+    (directory / ".zshrc").write_text("source plugins\n")
+    environment = home / ".zshenv"
+    environment.write_text("ZDOTDIR=$HOME/.config/zsh\n")
+    instance.add(directory, "zsh")
+    (directory / ".zshrc").write_text("local change not synchronized\n")
+
+    target = instance.add_path("zsh", environment)
+
+    assert [path.local_path for path in target.paths] == [directory, environment]
+    assert (repository / "zsh/.config/zsh/.zshrc").exists()
+    assert (repository / "zsh/.config/zsh/.zshrc").read_text() == "source plugins\n"
+    assert (repository / "zsh/.zshenv").read_text() == environment.read_text()
+    manifest = ConfigManager().load()
+    zsh = next(item for item in manifest.targets if item.name == "zsh")
+    assert [path.relative_path for path in zsh.paths] == [Path(".config/zsh"), Path(".zshenv")]
+
+
+def test_overlapping_paths_are_rejected_even_within_same_target(manager):
+    instance, home, _ = manager
+    directory = home / ".config/nvim"
+    nested = directory / "lua"
+    nested.mkdir(parents=True)
+    instance.add(directory, "nvim")
+
+    with pytest.raises(ValueError, match="solapa"):
+        instance.add_path("nvim", nested)
+    with pytest.raises(ValueError, match="solapa"):
+        instance.add(nested, "lua")
+
+
+def test_existing_target_requires_add_path_command(manager):
+    instance, home, _ = manager
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.touch()
+    second.touch()
+    instance.add(first, "zsh")
+
+    with pytest.raises(ValueError, match="add-path"):
+        instance.add(second, "zsh")
+
+
+def test_remove_path_keeps_local_file_and_rejects_empty_target(manager):
+    instance, home, repository = manager
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.write_text("one")
+    second.write_text("two")
+    instance.add(first, "zsh")
+    instance.add_path("zsh", second)
+
+    target = instance.remove_path("zsh", second)
+
+    assert second.exists()
+    assert not (repository / "zsh/.zprofile").exists()
+    assert [path.local_path for path in target.paths] == [first]
+    with pytest.raises(ValueError, match="concord remove zsh"):
+        instance.remove_path("zsh", first)
+
+
+def test_sync_all_validates_every_path_before_writing(manager):
+    instance, home, repository = manager
+    first = home / ".first"
+    second = home / ".second"
+    first.write_text("stored first")
+    second.write_text("stored second")
+    instance.add(first, "first")
+    instance.add(second, "second")
+    first.write_text("changed first")
+    second.unlink()
+
+    with pytest.raises(FileNotFoundError):
+        instance.sync()
+
+    assert (repository / "first/.first").read_text() == "stored first"
+
+
+def test_restore_multi_path_aborts_before_writing_on_collision(manager):
+    instance, home, _ = manager
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.write_text("stored first")
+    second.write_text("stored second")
+    instance.add(first, "zsh")
+    instance.add_path("zsh", second)
+    first.unlink()
+    second.write_text("local collision")
+
+    with pytest.raises(FileExistsError):
+        instance.restore("zsh")
+
+    assert not first.exists()
+    assert second.read_text() == "local collision"
+
+
+def test_status_counts_changed_paths_and_prioritizes_missing(manager):
+    instance, home, _ = manager
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.write_text("one")
+    second.write_text("two")
+    instance.add(first, "zsh")
+    instance.add_path("zsh", second)
+    first.write_text("changed")
+    second.unlink()
+
+    status = next(item for item in instance.status() if item.name == "zsh")
+
+    assert status.state == "missing"
+    assert (status.changed_paths, status.total_paths) == (2, 2)
+
+
 def test_status_sync_and_restore(manager):
     instance, home, _ = manager
     source = home / ".bashrc"
@@ -228,6 +344,75 @@ def test_database_migrates_updated_at_column(tmp_path):
             "SELECT created_at, updated_at FROM targets WHERE id = '1'"
         ).fetchone()
     assert row == ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00")
+
+
+def test_first_command_migrates_manifest_and_database_to_v2(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    concord.config_dir.mkdir(parents=True)
+    concord.config_file.write_text(
+        """
+version = 1
+repository_path = "REPOSITORY"
+
+[git]
+enabled = true
+auto_commit = true
+auto_push = false
+remote = "origin"
+
+[[targets]]
+name = "concord"
+relative_path = ".config/concord"
+type = "directory"
+created_at = "2026-01-01T00:00:00+00:00"
+updated_at = "2026-01-01T00:00:00+00:00"
+""".replace("REPOSITORY", str(repository))
+    )
+    database = Database(concord.database_file)
+    with database.connect() as connection:
+        connection.execute(
+            """
+            CREATE TABLE targets (
+                id TEXT PRIMARY KEY, name TEXT UNIQUE, local_path TEXT,
+                type TEXT, created_at TEXT, updated_at TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO targets VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "1",
+                "concord",
+                str(concord.config_dir),
+                "directory",
+                "2026-01-01T00:00:00+00:00",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    git = GitManager(repository)
+    git.initialize()
+    git.set_identity("Concord Test", "concord@example.com")
+    (repository / "old").write_text("fixture")
+    git.commit([Path(".")], "initial")
+
+    result = CliRunner().invoke(app, ["list"])
+
+    assert result.exit_code == 0, result.output
+    assert ConfigManager().load().source_version == 2
+    assert "paths" in concord.config_file.read_text()
+    assert list((concord.data_dir / "backups").glob("concord-v1-*.toml"))
+    with database.connect() as connection:
+        columns = {row[1] for row in connection.execute("PRAGMA table_info(targets)")}
+        count = connection.execute("SELECT COUNT(*) FROM target_paths").fetchone()[0]
+    assert "local_path" not in columns
+    assert count == 1
+    assert git.log()[0][2] == "concord: migrate manifest v2"
 
 
 def test_diff_reports_added_modified_and_deleted_files(manager):
@@ -465,6 +650,29 @@ def test_edit_target_opens_local_path_without_syncing(manager, monkeypatch):
     assert (repository / "bash/.bashrc").read_text() == "before"
 
 
+def test_edit_multi_path_requires_or_accepts_explicit_path(manager, monkeypatch):
+    instance, home, _ = manager
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.write_text("one")
+    second.write_text("two")
+    instance.add(first, "zsh")
+    instance.add_path("zsh", second)
+    opened = []
+    monkeypatch.setattr("concord.cli.app.manager", lambda: instance)
+    monkeypatch.setattr(
+        "concord.cli.app.open_in_editor", lambda path: opened.append(path) or 0
+    )
+
+    ambiguous = CliRunner().invoke(app, ["edit", "zsh"])
+    selected = CliRunner().invoke(app, ["edit", "zsh", "--path", str(second)])
+
+    assert ambiguous.exit_code == 1
+    assert "contiene varias rutas" in ambiguous.output
+    assert selected.exit_code == 0, selected.output
+    assert opened == [second.resolve()]
+
+
 def test_edit_ignore_untracks_commits_and_pushes(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
@@ -519,9 +727,10 @@ def test_target_completion_falls_back_to_read_only_database(tmp_path, monkeypatc
     database = Database(concord.database_file)
     database.initialize()
     with database.connect() as connection:
+        connection.execute("INSERT INTO targets VALUES (?, ?, ?, ?)", ("1", "zsh", "now", "now"))
         connection.execute(
-            "INSERT INTO targets VALUES (?, ?, ?, ?, ?, ?)",
-            ("1", "zsh", str(home / ".config/zsh"), "directory", "now", "now"),
+            "INSERT INTO target_paths VALUES (?, ?, ?, ?, ?)",
+            ("p1", "1", str(home / ".config/zsh"), "directory", 0),
         )
 
     assert complete_targets("zs") == [("zsh", str(home / ".config/zsh"))]
@@ -579,6 +788,8 @@ def test_repo_commands_and_bootstrap_are_exposed():
     repo_help = runner.invoke(app, ["repo", "--help"]).output
 
     assert "bootstrap" in root_help
+    assert "add-path" in root_help
+    assert "remove-path" in root_help
     for command in ("status", "log", "diff", "commit", "push", "pull", "remote", "init"):
         assert command in repo_help
 
@@ -630,6 +841,33 @@ def test_cli_global_sync_highlights_only_changed_target(tmp_path, monkeypatch):
 
     assert synchronized.exit_code == 0, synchronized.output
     assert GitManager(repository).log()[0][2] == "bash: sync target"
+
+
+def test_cli_add_and_remove_path_create_specific_commits(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    git_config = tmp_path / "gitconfig"
+    git_config.write_text(
+        "[user]\n\tname = Concord Test\n\temail = concord@example.com\n"
+    )
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(git_config))
+    repository = tmp_path / "repository"
+    runner = CliRunner()
+    runner.invoke(app, ["init", "--repository", str(repository)])
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.write_text("one")
+    second.write_text("two")
+    runner.invoke(app, ["add", str(first), "--name", "zsh", "--yes"])
+
+    added = runner.invoke(app, ["add-path", "zsh", str(second), "--yes"])
+    removed = runner.invoke(app, ["remove-path", "zsh", str(second), "--yes"])
+
+    assert added.exit_code == 0, added.output
+    assert removed.exit_code == 0, removed.output
+    messages = [message for _, _, message in GitManager(repository).log()[:2]]
+    assert messages == ["zsh: remove .zprofile", "zsh: add .zprofile"]
 
 
 def test_cli_sync_dry_run_previews_message_for_changed_targets(tmp_path, monkeypatch):
@@ -713,6 +951,32 @@ def test_doctor_detects_database_manifest_mismatch(tmp_path, monkeypatch):
     check = next(item for item in report.checks if item.name == "Índice local")
     assert check.state == "failure"
     assert "concord import --replace" in check.hint
+
+
+def test_doctor_accepts_multiple_paths_and_detects_path_mismatch(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    Initializer().initialize(
+        tmp_path / "repository",
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    first = home / ".zshenv"
+    second = home / ".zprofile"
+    first.write_text("one")
+    second.write_text("two")
+    TargetManager().add(first, "zsh")
+    TargetManager().add_path("zsh", second)
+
+    assert Doctor().run().failures == 0
+
+    with Database(concord.database_file).connect() as connection:
+        connection.execute("DELETE FROM target_paths WHERE local_path = ?", (str(second),))
+    report = Doctor().run()
+    check = next(item for item in report.checks if item.name == "Índice local")
+    assert check.state == "failure"
 
 
 def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch):

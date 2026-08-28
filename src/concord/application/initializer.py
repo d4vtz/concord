@@ -3,7 +3,8 @@ from pathlib import Path
 
 from concord import application as concord
 from concord.application.config import (CONCORD_TARGET, Config, ConfigManager,
-                                        GitConfig, TargetConfig)
+                                        GitConfig, TargetConfig,
+                                        TargetPathConfig)
 from concord.application.database import Database
 from concord.application.git import GitManager
 from concord.application.repository import RepositoryManager
@@ -52,8 +53,12 @@ class Initializer:
             config,
             TargetConfig(
                 name=CONCORD_TARGET,
-                relative_path=concord.config_dir.relative_to(Path.home()),
-                type="directory",
+                paths=[
+                    TargetPathConfig(
+                        relative_path=concord.config_dir.relative_to(Path.home()),
+                        type="directory",
+                    )
+                ],
                 created_at=now,
                 updated_at=now,
             ),

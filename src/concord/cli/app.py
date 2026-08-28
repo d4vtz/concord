@@ -20,7 +20,7 @@ from concord.application.initializer import Initializer
 from concord.application.target_manager import TargetManager
 from concord.cli.completion import (complete_editables,
                                     complete_removable_targets,
-                                    complete_targets)
+                                    complete_target_paths, complete_targets)
 from concord.cli.ui import console, details, execute, heading, success, warning
 
 app = typer.Typer(
@@ -37,11 +37,40 @@ repo_app.add_typer(remote_app, name="remote")
 def manager() -> TargetManager:
     if not concord.is_initialized():
         raise ValueError("Concord todavía no está inicializado.")
-    return TargetManager()
+    target_manager = TargetManager()
+    if target_manager.manifest_backup:
+        config = ConfigManager().load()
+        if config.git.enabled and config.git.auto_commit:
+            git = GitManager(config.repository_path)
+            if not git.initialized:
+                git.initialize()
+            if all(git.identity()):
+                commit = git.commit(git_paths(CONCORD_TARGET), "concord: migrate manifest v2")
+                if commit and config.git.auto_push:
+                    try:
+                        push_with_secret_check(git, config.git.remote)
+                    except (FileNotFoundError, ValueError) as error:
+                        warning(str(error))
+                        warning("La migración quedó confirmada localmente; reintenta con concord repo push.")
+            else:
+                warning("La migración quedó pendiente de commit porque Git no tiene identidad.")
+        success(
+            "Manifiesto migrado a la versión 2.",
+            hint=f"Respaldo: {target_manager.manifest_backup}",
+        )
+    return target_manager
 
 
 def format_date(value: datetime) -> str:
     return value.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def relative_to_home(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    try:
+        return resolved.relative_to(Path.home().resolve())
+    except ValueError as error:
+        raise ValueError("La ruta debe estar dentro de HOME.") from error
 
 
 @dataclass(frozen=True)
@@ -340,12 +369,13 @@ def add(
         lambda: target_manager.add(path, name=name),
         hint="Usa una ruta existente dentro de HOME y un nombre que no esté registrado.",
     )
-    destination = target_manager.repository.target_path(target.name) / target.local_path.relative_to(Path.home())
+    target_path = target.paths[0]
+    destination = target_manager.repository.target_path(target.name) / target_path.relative_path
     details(
         [
             ("Nombre", target.name),
-            ("Tipo", "directorio" if target.local_path.is_dir() else "archivo"),
-            ("Origen", str(target.local_path)),
+            ("Tipo", "directorio" if target_path.type.value == "directory" else "archivo"),
+            ("Origen", str(target_path.local_path)),
             ("Copia", str(destination)),
             ("Archivos", str(len(target.get_files()))),
             ("Creado", format_date(target.created_at)),
@@ -364,6 +394,65 @@ def add(
     success(f"'{target.name}' fue agregado correctamente.", hint=f"Comprueba su estado con: concord status")
 
 
+@app.command("add-path")
+def add_path(
+    name: str = typer.Argument(..., autocompletion=complete_targets),
+    path: Path = typer.Argument(..., help="Nueva ruta local del target."),
+    message: str | None = typer.Option(None, "--message", "-m"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    no_commit: bool = typer.Option(False, "--no-commit"),
+    push: bool | None = typer.Option(None, "--push/--no-push"),
+) -> None:
+    """Agrega una ruta a un target existente."""
+    heading("AGREGAR RUTA", "Ampliando una configuración existente")
+    target = execute(
+        lambda: manager().add_path(name, path),
+        hint="La ruta debe existir, estar dentro de HOME y no solaparse con otra.",
+    )
+    added = execute(lambda: relative_to_home(path)).as_posix()
+    execute(
+        lambda: finalize_git(
+            git_paths(name),
+            f"{name}: add {added}",
+            git_command_options(message, yes, no_commit, push),
+        )
+    )
+    success(f"Se agregó '{added}' a '{name}'.", hint=f"El target contiene {len(target.paths)} rutas.")
+
+
+@app.command("remove-path")
+def remove_path(
+    name: str = typer.Argument(..., autocompletion=complete_removable_targets),
+    path: Path = typer.Argument(
+        ...,
+        help="Ruta registrada que dejará de administrarse.",
+        autocompletion=complete_target_paths,
+    ),
+    message: str | None = typer.Option(None, "--message", "-m"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+    no_commit: bool = typer.Option(False, "--no-commit"),
+    push: bool | None = typer.Option(None, "--push/--no-push"),
+) -> None:
+    """Retira una ruta de un target sin borrarla de HOME."""
+    heading("RETIRAR RUTA", "Dejando de administrar una parte del target")
+    relative = execute(lambda: relative_to_home(path)).as_posix()
+    target = execute(
+        lambda: manager().remove_path(name, path),
+        hint=f"Si es la única ruta, elimina el target completo con: concord remove {name}",
+    )
+    execute(
+        lambda: finalize_git(
+            git_paths(name),
+            f"{name}: remove {relative}",
+            git_command_options(message, yes, no_commit, push),
+        )
+    )
+    success(
+        f"'{relative}' permanece en HOME, pero ya no pertenece a '{name}'.",
+        hint=f"El target conserva {len(target.paths)} rutas.",
+    )
+
+
 @app.command("list")
 def list_targets() -> None:
     """Muestra los targets registrados y sus rutas."""
@@ -376,15 +465,15 @@ def list_targets() -> None:
         return
     table = Table(box=box.ROUNDED, border_style="#4C566A", header_style="bold #88C0D0")
     table.add_column("Nombre", style="bold #D8DEE9")
-    table.add_column("Tipo")
-    table.add_column("Ruta local", style="concord.path")
+    table.add_column("Rutas", justify="right")
+    table.add_column("Rutas locales", style="concord.path")
     table.add_column("Creado", style="concord.muted", no_wrap=True)
     table.add_column("Actualizado", style="concord.muted", no_wrap=True)
     for target in targets:
         table.add_row(
             target.name,
-            "directorio" if target.local_path.is_dir() else "archivo",
-            str(target.local_path),
+            str(len(target.paths)),
+            "\n".join(str(path.local_path) for path in target.paths),
             format_date(target.created_at),
             format_date(target.updated_at),
         )
@@ -404,6 +493,12 @@ def edit(
         "--no-push",
         help="Conserva localmente el commit generado al editar ignore.",
     ),
+    path: Path | None = typer.Option(
+        None,
+        "--path",
+        help="Ruta registrada que se abrirá.",
+        autocompletion=complete_target_paths,
+    ),
 ) -> None:
     """Abre un target local o edita un recurso especial de Concord."""
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
@@ -418,8 +513,29 @@ def edit(
             lambda: target_manager.get(name),
             hint="Consulta los nombres disponibles con: concord list",
         )
+        selected = None
+        if path is not None:
+            requested = path.expanduser().resolve()
+            selected = next((item for item in target.paths if item.local_path == requested), None)
+            if selected is None:
+                execute(lambda: (_ for _ in ()).throw(ValueError(f"La ruta no pertenece a '{name}'.")))
+        elif len(target.paths) == 1:
+            selected = target.paths[0]
+        elif sys.stdin.isatty():
+            answer = questionary.select(
+                "Ruta que se abrirá:", choices=[str(item.local_path) for item in target.paths]
+            ).ask()
+            if answer is None:
+                raise KeyboardInterrupt
+            selected = next(item for item in target.paths if str(item.local_path) == answer)
+        else:
+            execute(
+                lambda: (_ for _ in ()).throw(
+                    ValueError(f"'{name}' contiene varias rutas; use --path <ruta>.")
+                )
+            )
         heading("EDITAR TARGET", "Abriendo la configuración local sin sincronizarla")
-        result = execute(lambda: open_in_editor(target.local_path))
+        result = execute(lambda: open_in_editor(selected.local_path))
         if result:
             raise typer.Exit(result)
         success(
@@ -569,7 +685,8 @@ def status(
     hints = {"clean": "Ninguna", "modified": "concord sync <target>", "missing": "concord restore <target>", "untracked": "concord sync <target>"}
     for item in items:
         label, color = labels[item.state]
-        table.add_row(item.name, f"[{color}]{label}[/]", hints[item.state])
+        counter = f" · {item.changed_paths}/{item.total_paths} rutas" if item.total_paths > 1 else ""
+        table.add_row(item.name, f"[{color}]{label}{counter}[/]", hints[item.state])
     console.print(table)
     clean = sum(item.state == "clean" for item in items)
     success(f"Comprobación terminada: {clean}/{len(items)} target(s) sin cambios.")
@@ -643,7 +760,7 @@ def sync(
     heading("SINCRONIZACIÓN", "Copiando cambios locales al repositorio")
     targets = execute(lambda: manager().sync(name), hint="Consulta los nombres disponibles con: concord list")
     for target in targets:
-        console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {target.local_path}[/]")
+        console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {len(target.paths)} ruta(s)[/]")
     if targets:
         target_names = [target.name for target in targets]
         default_message = sync_commit_message(target_names)
@@ -691,14 +808,17 @@ def restore(
             hint="Usa --force si deseas reemplazar configuraciones locales existentes.",
         )
         for target in targets:
-            console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]→ {target.local_path}[/]")
+            console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]→ {len(target.paths)} ruta(s)[/]")
         success(f"Se restauraron {len(targets)} target(s).")
         return
     target = execute(
         lambda: target_manager.restore(name, force=force),
         hint="Si la ruta local ya existe y quieres reemplazarla, agrega --force.",
     )
-    details([("Target", target.name), ("Destino", str(target.local_path))], title="Restauración completada")
+    details(
+        [("Target", target.name), ("Destinos", "\n".join(str(path.local_path) for path in target.paths))],
+        title="Restauración completada",
+    )
     success(f"'{target.name}' fue restaurado correctamente.")
 
 
@@ -942,7 +1062,7 @@ def import_targets(
     for target in targets:
         console.print(
             f"[concord.success]✓[/] {target.name}  "
-            f"[concord.muted]→ {target.local_path.relative_to(Path.home())}[/]"
+            f"[concord.muted]→ {len(target.paths)} ruta(s)[/]"
         )
     success(f"Se importaron {len(targets)} target(s).", hint="Restaura tus archivos con: concord restore --all")
 
@@ -964,7 +1084,7 @@ def remove(
     details(
         [
             ("Target", name),
-            ("Archivo local", f"conservado en {target.local_path}"),
+            ("Rutas locales", f"{len(target.paths)} conservada(s)"),
             ("Copia", "conservada" if keep_repository else "eliminada"),
         ],
         title="Resultado",

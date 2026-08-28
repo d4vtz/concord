@@ -136,8 +136,21 @@ class Doctor:
         unsafe = [
             target.name
             for target in config.targets
-            if target.relative_path.is_absolute() or ".." in target.relative_path.parts
+            if any(
+                path.relative_path.is_absolute() or ".." in path.relative_path.parts
+                for path in target.paths
+            )
         ]
+        paths = [
+            (target.name, path.relative_path)
+            for target in config.targets
+            for path in target.paths
+        ]
+        overlaps = []
+        for index, (name, path) in enumerate(paths):
+            for other_name, other in paths[index + 1 :]:
+                if path == other or path.is_relative_to(other) or other.is_relative_to(path):
+                    overlaps.append(f"{name}:{path} ↔ {other_name}:{other}")
         if unsafe:
             self._add(
                 checks,
@@ -154,6 +167,23 @@ class Doctor:
                 "Rutas del manifiesto",
                 "pass",
                 "Todas son relativas a HOME.",
+            )
+        if overlaps:
+            self._add(
+                checks,
+                "Seguridad",
+                "Solapamiento de rutas",
+                "failure",
+                "; ".join(overlaps),
+                "Cada ruta debe pertenecer exclusivamente a un target.",
+            )
+        else:
+            self._add(
+                checks,
+                "Seguridad",
+                "Solapamiento de rutas",
+                "pass",
+                "No hay rutas iguales ni anidadas.",
             )
         return config
 
@@ -173,6 +203,13 @@ class Doctor:
             with sqlite3.connect(uri, uri=True) as connection:
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
                 rows = connection.execute("SELECT name FROM targets").fetchall()
+                path_rows = connection.execute(
+                    """
+                    SELECT targets.name, target_paths.local_path
+                    FROM targets
+                    JOIN target_paths ON target_paths.target_id = targets.id
+                    """
+                ).fetchall()
         except sqlite3.Error as error:
             self._add(
                 checks,
@@ -196,7 +233,13 @@ class Doctor:
         self._add(checks, "Concord", "Integridad SQLite", "pass", "Base de datos íntegra.")
         database_names = {row[0] for row in rows}
         manifest_names = {target.name for target in config.targets}
-        if database_names == manifest_names:
+        database_paths = {(name, Path(path)) for name, path in path_rows}
+        manifest_paths = {
+            (target.name, (Path.home() / path.relative_path).resolve())
+            for target in config.targets
+            for path in target.paths
+        }
+        if database_names == manifest_names and database_paths == manifest_paths:
             self._add(
                 checks,
                 "Concord",
@@ -219,16 +262,18 @@ class Doctor:
         missing_copy: list[str] = []
         modified: list[str] = []
         for target in config.targets:
-            local = Path.home() / target.relative_path
-            stored = config.repository_path / target.name / target.relative_path
-            local_exists = os.path.lexists(local)
-            stored_exists = os.path.lexists(stored)
-            if not local_exists:
-                missing_local.append(target.name)
-            if not stored_exists:
-                missing_copy.append(target.name)
-            if local_exists and stored_exists and not self._paths_equal(local, stored):
-                modified.append(target.name)
+            for path in target.paths:
+                local = Path.home() / path.relative_path
+                stored = config.repository_path / target.name / path.relative_path
+                label = f"{target.name}:{path.relative_path}"
+                local_exists = os.path.lexists(local)
+                stored_exists = os.path.lexists(stored)
+                if not local_exists:
+                    missing_local.append(label)
+                if not stored_exists:
+                    missing_copy.append(label)
+                if local_exists and stored_exists and not self._paths_equal(local, stored):
+                    modified.append(label)
         if missing_copy:
             self._add(
                 checks,

@@ -19,7 +19,7 @@ class TargetCompletion:
 def _manifest_targets() -> list[TargetCompletion]:
     config = ConfigManager().load()
     return [
-        TargetCompletion(target.name, Path.home() / target.relative_path)
+        TargetCompletion(target.name, Path.home() / target.paths[0].relative_path)
         for target in config.targets
     ]
 
@@ -30,7 +30,13 @@ def _database_targets() -> list[TargetCompletion]:
         return []
     with sqlite3.connect(f"file:{database_path}?mode=ro", uri=True) as connection:
         rows = connection.execute(
-            "SELECT name, local_path FROM targets ORDER BY name"
+            """
+            SELECT targets.name, target_paths.local_path
+            FROM targets
+            JOIN target_paths ON target_paths.target_id = targets.id
+            WHERE target_paths.position = 0
+            ORDER BY targets.name
+            """
         ).fetchall()
     return [TargetCompletion(name, Path(local_path)) for name, local_path in rows]
 
@@ -84,3 +90,20 @@ def complete_editables(incomplete: str) -> list[tuple[str, str]]:
         for target in (*resources, *targets)
         if target.name.startswith(incomplete)
     ]
+
+
+def complete_target_paths(ctx, incomplete: str) -> list[tuple[str, str]]:
+    name = ctx.params.get("name")
+    if not name:
+        return []
+    try:
+        config = ConfigManager().load()
+        target = next(item for item in config.targets if item.name == name)
+    except Exception:
+        return []
+    result = []
+    for path in target.paths:
+        local_path = str(Path.home() / path.relative_path)
+        if local_path.startswith(incomplete):
+            result.append((local_path, path.type))
+    return result
