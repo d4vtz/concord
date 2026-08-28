@@ -1,7 +1,7 @@
 pkgbase = concord
 	pkgdesc = Gestor explícito y seguro de dotfiles con integración Git
 	pkgver = 2.1.0
-	pkgrel = 5
+	pkgrel = 6
 	url = https://github.com/d4vtz/concord
 	arch = any
 	license = MIT
@@ -17,7 +17,7 @@ pkgbase = concord
 	depends = python-tomli-w
 	depends = python-typer
 	optdepends = github-cli: crear y autenticar repositorios remotos en GitHub
-	source = concord::git+https://github.com/d4vtz/concord.git#commit=7d0a5aee30db3efeb0da21d7eec86672512ecac5
+	source = concord::git+https://github.com/d4vtz/concord.git#commit=38e2a12e441f18e21a20aa9f378493b38cd83795
 	b2sums = SKIP
 
 pkgname = concord
