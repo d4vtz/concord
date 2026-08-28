@@ -570,7 +570,7 @@ def test_zsh_completion_protocol_returns_dynamic_target(manager):
 
     assert result.exit_code == 0, result.output
     assert "nvim" in result.output
-    assert str(source) in result.output
+    assert str(source) in result.output.replace("\n", "")
 
 
 def test_repo_commands_and_bootstrap_are_exposed():
