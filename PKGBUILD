@@ -23,7 +23,7 @@ makedepends=(
 )
 checkdepends=('python-pytest')
 optdepends=('github-cli: crear y autenticar repositorios remotos en GitHub')
-_commit='38e2a12e441f18e21a20aa9f378493b38cd83795'
+_commit='17310860c3f25a625be6c554c9d8342814a6a982'
 source=("${pkgname}::git+${url}.git#commit=${_commit}")
 b2sums=('SKIP')
 
