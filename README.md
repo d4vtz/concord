@@ -268,6 +268,25 @@ concord doctor --strict
   no existe, el comando deberá crearlo de forma segura. Abrir o guardar el
   archivo no deberá crear un commit automáticamente; los cambios podrán
   revisarse y confirmarse después con los comandos `concord repo`.
+- `concord edit <target>`: abrir la ruta local original de un target en el
+  editor configurado mediante `$VISUAL` o `$EDITOR`. Si el target representa un
+  directorio, el editor deberá iniciarse usando ese directorio como carpeta de
+  trabajo y raíz del proyecto; si representa un archivo, deberá abrir el archivo
+  desde su directorio padre. El comando no editará directamente la copia del
+  repositorio ni ejecutará `sync` o creará commits al cerrar el editor.
+
+  ```bash
+  concord edit nvim
+  concord edit zsh --path ~/.zshenv
+  ```
+
+  Cuando un target contenga varias rutas, Concord deberá mostrar una selección
+  interactiva o permitir elegirla explícitamente mediante `--path`. En una
+  sesión sin TTY, una selección ambigua producirá un error descriptivo. Si no
+  están definidos `$VISUAL` ni `$EDITOR`, el comando deberá detenerse explicando
+  cómo configurarlos. Concord cambiará el directorio de trabajo únicamente para
+  el proceso del editor: al cerrarlo, la terminal del usuario permanecerá en el
+  directorio desde el que ejecutó el comando.
 - Diferenciar los mensajes predeterminados según la operación. Al registrar un
   target nuevo, `add` conservará `concord: add <target>`. Al sincronizar un
   target existente, `sync` utilizará `<target>: sync target`, por ejemplo
