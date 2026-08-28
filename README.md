@@ -62,6 +62,7 @@ concord add ~/.config/nvim --name nvim
 concord edit nvim         # abre el target local sin sincronizarlo
 concord edit ignore       # edita .gitignore, confirma y publica el cambio
 concord edit ignore --no-push  # conserva localmente el commit
+concord sync nv<Tab>      # completa dinámicamente: nvim
 concord list
 concord status
 concord diff              # compara todos los targets
@@ -108,6 +109,28 @@ coincidan con sus reglas sin borrarlos del disco. Después crea el commit
 `concord: update ignore rules` y lo envía al remoto configurado. No utiliza
 force-push ni integra automáticamente cambios remotos. `--no-push` conserva el
 commit únicamente en la máquina local.
+
+## Completado de shell
+
+Concord completa dinámicamente los targets registrados en `edit`, `diff`,
+`sync`, `restore` y `remove`. Cada sugerencia muestra el nombre y su ruta local;
+`edit` incluye también el recurso especial `ignore`. El target interno
+`concord` se oculta en `remove`, donde no puede utilizarse.
+
+El completado consulta primero `concord.toml`, la fuente de verdad, y utiliza el
+índice SQLite como respaldo si el manifiesto no puede leerse. Ambas consultas
+son de solo lectura. Los targets cuya ruta local no existe continúan apareciendo
+para que puedan seleccionarse en `restore`. Si Concord aún no está inicializado
+o ambas fuentes están dañadas, la shell no muestra sugerencias ni errores.
+
+El paquete de Arch instala automáticamente las integraciones para Zsh, Bash y
+Fish. Después de actualizar el paquete basta con reiniciar la shell o ejecutar
+`rehash` en Zsh. Las instalaciones realizadas con `uv` pueden usar la opción
+incorporada de Typer:
+
+```bash
+concord --install-completion
+```
 
 ## Manifiesto portable
 
@@ -291,33 +314,6 @@ concord doctor --strict
 
 ## Implementaciones pendientes
 
-- Implementar completado dinámico de shell para los nombres registrados. Al
-  completar argumentos de comandos como `sync`, `restore`, `remove`, `diff` o
-  `edit`, Concord deberá consultar los targets locales y mostrar únicamente los
-  que coincidan con el texto escrito.
-
-  ```text
-  concord sync nv<Tab>       -> nvim
-  concord edit <Tab>         -> bash  git  kitty  nvim  zsh
-  concord profile show <Tab> -> base  kde  qtile
-  ```
-
-  La instalación aprovechará el mecanismo de completado de Typer:
-
-  ```bash
-  concord --install-completion zsh
-  concord --install-completion bash
-  concord --install-completion fish
-  ```
-
-  El completado deberá ser de solo lectura, no consultar la red, no inicializar
-  Concord ni imprimir errores cuando todavía no existan configuración,
-  manifiesto o base de datos. Cada sugerencia podrá incluir una descripción
-  breve con la ruta o el tipo del target. Los comandos de perfiles deberán
-  completar nombres de perfiles o targets según el argumento esperado; por
-  ejemplo, `profile add` sugerirá targets y `profile restore` sugerirá perfiles.
-  La consulta deberá ser suficientemente ligera para ejecutarse en cada
-  pulsación de tabulador y cerrar siempre sus conexiones a SQLite.
 ### Targets con múltiples rutas
 
 ```bash

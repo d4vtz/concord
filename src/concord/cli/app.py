@@ -18,6 +18,9 @@ from concord.application.doctor import Doctor
 from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
 from concord.application.target_manager import TargetManager
+from concord.cli.completion import (complete_editables,
+                                    complete_removable_targets,
+                                    complete_targets)
 from concord.cli.ui import console, details, execute, heading, success, warning
 
 app = typer.Typer(
@@ -391,7 +394,11 @@ def list_targets() -> None:
 
 @app.command()
 def edit(
-    name: str = typer.Argument(..., help="Target o recurso especial que se abrirá."),
+    name: str = typer.Argument(
+        ...,
+        help="Target o recurso especial que se abrirá.",
+        autocompletion=complete_editables,
+    ),
     no_push: bool = typer.Option(
         False,
         "--no-push",
@@ -578,7 +585,9 @@ def status(
 @app.command("diff")
 def diff_targets(
     name: str | None = typer.Argument(
-        None, help="Target concreto; omítelo para comparar todos."
+        None,
+        help="Target concreto; omítelo para comparar todos.",
+        autocompletion=complete_targets,
     ),
 ) -> None:
     """Muestra los cambios que sync aplicaría al repositorio."""
@@ -592,7 +601,11 @@ def diff_targets(
 
 @app.command()
 def sync(
-    name: str | None = typer.Argument(None, help="Target concreto; omítelo para sincronizar todos."),
+    name: str | None = typer.Argument(
+        None,
+        help="Target concreto; omítelo para sincronizar todos.",
+        autocompletion=complete_targets,
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simula la operación sin modificar archivos."),
     message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Acepta el mensaje predeterminado."),
@@ -647,7 +660,11 @@ def sync(
 
 @app.command()
 def restore(
-    name: str | None = typer.Argument(None, help="Target que se restaurará."),
+    name: str | None = typer.Argument(
+        None,
+        help="Target que se restaurará.",
+        autocompletion=complete_targets,
+    ),
     all_targets: bool = typer.Option(False, "--all", "-a", help="Restaura todos los targets del manifiesto."),
     force: bool = typer.Option(False, "--force", "-f", help="Reemplaza la ruta local existente."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simula la operación sin modificar archivos."),
@@ -932,7 +949,7 @@ def import_targets(
 
 @app.command()
 def remove(
-    name: str,
+    name: str = typer.Argument(..., autocompletion=complete_removable_targets),
     keep_repository: bool = typer.Option(False, "--keep-repository", help="Conserva la copia del repositorio."),
     message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Acepta el mensaje predeterminado."),

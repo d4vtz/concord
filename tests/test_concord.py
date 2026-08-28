@@ -12,6 +12,9 @@ from concord.application.initializer import Initializer
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
 from concord.cli.app import app, editor_command, sync_commit_message
+from concord.cli.completion import (complete_editables,
+                                    complete_removable_targets,
+                                    complete_targets)
 
 
 def configure_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -495,6 +498,79 @@ def test_edit_ignore_untracks_commits_and_pushes(tmp_path, monkeypatch):
         "--git-dir", str(remote), "log", "--all", "-1", "--pretty=%s"
     ).stdout.strip()
     assert remote_head == "concord: update ignore rules"
+
+
+def test_target_completion_reads_manifest_and_includes_paths(manager):
+    instance, home, _ = manager
+    source = home / ".config/nvim"
+    source.mkdir(parents=True)
+    instance.add(source, "nvim")
+
+    assert ("nvim", str(source)) in complete_targets("nv")
+    assert complete_targets("missing") == []
+
+
+def test_target_completion_falls_back_to_read_only_database(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    database = Database(concord.database_file)
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute(
+            "INSERT INTO targets VALUES (?, ?, ?, ?, ?, ?)",
+            ("1", "zsh", str(home / ".config/zsh"), "directory", "now", "now"),
+        )
+
+    assert complete_targets("zs") == [("zsh", str(home / ".config/zsh"))]
+    assert not concord.config_dir.exists()
+
+
+def test_target_completion_is_silent_without_manifest_or_database(tmp_path, monkeypatch):
+    from concord import application as concord
+
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+
+    assert complete_targets("") == []
+    assert complete_editables("") == []
+    assert not concord.config_dir.exists()
+    assert not concord.database_file.parent.exists()
+
+
+def test_completion_filters_internal_target_and_adds_ignore(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("test")
+    instance.add(source, "bash")
+
+    assert any(name == "concord" for name, _ in complete_targets(""))
+    assert all(name != "concord" for name, _ in complete_removable_targets(""))
+    assert any(name == "ignore" for name, _ in complete_editables(""))
+
+
+def test_zsh_completion_protocol_returns_dynamic_target(manager):
+    instance, home, _ = manager
+    source = home / ".config/nvim"
+    source.mkdir(parents=True)
+    instance.add(source, "nvim")
+
+    result = CliRunner().invoke(
+        app,
+        [],
+        prog_name="concord",
+        env={
+            "_CONCORD_COMPLETE": "complete_zsh",
+            "_TYPER_COMPLETE_ARGS": "concord sync nv",
+        },
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "nvim" in result.output
+    assert str(source) in result.output
 
 
 def test_repo_commands_and_bootstrap_are_exposed():
