@@ -447,6 +447,74 @@ Más adelante podrá añadirse un perfil activo por máquina, pero la primera
 versión no sincronizará automáticamente el nombre del equipo ni decidirá qué
 perfil restaurar sin confirmación.
 
+### Dependencias de paquetes por target
+
+Permitir que cada target declare los paquetes necesarios para que su
+configuración funcione. En una instalación nueva, Concord podrá reunir las
+dependencias de uno o varios targets —o de un perfil completo—, comprobar cuáles
+faltan e instalarlas mediante el gestor correspondiente.
+
+Ejemplo propuesto para Arch Linux:
+
+```bash
+concord deps add nvim --manager pacman neovim ripgrep fd
+concord deps add nvim --manager aur lua-language-server
+concord deps add zsh --manager pacman zsh fzf
+
+concord deps list nvim
+concord deps check nvim
+concord deps install nvim --dry-run
+concord profile deps install base
+```
+
+Comandos previstos:
+
+```bash
+concord deps list <target>
+concord deps add <target> --manager <manager> <package>...
+concord deps remove <target> --manager <manager> <package>...
+concord deps check <target>
+concord deps install <target>
+concord profile deps list <profile>
+concord profile deps check <profile>
+concord profile deps install <profile>
+```
+
+Comportamiento esperado:
+
+- Guardar en el manifiesto los nombres de paquetes agrupados por gestor; SQLite
+  seguirá siendo un índice local reconstruible.
+- Comenzar con `pacman` para paquetes oficiales de Arch y un backend AUR
+  configurable, inicialmente `paru` o `yay`, sin asumir que ambos existen.
+- Diseñar una interfaz de backends que permita añadir posteriormente gestores
+  como `apt`, `dnf`, `brew`, `flatpak` o `pipx` sin cambiar el modelo de los
+  targets.
+- Separar dependencias obligatorias y opcionales, de modo que la instalación de
+  estas últimas requiera una opción explícita como `--include-optional`.
+- Al operar sobre un perfil, expandir sus perfiles incluidos, reunir las
+  dependencias de todos los targets y eliminar duplicados antes de consultar el
+  sistema.
+- Instalar únicamente paquetes faltantes y mostrar cuáles ya están presentes,
+  cuáles se omitirán y qué backend se utilizará.
+- Requerir confirmación antes de instalar y admitir `--dry-run`, `--yes` y modo
+  no interactivo seguro. `restore` y `bootstrap` podrán ofrecer ejecutar la
+  instalación, pero nunca hacerlo silenciosamente.
+- Ejecutar cada gestor mediante argumentos estructurados, sin construir comandos
+  con `shell=True` ni aceptar nombres de paquetes que puedan convertirse en
+  opciones arbitrarias.
+- No ejecutar todo Concord con privilegios elevados. Solo el gestor de paquetes
+  podrá solicitar `sudo` cuando sea necesario; los helpers de AUR se ejecutarán
+  como usuario normal.
+- Hacer que `doctor` compruebe backends disponibles y dependencias faltantes sin
+  instalar nada.
+- Permitir que una dependencia tenga un nombre distinto según el sistema en una
+  versión posterior, conservando inicialmente una implementación clara y
+  centrada en Arch Linux.
+
+Las dependencias de Python que forman parte interna de Concord seguirán
+gestionándose mediante el paquete de la aplicación; esta función se reservará
+para programas externos requeridos por los dotfiles.
+
 ## Bootstrap desde GitHub
 
 Para reconstruir Concord en otra máquina directamente desde el remoto:
