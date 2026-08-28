@@ -745,5 +745,8 @@ def test_pkgbuild_matches_project_metadata():
     assert "'python-questionary'" in pkgbuild
     assert "'github-cli: crear y autenticar repositorios remotos en GitHub'" in pkgbuild
     assert "PYTHONPATH=src python -m pytest" in pkgbuild
+    assert "/usr/share/bash-completion/completions/concord" in pkgbuild
+    assert "/usr/share/zsh/site-functions/_concord" in pkgbuild
+    assert "/usr/share/fish/vendor_completions.d/concord.fish" in pkgbuild
     assert f"\tpkgver = {project['version']}" in srcinfo
     assert "\tdepends = python-questionary" in srcinfo

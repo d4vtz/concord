@@ -2,7 +2,7 @@
 
 pkgname=concord
 pkgver=2.1.0
-pkgrel=4
+pkgrel=5
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
 url='https://github.com/d4vtz/concord'
@@ -23,7 +23,7 @@ makedepends=(
 )
 checkdepends=('python-pytest')
 optdepends=('github-cli: crear y autenticar repositorios remotos en GitHub')
-_commit='ed8e8d10aee31448d2ef8c487bf89af55d26f47a'
+_commit='7d0a5aee30db3efeb0da21d7eec86672512ecac5'
 source=("${pkgname}::git+${url}.git#commit=${_commit}")
 b2sums=('SKIP')
 
@@ -41,4 +41,11 @@ package() {
     cd "$pkgname"
     python -m installer --destdir="$pkgdir" dist/*.whl
     install -Dm644 LICENSE -t "$pkgdir/usr/share/licenses/$pkgname/"
+
+    python -c 'import sys; from typer.completion import get_completion_script; print(get_completion_script(prog_name="concord", complete_var="_CONCORD_COMPLETE", shell=sys.argv[1]))' bash > concord.bash
+    python -c 'import sys; from typer.completion import get_completion_script; print(get_completion_script(prog_name="concord", complete_var="_CONCORD_COMPLETE", shell=sys.argv[1]))' zsh > _concord
+    python -c 'import sys; from typer.completion import get_completion_script; print(get_completion_script(prog_name="concord", complete_var="_CONCORD_COMPLETE", shell=sys.argv[1]))' fish > concord.fish
+    install -Dm644 concord.bash "$pkgdir/usr/share/bash-completion/completions/concord"
+    install -Dm644 _concord "$pkgdir/usr/share/zsh/site-functions/_concord"
+    install -Dm644 concord.fish "$pkgdir/usr/share/fish/vendor_completions.d/concord.fish"
 }
