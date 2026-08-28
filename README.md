@@ -287,6 +287,33 @@ concord doctor --strict
   cómo configurarlos. Concord cambiará el directorio de trabajo únicamente para
   el proceso del editor: al cerrarlo, la terminal del usuario permanecerá en el
   directorio desde el que ejecutó el comando.
+- Implementar completado dinámico de shell para los nombres registrados. Al
+  completar argumentos de comandos como `sync`, `restore`, `remove`, `diff` o
+  `edit`, Concord deberá consultar los targets locales y mostrar únicamente los
+  que coincidan con el texto escrito.
+
+  ```text
+  concord sync nv<Tab>       -> nvim
+  concord edit <Tab>         -> bash  git  kitty  nvim  zsh
+  concord profile show <Tab> -> base  kde  qtile
+  ```
+
+  La instalación aprovechará el mecanismo de completado de Typer:
+
+  ```bash
+  concord --install-completion zsh
+  concord --install-completion bash
+  concord --install-completion fish
+  ```
+
+  El completado deberá ser de solo lectura, no consultar la red, no inicializar
+  Concord ni imprimir errores cuando todavía no existan configuración,
+  manifiesto o base de datos. Cada sugerencia podrá incluir una descripción
+  breve con la ruta o el tipo del target. Los comandos de perfiles deberán
+  completar nombres de perfiles o targets según el argumento esperado; por
+  ejemplo, `profile add` sugerirá targets y `profile restore` sugerirá perfiles.
+  La consulta deberá ser suficientemente ligera para ejecutarse en cada
+  pulsación de tabulador y cerrar siempre sus conexiones a SQLite.
 - Diferenciar los mensajes predeterminados según la operación. Al registrar un
   target nuevo, `add` conservará `concord: add <target>`. Al sincronizar un
   target existente, `sync` utilizará `<target>: sync target`, por ejemplo
