@@ -573,13 +573,38 @@ class Doctor:
         if left.is_symlink() or right.is_symlink():
             return left.is_symlink() and right.is_symlink() and left.readlink() == right.readlink()
         if left.is_file() or right.is_file():
-            return left.is_file() and right.is_file() and filecmp.cmp(left, right, shallow=False)
-        comparison = filecmp.dircmp(left, right)
-        if comparison.left_only or comparison.right_only or comparison.diff_files or comparison.funny_files:
+            return left.is_file() and right.is_file() and self._files_equal(left, right)
+        if not left.is_dir() or not right.is_dir():
             return False
-        return all(self._directories_equal(child) for child in comparison.subdirs.values())
+        left_entries = self._directory_snapshot(left)
+        right_entries = self._directory_snapshot(right)
+        if left_entries.keys() != right_entries.keys():
+            return False
+        return all(
+            self._snapshot_entries_equal(left_entries[relative], right_entries[relative])
+            for relative in left_entries
+        )
 
-    def _directories_equal(self, comparison: filecmp.dircmp) -> bool:
-        if comparison.left_only or comparison.right_only or comparison.diff_files or comparison.funny_files:
+    def _directory_snapshot(self, root: Path) -> dict[Path, Path]:
+        return {path.relative_to(root): path for path in root.rglob("*")}
+
+    def _snapshot_entries_equal(self, left: Path, right: Path) -> bool:
+        if left.is_symlink() or right.is_symlink():
+            return left.is_symlink() and right.is_symlink() and left.readlink() == right.readlink()
+        if left.is_dir() or right.is_dir():
+            return left.is_dir() and right.is_dir()
+        if not left.is_file() or not right.is_file():
             return False
-        return all(self._directories_equal(child) for child in comparison.subdirs.values())
+        return self._files_equal(left, right)
+
+    def _files_equal(self, left: Path, right: Path) -> bool:
+        left_stat = left.stat()
+        right_stat = right.stat()
+        if (
+            left_stat.st_size == right_stat.st_size
+            and left_stat.st_mtime_ns == right_stat.st_mtime_ns
+        ):
+            return True
+        if left_stat.st_size != right_stat.st_size:
+            return False
+        return filecmp.cmp(left, right, shallow=False)

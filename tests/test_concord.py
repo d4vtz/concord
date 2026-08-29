@@ -1,3 +1,4 @@
+import os
 import tomllib
 from pathlib import Path
 
@@ -955,6 +956,51 @@ def test_sensitive_files_use_precise_names_and_ignore_resources(tmp_path):
         Path("certificates/server.key"),
         Path("ssh/id_ed25519"),
     ]
+
+
+def test_sensitive_files_use_git_candidates_and_respect_gitignore(tmp_path):
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    git = GitManager(repository)
+    git.initialize()
+    (repository / ".gitignore").write_text("ignored/\n")
+    (repository / "tracked").mkdir()
+    (repository / "tracked/.env").write_text("TOKEN=tracked")
+    (repository / "ignored").mkdir()
+    (repository / "ignored/.env").write_text("TOKEN=ignored")
+
+    assert git.sensitive_files() == [Path("tracked/.env")]
+
+
+def test_doctor_file_comparison_uses_metadata_fast_path(tmp_path, monkeypatch):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.mkdir()
+    right.mkdir()
+    left_file = left / "nested.conf"
+    right_file = right / "nested.conf"
+    left_file.write_text("same content")
+    right_file.write_text("same content")
+    timestamp = 1_700_000_000_000_000_000
+    os.utime(left_file, ns=(timestamp, timestamp))
+    os.utime(right_file, ns=(timestamp, timestamp))
+    monkeypatch.setattr(
+        "concord.application.doctor.filecmp.cmp",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deep comparison")),
+    )
+
+    assert Doctor()._paths_equal(left, right)
+
+
+def test_doctor_file_comparison_reads_changed_metadata_candidates(tmp_path):
+    left = tmp_path / "left"
+    right = tmp_path / "right"
+    left.write_text("first")
+    right.write_text("other")
+    os.utime(left, ns=(1_700_000_000_000_000_000,) * 2)
+    os.utime(right, ns=(1_700_000_001_000_000_000,) * 2)
+
+    assert not Doctor()._paths_equal(left, right)
 
 
 def test_doctor_reports_uninitialized_installation_without_creating_files(tmp_path, monkeypatch):

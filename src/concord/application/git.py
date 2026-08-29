@@ -232,34 +232,43 @@ class GitManager:
         return self._run(*arguments).stdout
 
     def sensitive_files(self, paths: list[Path] | None = None) -> list[Path]:
-        candidates = paths or [Path(".")]
+        candidates = self._sensitive_candidates(paths)
         result: set[Path] = set()
+        for relative in candidates:
+            name = relative.name.casefold()
+            suffix = relative.suffix.casefold()
+            if suffix in self.IGNORED_RESOURCE_SUFFIXES:
+                continue
+            is_environment = name.startswith(".env.")
+            if (
+                name in self.SENSITIVE_FILENAMES
+                or is_environment
+                or suffix in self.SENSITIVE_SUFFIXES
+            ):
+                result.add(relative)
+        return sorted(result, key=str)
+
+    def _sensitive_candidates(self, paths: list[Path] | None) -> list[Path]:
+        if self.initialized:
+            arguments = ["ls-files", "--cached", "--others", "--exclude-standard", "-z"]
+            if paths:
+                arguments.extend(["--", *[path.as_posix() for path in paths]])
+            output = self._run(*arguments).stdout
+            return [Path(name) for name in output.split("\0") if name]
+        candidates = paths or [Path(".")]
+        files: list[Path] = []
         for root in candidates:
             absolute = self.repository_path / root
             if absolute.is_file():
-                files = [absolute]
+                files.append(absolute.relative_to(self.repository_path))
             elif absolute.exists():
-                files = [
-                    path
+                files.extend(
+                    path.relative_to(self.repository_path)
                     for path in absolute.rglob("*")
-                    if path.is_file() and ".git" not in path.relative_to(self.repository_path).parts
-                ]
-            else:
-                continue
-            for file in files:
-                relative = file.relative_to(self.repository_path)
-                name = file.name.casefold()
-                suffix = file.suffix.casefold()
-                if suffix in self.IGNORED_RESOURCE_SUFFIXES:
-                    continue
-                is_environment = name.startswith(".env.")
-                if (
-                    name in self.SENSITIVE_FILENAMES
-                    or is_environment
-                    or suffix in self.SENSITIVE_SUFFIXES
-                ):
-                    result.add(relative)
-        return sorted(result, key=str)
+                    if path.is_file()
+                    and ".git" not in path.relative_to(self.repository_path).parts
+                )
+        return files
 
     def create_github_repository(self, name: str, *, private: bool = True) -> str:
         if not self.github_available():
