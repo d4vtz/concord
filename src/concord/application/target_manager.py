@@ -9,6 +9,7 @@ from concord import application as concord
 from concord.application.config import (CONCORD_TARGET, ConfigManager,
                                         TargetConfig, TargetPathConfig)
 from concord.application.database import Database
+from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target import Target, TargetPath, TargetType
 
@@ -51,11 +52,16 @@ class TargetManager:
         self.config_manager = config_manager or ConfigManager()
         self.database.initialize()
         self.manifest_backup: Path | None = None
+        self.profile_manifest_changed = False
         if concord.config_file.exists():
             config, self.manifest_backup = self.config_manager.migrate()
             self._repair_index(config)
             if self.manifest_backup:
                 self._persist_manifest()
+            current = self.config_manager.load()
+            self.profile_manifest_changed = not ProfileManager(
+                self.database, self.config_manager
+            ).matches_config(current)
 
     def _destination(self, target: Target, path: TargetPath) -> Path:
         return self.repository.target_path(target.name) / path.relative_path
@@ -152,6 +158,7 @@ class TargetManager:
 
     def _manifest_target(self, target: Target) -> TargetConfig:
         return TargetConfig(
+            id=target.id,
             name=target.name,
             paths=[TargetPathConfig(path.relative_path, path.type.value) for path in target.paths],
             created_at=target.created_at,
@@ -168,6 +175,7 @@ class TargetManager:
             concord_target.touch()
             self._update_timestamp(concord_target)
         config.targets = [self._manifest_target(target) for target in self.list()]
+        ProfileManager(self.database, self.config_manager).apply_to_config(config)
         config.targets.sort(key=lambda item: (item.name != CONCORD_TARGET, item.name))
         self.config_manager.save(config)
         if concord_target is not None:
@@ -226,6 +234,12 @@ class TargetManager:
                 ).fetchall()
                 targets.append(self._target_from_row(row, paths))
         return targets
+
+    def selected(self) -> list[Target]:
+        resolution = ProfileManager(self.database, self.config_manager).resolve_active()
+        if resolution is None:
+            return self.list()
+        return [self.get(name) for name in resolution.target_names]
 
     def _check_overlap(self, candidate: Path) -> None:
         candidate = candidate.expanduser().resolve()
@@ -332,7 +346,7 @@ class TargetManager:
         return self.get(name)
 
     def sync(self, name: str | None = None) -> list[Target]:
-        targets = [self.get(name)] if name else self.list()
+        targets = [self.get(name)] if name else self.selected()
         for target in targets:
             for path in target.paths:
                 if not os.path.lexists(path.local_path):
@@ -417,7 +431,7 @@ class TargetManager:
         return self._restore_targets([self.get(name)], force=force)[0]
 
     def restore_all(self, *, force: bool = False) -> list[Target]:
-        targets = [target for target in self.list() if target.name != CONCORD_TARGET]
+        targets = [target for target in self.selected() if target.name != CONCORD_TARGET]
         return self._restore_targets(targets, force=force)
 
     def remove(self, name: str, *, keep_repository: bool = False) -> None:
@@ -458,6 +472,7 @@ class TargetManager:
                     paths=paths,
                     created_at=item.created_at or datetime.now(UTC),
                     updated_at=item.updated_at or item.created_at or datetime.now(UTC),
+                    target_id=item.id,
                 )
             )
         with self.database.connect() as connection:
@@ -467,6 +482,9 @@ class TargetManager:
             connection.execute("DELETE FROM targets")
             for target in targets:
                 self._insert_target(connection, target)
+            ProfileManager(self.database, self.config_manager).import_config(
+                config, connection=connection
+            )
         return targets
 
     def _path_state(self, target: Target, path: TargetPath) -> str:
@@ -480,7 +498,7 @@ class TargetManager:
     def status(self) -> list[TargetStatus]:
         priority = {"clean": 0, "modified": 1, "untracked": 2, "missing": 3}
         result = []
-        for target in self.list():
+        for target in self.selected():
             states = [self._path_state(target, path) for path in target.paths]
             state = max(states, key=priority.get)
             result.append(
@@ -489,14 +507,14 @@ class TargetManager:
         return result
 
     def diff(self, name: str | None = None) -> list[TargetDiff]:
-        targets = [self.get(name)] if name else self.list()
+        targets = [self.get(name)] if name else self.selected()
         return [self._target_diff(target) for target in targets]
 
     def preview_sync(self, name: str | None = None) -> list[TargetDiff]:
         return self.diff(name)
 
     def preview_restore(self, name: str | None = None) -> list[TargetDiff]:
-        targets = [self.get(name)] if name else [t for t in self.list() if t.name != CONCORD_TARGET]
+        targets = [self.get(name)] if name else [t for t in self.selected() if t.name != CONCORD_TARGET]
         return [self._target_diff(target, reverse=True) for target in targets]
 
     def _path_diff(self, target: Target, path: TargetPath, *, reverse: bool = False) -> TargetDiff:

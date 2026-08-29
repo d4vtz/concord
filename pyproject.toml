@@ -1,6 +1,6 @@
 [project]
 name = "concord"
-version = "2.2.0"
+version = "2.3.0"
 description = "Un gestor de dotfiles simple, explícito y seguro"
 license = "MIT"
 readme = "README.md"

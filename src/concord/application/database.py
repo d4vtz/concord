@@ -56,6 +56,88 @@ class Database:
                     FOREIGN KEY (target_path_id) REFERENCES target_paths(id) ON DELETE CASCADE
                 )
                 """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    description TEXT NOT NULL DEFAULT ''
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_tags (
+                    profile_id TEXT NOT NULL,
+                    tag TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (profile_id, tag),
+                    FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+                    UNIQUE (profile_id, position)
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_includes (
+                    profile_id TEXT NOT NULL,
+                    included_profile_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (profile_id, included_profile_id),
+                    FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+                    FOREIGN KEY (included_profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+                    UNIQUE (profile_id, position)
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_targets (
+                    profile_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (profile_id, target_id),
+                    FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE,
+                    UNIQUE (profile_id, position)
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_exclusions (
+                    profile_id TEXT NOT NULL,
+                    target_id TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (profile_id, target_id),
+                    FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE,
+                    UNIQUE (profile_id, position)
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_activation (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    primary_profile_id TEXT NOT NULL
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_activation_complements (
+                    profile_id TEXT PRIMARY KEY,
+                    position INTEGER NOT NULL UNIQUE
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_suggestion (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    primary_profile_id TEXT NOT NULL,
+                    FOREIGN KEY (primary_profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS profile_suggestion_complements (
+                    profile_id TEXT PRIMARY KEY,
+                    position INTEGER NOT NULL UNIQUE,
+                    FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS local_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+                """)
 
     def _migrate_v1(self, connection: sqlite3.Connection) -> None:
         columns = {

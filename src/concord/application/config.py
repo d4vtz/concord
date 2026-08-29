@@ -11,6 +11,7 @@ from questionary import ValidationError, Validator
 from concord import application as concord
 
 MANIFEST_VERSION = 2
+CONCORD_VERSION = "2.3.0"
 CONCORD_TARGET = "concord"
 
 
@@ -24,8 +25,32 @@ class TargetPathConfig:
 class TargetConfig:
     name: str
     paths: list[TargetPathConfig]
+    id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+@dataclass(frozen=True)
+class ManifestReference:
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ProfileConfig:
+    id: str
+    name: str
+    description: str = ""
+    tags: list[str] = field(default_factory=list)
+    includes: list[ManifestReference] = field(default_factory=list)
+    targets: list[ManifestReference] = field(default_factory=list)
+    excludes: list[ManifestReference] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SuggestedActivationConfig:
+    primary: ManifestReference
+    complements: list[ManifestReference] = field(default_factory=list)
 
 
 @dataclass
@@ -41,6 +66,9 @@ class Config:
     repository_path: Path
     version: int = MANIFEST_VERSION
     targets: list[TargetConfig] = field(default_factory=list)
+    profiles: list[ProfileConfig] = field(default_factory=list)
+    suggested_activation: SuggestedActivationConfig | None = None
+    minimum_concord_version: str | None = None
     git: GitConfig = field(default_factory=GitConfig)
     source_version: int = MANIFEST_VERSION
 
@@ -57,6 +85,12 @@ class RepositoryPathValidator(Validator):
 
 
 class ConfigManager:
+    def _version_tuple(self, version: str) -> tuple[int, ...]:
+        try:
+            return tuple(int(part) for part in version.split("."))
+        except ValueError as error:
+            raise ValueError(f"Versión de Concord no válida: {version}.") from error
+
     def _portable_path(self, path: Path) -> str:
         path = path.expanduser().resolve()
         try:
@@ -68,6 +102,11 @@ class ConfigManager:
         concord.config_dir.mkdir(parents=True, exist_ok=True)
         settings = {
             "version": config.version,
+            **(
+                {"minimum_concord_version": config.minimum_concord_version}
+                if config.minimum_concord_version
+                else {}
+            ),
             "repository_path": self._portable_path(config.repository_path),
             "git": {
                 "enabled": config.git.enabled,
@@ -77,6 +116,7 @@ class ConfigManager:
             },
             "targets": [
                 {
+                    **({"id": target.id} if target.id else {}),
                     "name": target.name,
                     "paths": [
                         {
@@ -98,6 +138,43 @@ class ConfigManager:
                 }
                 for target in config.targets
             ],
+            "profiles": [
+                {
+                    "id": profile.id,
+                    "name": profile.name,
+                    "description": profile.description,
+                    "tags": profile.tags,
+                    "includes": [
+                        {"id": reference.id, "name": reference.name}
+                        for reference in profile.includes
+                    ],
+                    "targets": [
+                        {"id": reference.id, "name": reference.name}
+                        for reference in profile.targets
+                    ],
+                    "excludes": [
+                        {"id": reference.id, "name": reference.name}
+                        for reference in profile.excludes
+                    ],
+                }
+                for profile in config.profiles
+            ],
+            **(
+                {
+                    "suggested_activation": {
+                        "primary": {
+                            "id": config.suggested_activation.primary.id,
+                            "name": config.suggested_activation.primary.name,
+                        },
+                        "complements": [
+                            {"id": reference.id, "name": reference.name}
+                            for reference in config.suggested_activation.complements
+                        ],
+                    }
+                }
+                if config.suggested_activation
+                else {}
+            ),
         }
         temporary = concord.config_file.with_suffix(".toml.tmp")
         with temporary.open("wb") as file:
@@ -111,6 +188,12 @@ class ConfigManager:
         version = settings.get("version", 1)
         if version not in {1, MANIFEST_VERSION}:
             raise ValueError(f"Versión de manifiesto no compatible: {version}.")
+        minimum = settings.get("minimum_concord_version")
+        if minimum and self._version_tuple(minimum) > self._version_tuple(CONCORD_VERSION):
+            raise ValueError(
+                f"Este manifiesto requiere Concord {minimum} o posterior; "
+                f"la versión actual es {CONCORD_VERSION}."
+            )
         targets = []
         for item in settings.get("targets", []):
             path_items = (
@@ -128,14 +211,44 @@ class ConfigManager:
                         )
                         for path in path_items
                     ],
+                    id=item.get("id"),
                     created_at=(datetime.fromisoformat(item["created_at"]) if item.get("created_at") else None),
                     updated_at=(datetime.fromisoformat(item["updated_at"]) if item.get("updated_at") else None),
                 )
+            )
+        profiles = []
+        for item in settings.get("profiles", []):
+            reference = lambda value: ManifestReference(value["id"], value["name"])
+            profiles.append(
+                ProfileConfig(
+                    id=item["id"],
+                    name=item["name"],
+                    description=item.get("description", ""),
+                    tags=[str(tag) for tag in item.get("tags", [])],
+                    includes=[reference(value) for value in item.get("includes", [])],
+                    targets=[reference(value) for value in item.get("targets", [])],
+                    excludes=[reference(value) for value in item.get("excludes", [])],
+                )
+            )
+        suggested = settings.get("suggested_activation")
+        suggested_activation = None
+        if suggested:
+            suggested_activation = SuggestedActivationConfig(
+                primary=ManifestReference(
+                    suggested["primary"]["id"], suggested["primary"]["name"]
+                ),
+                complements=[
+                    ManifestReference(value["id"], value["name"])
+                    for value in suggested.get("complements", [])
+                ],
             )
         return Config(
             repository_path=Path(settings["repository_path"]).expanduser(),
             version=MANIFEST_VERSION,
             targets=targets,
+            profiles=profiles,
+            suggested_activation=suggested_activation,
+            minimum_concord_version=minimum,
             git=GitConfig(**settings.get("git", {})),
             source_version=version,
         )

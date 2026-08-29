@@ -67,6 +67,7 @@ concord edit ignore       # edita .gitignore, confirma y publica el cambio
 concord edit ignore --no-push  # conserva localmente el commit
 concord sync nv<Tab>      # completa dinámicamente: nvim
 concord list
+concord list --all        # incluye targets fuera del perfil activo
 concord status
 concord diff              # compara todos los targets
 concord diff nvim         # compara un target sin modificar nada
@@ -95,6 +96,65 @@ nombres que empiezan con punto se normalizan con el prefijo `dot_`.
 
 Los nombres `ignore`, `manifest` y `config` están reservados para recursos
 internos de Concord y no pueden utilizarse como nombres de targets.
+
+## Perfiles
+
+Los perfiles agrupan referencias a targets existentes sin duplicar sus archivos.
+Permiten usar un mismo repositorio en equipos o contextos diferentes:
+
+```bash
+concord profile create base
+concord profile edit base --target bash --target nvim
+
+concord profile create linux
+concord profile edit linux --include base --target qtile
+
+concord profile create trabajo
+concord profile edit trabajo --include base --target git
+```
+
+La edición sin opciones abre un selector interactivo:
+
+```bash
+concord profile edit linux
+```
+
+Una activación contiene un perfil principal y complementarios ordenados:
+
+```bash
+concord profile activate
+concord profile activate --primary linux --with trabajo
+```
+
+El principal forma una base protegida. Los complementarios pueden agregar
+targets y excluir targets aportados por complementarios anteriores, pero no
+pueden retirar los del principal. Las inclusiones se expanden primero, después
+se agregan los targets directos y al final se aplican las exclusiones. Los ciclos
+y referencias inexistentes se rechazan antes de guardar.
+
+Con una activación, `list`, `status`, `diff`, `sync` y `restore --all` trabajan
+por defecto sobre sus targets efectivos. Un target indicado explícitamente
+continúa siendo válido aunque esté fuera del perfil. Para volver al comportamiento
+global:
+
+```bash
+concord profile deactivate --all
+```
+
+Comandos de consulta y mantenimiento:
+
+```bash
+concord profile list
+concord profile show linux
+concord profile rename linux laptop
+concord profile validate
+concord profile suggest --primary linux --with trabajo
+concord profile delete laptop
+```
+
+La activación efectiva se guarda únicamente en el equipo local. El manifiesto
+puede llevar una combinación sugerida; Concord pregunta antes de adoptarla y,
+si se rechaza, no vuelve a ofrecerla hasta que cambie.
 
 ## Editar configuraciones
 
@@ -146,6 +206,7 @@ version = 2
 repository_path = "~/.local/share/concord/repository"
 
 [[targets]]
+id = "5e741dda-93bb-4e2a-a9c8-337a83ed755b"
 name = "zsh"
 created_at = "2026-08-25T12:05:00+00:00"
 updated_at = "2026-08-25T14:30:00+00:00"
@@ -154,6 +215,11 @@ paths = [
     { relative_path = ".zshenv", type = "file" },
 ]
 ```
+
+Los perfiles se guardan mediante UUID estables y nombres legibles. SQLite es la
+fuente de trabajo para administrarlos y cada cambio exporta inmediatamente su
+representación portable al manifiesto. Cuando el manifiesto contiene perfiles,
+declara `minimum_concord_version = "2.3.0"`.
 
 Concord se registra automáticamente como el primer target. Después de agregar
 o eliminar una configuración, actualiza el manifiesto y sincroniza su propia
@@ -318,6 +384,7 @@ El diagnóstico es de solo lectura y comprueba:
 
 - Validez de `concord.toml` y seguridad de sus rutas.
 - Integridad de SQLite y coincidencia con el manifiesto.
+- Integridad, composición y activación local de los perfiles.
 - Existencia y sincronización de los targets.
 - Instalación, identidad, rama y estado de Git.
 - Configuración del remoto y seguimiento de la rama.

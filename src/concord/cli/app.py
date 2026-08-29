@@ -11,12 +11,14 @@ import questionary
 import typer
 from rich import box
 from rich.table import Table
+from rich.tree import Tree
 
 from concord import application as concord
 from concord.application.config import CONCORD_TARGET, ConfigManager, GitConfig
 from concord.application.doctor import Doctor
 from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
+from concord.application.profile_manager import Activation, ProfileManager
 from concord.application.target_manager import TargetManager
 from concord.cli.completion import (complete_editables,
                                     complete_removable_targets,
@@ -30,14 +32,31 @@ app = typer.Typer(
 )
 repo_app = typer.Typer(no_args_is_help=True, help="Administra el repositorio Git de Concord.")
 remote_app = typer.Typer(no_args_is_help=False, help="Consulta o configura el remoto Git.")
+profile_app = typer.Typer(no_args_is_help=True, help="Crea, compone y activa perfiles de targets.")
 app.add_typer(repo_app, name="repo")
+app.add_typer(profile_app, name="profile")
 repo_app.add_typer(remote_app, name="remote")
 
 
-def manager() -> TargetManager:
+def manager(*, check_manifest: bool = True) -> TargetManager:
     if not concord.is_initialized():
         raise ValueError("Concord todavía no está inicializado.")
     target_manager = TargetManager()
+    if check_manifest and target_manager.profile_manifest_changed:
+        if not sys.stdin.isatty():
+            raise ValueError(
+                "El manifiesto contiene cambios externos en los perfiles. "
+                "Revísalos y ejecuta concord import --replace."
+            )
+        if not questionary.confirm(
+            "El manifiesto contiene perfiles diferentes. ¿Reemplazar los perfiles locales?",
+            default=False,
+        ).ask():
+            raise ValueError(
+                "Importación cancelada; no se modificó SQLite ni el manifiesto."
+            )
+        target_manager.import_manifest(replace=True)
+        success("Los perfiles del manifiesto reemplazaron las definiciones locales.")
     if target_manager.manifest_backup:
         config = ConfigManager().load()
         if config.git.enabled and config.git.auto_commit:
@@ -59,6 +78,57 @@ def manager() -> TargetManager:
             hint=f"Respaldo: {target_manager.manifest_backup}",
         )
     return target_manager
+
+
+def profiles(target_manager: TargetManager | None = None) -> ProfileManager:
+    target_manager = target_manager or manager()
+    return ProfileManager(target_manager.database, target_manager.config_manager)
+
+
+def render_activation(profile_manager: ProfileManager) -> None:
+    activation = profile_manager.activation()
+    if activation is None:
+        details([("Perfiles", "ninguno — se usan todos los targets")], title="Selección activa")
+        return
+    details(
+        [
+            ("Principal", activation.primary),
+            ("Complementarios", ", ".join(activation.complements) or "ninguno"),
+        ],
+        title="Selección activa",
+    )
+    resolution = profile_manager.resolve_active()
+    if resolution:
+        for message in resolution.warnings:
+            warning(message)
+
+
+def maybe_offer_suggestion(profile_manager: ProfileManager) -> None:
+    if not sys.stdin.isatty() or not profile_manager.should_offer_suggestion():
+        return
+    suggestion = profile_manager.suggestion()
+    if suggestion is None:
+        return
+    label = suggestion.primary
+    if suggestion.complements:
+        label += f" + {', '.join(suggestion.complements)}"
+    if questionary.confirm(
+        f"El manifiesto sugiere activar {label}. ¿Deseas adoptarlo?", default=True
+    ).ask():
+        profile_manager.activate(suggestion.primary, suggestion.complements)
+        success("Se adoptó la activación sugerida para este equipo.")
+    else:
+        profile_manager.decline_suggestion()
+
+
+def persist_profile_manifest(target_manager: TargetManager, message: str) -> None:
+    changed = target_manager.sync(CONCORD_TARGET)
+    if changed:
+        finalize_git(
+            git_paths(CONCORD_TARGET),
+            message,
+            GitOptions(message=None, yes=False, commit=True, push=None),
+        )
 
 
 def format_date(value: datetime) -> str:
@@ -149,6 +219,10 @@ def finalize_git(
     git = GitManager(config.repository_path)
     if not git.initialized:
         git.initialize()
+    if not all(git.identity()):
+        warning("Los cambios quedaron sin commit porque Git no tiene identidad configurada.")
+        console.print("  [concord.muted]Configúrala con: concord repo init[/]")
+        return None
     if not git.changed(paths):
         console.print("[concord.muted]Git: no hay cambios nuevos para confirmar.[/]")
         return None
@@ -361,6 +435,9 @@ def init(
 def add(
     path: Path,
     name: str | None = typer.Option(None, "--name", "-n", help="Nombre único del target."),
+    profile: list[str] | None = typer.Option(
+        None, "--profile", help="Perfil al que se asignará; puede repetirse."
+    ),
     message: str | None = typer.Option(None, "--message", "-m", help="Mensaje del commit."),
     yes: bool = typer.Option(False, "--yes", "-y", help="Acepta el mensaje predeterminado."),
     no_commit: bool = typer.Option(False, "--no-commit", help="No crea el commit automático."),
@@ -369,10 +446,34 @@ def add(
     """Registra un archivo o directorio y crea su primera copia."""
     heading("NUEVO TARGET", "Registrando una configuración en Concord")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    selected_profiles = list(profile or [])
+    active = execute(profile_manager.activation)
+    if not selected_profiles and active and sys.stdin.isatty():
+        choices = [active.primary, *active.complements]
+        answer = questionary.checkbox(
+            "¿A qué perfiles activos deseas agregar el target?", choices=choices
+        ).ask()
+        if answer is None:
+            raise KeyboardInterrupt
+        selected_profiles = answer
+    selected_profile_models = [
+        execute(lambda profile_name=profile_name: profile_manager.get(profile_name))
+        for profile_name in selected_profiles
+    ]
     target = execute(
         lambda: target_manager.add(path, name=name),
         hint="Usa una ruta existente dentro de HOME y un nombre que no esté registrado.",
     )
+    for current in selected_profile_models:
+        execute(
+            lambda current=current: profile_manager.update(
+                current.name, targets=[*current.targets, target.name]
+            )
+        )
+    if selected_profiles:
+        execute(lambda: target_manager.sync(CONCORD_TARGET))
     target_path = target.paths[0]
     destination = target_manager.repository.target_path(target.name) / target_path.relative_path
     details(
@@ -458,11 +559,17 @@ def remove_path(
 
 
 @app.command("list")
-def list_targets() -> None:
+def list_targets(
+    all_targets: bool = typer.Option(False, "--all", help="Muestra también targets fuera de los perfiles activos."),
+) -> None:
     """Muestra los targets registrados y sus rutas."""
     heading("TARGETS", "Configuraciones administradas por Concord")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
-    targets = target_manager.list()
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    if profile_manager.activation() is not None:
+        render_activation(profile_manager)
+    targets = target_manager.list() if all_targets else target_manager.selected()
     if not targets:
         warning("No hay targets registrados.")
         console.print("  [concord.muted]Agrega uno con:[/] concord add <ruta>")
@@ -671,6 +778,9 @@ def status(
     """Compara los archivos locales con sus copias del repositorio."""
     heading("ESTADO", "Comparando HOME con el repositorio de Concord")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    render_activation(profile_manager)
     items = target_manager.status()
     if not items:
         warning("No hay targets que comprobar.")
@@ -711,8 +821,12 @@ def diff_targets(
 ) -> None:
     """Muestra los cambios que sync aplicaría al repositorio."""
     heading("DIFERENCIAS", "Vista previa de HOME → repositorio")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    render_activation(profile_manager)
     differences = execute(
-        lambda: manager().diff(name),
+        lambda: target_manager.diff(name),
         hint="Consulta los nombres disponibles con: concord list",
     )
     render_differences(differences, command="concord sync" + (f" {name}" if name else ""))
@@ -734,8 +848,12 @@ def sync(
     """Actualiza uno o todos los targets desde HOME al repositorio."""
     if dry_run:
         heading("SIMULACIÓN DE SINCRONIZACIÓN", "Vista previa de HOME → repositorio")
+        target_manager = execute(manager, hint="Ejecuta primero: concord init")
+        profile_manager = profiles(target_manager)
+        maybe_offer_suggestion(profile_manager)
+        render_activation(profile_manager)
         differences = execute(
-            lambda: manager().preview_sync(name),
+            lambda: target_manager.preview_sync(name),
             hint="Consulta los nombres disponibles con: concord list",
         )
         render_differences(
@@ -760,7 +878,11 @@ def sync(
             )
         return
     heading("SINCRONIZACIÓN", "Copiando cambios locales al repositorio")
-    targets = execute(lambda: manager().sync(name), hint="Consulta los nombres disponibles con: concord list")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    render_activation(profile_manager)
+    targets = execute(lambda: target_manager.sync(name), hint="Consulta los nombres disponibles con: concord list")
     for target in targets:
         console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {len(target.paths)} ruta(s)[/]")
     if targets:
@@ -792,6 +914,9 @@ def restore(
     if (name is None) == (not all_targets):
         execute(lambda: (_ for _ in ()).throw(ValueError("Indique un target o use --all, pero no ambos.")))
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    render_activation(profile_manager)
     if dry_run:
         heading("SIMULACIÓN DE RESTAURACIÓN", "Vista previa de repositorio → HOME")
         differences = execute(
@@ -1058,7 +1183,7 @@ def import_targets(
     """Reconstruye SQLite usando los targets declarados en concord.toml."""
     heading("IMPORTAR MANIFIESTO", "Reconstruyendo el índice local desde concord.toml")
     targets = execute(
-        lambda: manager().import_manifest(replace=replace),
+        lambda: manager(check_manifest=False).import_manifest(replace=replace),
         hint="Usa --replace para reemplazar el índice local actual.",
     )
     for target in targets:
@@ -1100,3 +1225,279 @@ def remove(
         hint="La eliminación se conservó. Revisa Git con: concord repo status",
     )
     success(f"Concord dejó de administrar '{name}'.")
+
+
+def profile_tree(profile_manager: ProfileManager, name: str, *, root: Tree | None = None) -> Tree:
+    profile = profile_manager.get(name)
+    tree = root or Tree(f"[bold #D8DEE9]{profile.name}[/]")
+    if profile.includes:
+        includes = tree.add("[concord.accent]Incluye[/]")
+        for included in profile.includes:
+            branch = includes.add(f"[bold]{included}[/]")
+            profile_tree(profile_manager, included, root=branch)
+    if profile.targets:
+        targets = tree.add("[concord.success]Targets[/]")
+        for target in profile.targets:
+            targets.add(target)
+    if profile.excludes:
+        excludes = tree.add("[concord.warning]Excluye[/]")
+        for target in profile.excludes:
+            excludes.add(target)
+    return tree
+
+
+def choose_profile_activation(profile_manager: ProfileManager) -> Activation:
+    available = [profile.name for profile in profile_manager.list()]
+    if not available:
+        raise ValueError("No hay perfiles; cree uno con: concord profile create <nombre>.")
+    primary = questionary.select("Perfil principal:", choices=available).ask()
+    if primary is None:
+        raise KeyboardInterrupt
+    complements = questionary.checkbox(
+        "Perfiles complementarios (el orden mostrado será el orden de aplicación):",
+        choices=[name for name in available if name != primary],
+    ).ask()
+    if complements is None:
+        raise KeyboardInterrupt
+    return Activation(primary, complements)
+
+
+@profile_app.command("create")
+def profile_create(
+    name: str,
+    description: str = typer.Option("", "--description", "-d"),
+    tags: list[str] | None = typer.Option(None, "--tag", help="Etiqueta; puede repetirse."),
+) -> None:
+    """Crea un perfil vacío."""
+    heading("NUEVO PERFIL", "Creando una selección reutilizable de targets")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    profile = execute(lambda: profile_manager.create(name, description=description, tags=tags))
+    execute(lambda: persist_profile_manifest(target_manager, f"concord: create profile {profile.name}"))
+    details(
+        [
+            ("Nombre", profile.name),
+            ("Descripción", profile.description or "—"),
+            ("Etiquetas", ", ".join(profile.tags) or "—"),
+            ("Targets", "0"),
+        ],
+        title="Perfil creado",
+    )
+    success(f"Se creó el perfil vacío '{profile.name}'.", hint=f"Edítalo con: concord profile edit {profile.name}")
+
+
+@profile_app.command("edit")
+def profile_edit(
+    name: str,
+    description: str | None = typer.Option(None, "--description", "-d"),
+    tags: list[str] | None = typer.Option(None, "--tag"),
+    includes: list[str] | None = typer.Option(None, "--include"),
+    targets: list[str] | None = typer.Option(None, "--target"),
+    excludes: list[str] | None = typer.Option(None, "--exclude"),
+) -> None:
+    """Edita toda la composición de un perfil."""
+    heading("EDITAR PERFIL", "Modificando composición, exclusiones y metadatos")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    current = execute(lambda: profile_manager.get(name))
+    interactive = all(value is None for value in (description, tags, includes, targets, excludes))
+    if interactive:
+        description = request_text("Descripción:", current.description)
+        available_profiles = [item.name for item in profile_manager.list() if item.id != current.id]
+        includes = questionary.checkbox(
+            "Perfiles incluidos:",
+            choices=[questionary.Choice(item, checked=item in current.includes) for item in available_profiles],
+        ).ask()
+        available_targets = [target.name for target in target_manager.list()]
+        targets = questionary.checkbox(
+            "Targets directos:",
+            choices=[questionary.Choice(item, checked=item in current.targets) for item in available_targets],
+        ).ask()
+        excludes = questionary.checkbox(
+            "Targets excluidos:",
+            choices=[questionary.Choice(item, checked=item in current.excludes) for item in available_targets],
+        ).ask()
+        tag_text = request_text("Etiquetas separadas por comas:", ", ".join(current.tags))
+        tags = [tag.strip() for tag in tag_text.split(",") if tag.strip()]
+        if includes is None or targets is None or excludes is None:
+            raise KeyboardInterrupt
+        if not questionary.confirm("¿Guardar todos los cambios?", default=True).ask():
+            warning("Edición cancelada; no se modificó el perfil.")
+            return
+    updated = execute(
+        lambda: profile_manager.update(
+            current.name,
+            description=description,
+            tags=tags,
+            includes=includes,
+            targets=targets,
+            excludes=excludes,
+        )
+    )
+    execute(lambda: persist_profile_manifest(target_manager, f"concord: edit profile {updated.name}"))
+    success(f"Se actualizó el perfil '{updated.name}'.")
+
+
+@profile_app.command("rename")
+def profile_rename(name: str, new_name: str) -> None:
+    """Cambia el nombre sin romper referencias."""
+    heading("RENOMBRAR PERFIL", "Conservando referencias mediante UUID")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    renamed = execute(lambda: profiles(target_manager).rename(name, new_name))
+    execute(lambda: persist_profile_manifest(target_manager, f"concord: rename profile {name} to {renamed.name}"))
+    success(f"El perfil ahora se llama '{renamed.name}'.")
+
+
+@profile_app.command("delete")
+def profile_delete(
+    name: str,
+    yes: bool = typer.Option(False, "--yes", "-y", help="Elimina sin pedir confirmación."),
+) -> None:
+    """Elimina un perfil y limpia sus referencias."""
+    heading("ELIMINAR PERFIL", "Retirando una composición de targets")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    profile = execute(lambda: profile_manager.get(name))
+    if not yes and sys.stdin.isatty():
+        if not questionary.confirm(f"¿Eliminar el perfil '{profile.name}'?", default=False).ask():
+            warning("Eliminación cancelada.")
+            return
+    execute(lambda: profile_manager.delete(profile.name))
+    execute(lambda: persist_profile_manifest(target_manager, f"concord: delete profile {profile.name}"))
+    success(f"Se eliminó el perfil '{profile.name}' y sus referencias.")
+
+
+@profile_app.command("list")
+def profile_list() -> None:
+    """Muestra perfiles, composición y estado de activación."""
+    heading("PERFILES", "Composiciones disponibles y targets efectivos")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    available = profile_manager.list()
+    if not available:
+        warning("No hay perfiles definidos.")
+        return
+    active = execute(profile_manager.activation)
+    for profile in available:
+        state = ""
+        if active and profile.name == active.primary:
+            state = "  [concord.success](principal)[/]"
+        elif active and profile.name in active.complements:
+            position = active.complements.index(profile.name) + 1
+            state = f"  [concord.accent](complementario {position})[/]"
+        console.print(f"\n[bold #88C0D0]{profile.name}[/]{state}")
+        if profile.description:
+            console.print(f"[concord.muted]{profile.description}[/]")
+        console.print(profile_tree(profile_manager, profile.name))
+        resolution = execute(lambda profile=profile: profile_manager.resolve(profile.name))
+        console.print(
+            "[concord.muted]Resultado:[/] "
+            + (", ".join(resolution.target_names) if resolution.target_names else "vacío")
+        )
+
+
+@profile_app.command("show")
+def profile_show(name: str) -> None:
+    """Muestra el detalle de un perfil."""
+    heading("DETALLE DEL PERFIL", "Composición directa y resultado expandido")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    profile = execute(lambda: profile_manager.get(name))
+    details(
+        [
+            ("UUID", profile.id),
+            ("Nombre", profile.name),
+            ("Descripción", profile.description or "—"),
+            ("Etiquetas", ", ".join(profile.tags) or "—"),
+        ],
+        title="Perfil",
+    )
+    console.print(profile_tree(profile_manager, profile.name))
+    resolution = execute(lambda: profile_manager.resolve(profile.name))
+    details(
+        [("Targets efectivos", "\n".join(resolution.target_names) or "vacío")],
+        title="Resultado expandido",
+    )
+    for message in resolution.warnings:
+        warning(message)
+
+
+@profile_app.command("activate")
+def profile_activate(
+    primary: str | None = typer.Option(None, "--primary", help="Perfil principal."),
+    complements: list[str] | None = typer.Option(None, "--with", help="Perfil complementario; puede repetirse."),
+) -> None:
+    """Activa un perfil principal y complementarios ordenados."""
+    heading("ACTIVAR PERFILES", "Seleccionando los targets efectivos de este equipo")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    if primary is None:
+        chosen = execute(lambda: choose_profile_activation(profile_manager))
+        activation = execute(
+            lambda: profile_manager.activate(chosen.primary, chosen.complements)
+        )
+    else:
+        activation = execute(lambda: profile_manager.activate(primary, complements))
+    render_activation(profile_manager)
+    resolution = execute(profile_manager.resolve_active)
+    if resolution and not resolution.target_names:
+        warning("La activación es válida, pero su resultado está vacío.")
+    success(f"Se activó el perfil principal '{activation.primary}'.")
+
+
+@profile_app.command("deactivate")
+def profile_deactivate(
+    name: str | None = typer.Argument(None),
+    all_profiles: bool = typer.Option(False, "--all", help="Desactiva la selección completa."),
+    replace_with: str | None = typer.Option(None, "--replace-with", help="Nuevo perfil principal."),
+) -> None:
+    """Desactiva un perfil o vuelve al modo global."""
+    heading("DESACTIVAR PERFILES", "Actualizando la selección local")
+    profile_manager = profiles(execute(manager, hint="Ejecuta primero: concord init"))
+    if all_profiles:
+        if name is not None:
+            execute(lambda: (_ for _ in ()).throw(ValueError("No combine un nombre con --all.")))
+        profile_manager.deactivate_all()
+        success("Se desactivaron todos los perfiles; Concord usará todos los targets.")
+        return
+    if name is None:
+        execute(lambda: (_ for _ in ()).throw(ValueError("Indique un perfil o use --all.")))
+    active = execute(lambda: profile_manager.deactivate(name, replace_with=replace_with))
+    if active:
+        render_activation(profile_manager)
+    success(f"Se desactivó el perfil '{name}'.")
+
+
+@profile_app.command("suggest")
+def profile_suggest(
+    primary: str | None = typer.Option(None, "--primary"),
+    complements: list[str] | None = typer.Option(None, "--with"),
+) -> None:
+    """Guarda en el manifiesto una activación recomendada."""
+    heading("SUGERIR ACTIVACIÓN", "Definiendo la combinación recomendada para otros equipos")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    if primary is None:
+        chosen = execute(lambda: choose_profile_activation(profile_manager))
+        activation = execute(lambda: profile_manager.suggest(chosen.primary, chosen.complements))
+    else:
+        activation = execute(lambda: profile_manager.suggest(primary, complements))
+    execute(lambda: persist_profile_manifest(target_manager, "concord: update suggested profiles"))
+    success(
+        f"Se sugirió '{activation.primary}'"
+        + (f" con {', '.join(activation.complements)}." if activation.complements else ".")
+    )
+
+
+@profile_app.command("validate")
+def profile_validate() -> None:
+    """Comprueba referencias, ciclos y la activación actual."""
+    heading("VALIDAR PERFILES", "Comprobando composición e integridad")
+    profile_manager = profiles(execute(manager, hint="Ejecuta primero: concord init"))
+    warnings = execute(profile_manager.validate)
+    if warnings:
+        for message in warnings:
+            warning(message)
+        success("Los perfiles son válidos con advertencias.")
+    else:
+        success("Todos los perfiles y la activación son válidos.")

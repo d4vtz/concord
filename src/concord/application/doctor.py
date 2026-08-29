@@ -50,6 +50,7 @@ class Doctor:
         if config is None:
             return DoctorReport(checks)
         self._database_checks(config, checks)
+        self._profile_checks(config, checks)
         self._target_checks(config, checks)
         self._git_checks(config, checks, fetch=fetch)
         return DoctorReport(checks)
@@ -276,54 +277,127 @@ class Doctor:
                     modified.append(label)
         if missing_copy:
             self._add(
-                checks,
-                "Targets",
-                "Copias del repositorio",
-                "failure",
-                f"Faltan: {', '.join(missing_copy)}.",
-                "Sincroniza los targets indicados.",
+                checks, "Targets", "Copias del repositorio", "failure",
+                f"Faltan: {', '.join(missing_copy)}.", "Sincroniza los targets indicados."
             )
         else:
             self._add(
-                checks,
-                "Targets",
-                "Copias del repositorio",
-                "pass",
-                "Todos los targets tienen una copia.",
+                checks, "Targets", "Copias del repositorio", "pass",
+                "Todos los targets tienen una copia."
             )
         if missing_local:
             self._add(
-                checks,
-                "Targets",
-                "Rutas locales",
-                "warning",
+                checks, "Targets", "Rutas locales", "warning",
                 f"No existen: {', '.join(missing_local)}.",
-                "Revísalas con concord status o usa concord restore.",
+                "Revísalas con concord status o usa concord restore."
             )
         else:
             self._add(
-                checks,
-                "Targets",
-                "Rutas locales",
-                "pass",
-                "Todos los targets existen en HOME.",
+                checks, "Targets", "Rutas locales", "pass",
+                "Todos los targets existen en HOME."
             )
         if modified:
             self._add(
-                checks,
-                "Targets",
-                "Sincronización",
-                "warning",
-                f"Cambios locales en: {', '.join(modified)}.",
-                "Revísalos con: concord diff",
+                checks, "Targets", "Sincronización", "warning",
+                f"Cambios locales en: {', '.join(modified)}.", "Revísalos con: concord diff"
             )
         elif not missing_copy:
             self._add(
-                checks,
-                "Targets",
-                "Sincronización",
-                "pass",
-                "HOME y el repositorio coinciden.",
+                checks, "Targets", "Sincronización", "pass",
+                "HOME y el repositorio coinciden."
+            )
+
+    def _profile_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
+        if not concord.database_file.is_file():
+            return
+        try:
+            uri = f"file:{concord.database_file}?mode=ro"
+            with sqlite3.connect(uri, uri=True) as connection:
+                tables = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+                if "profiles" not in tables:
+                    self._add(
+                        checks, "Perfiles", "Esquema SQLite", "failure",
+                        "La base de datos todavía no contiene las tablas de perfiles.",
+                        "Ejecuta cualquier comando de Concord 2.3.0 para actualizarla."
+                    )
+                    return
+                rows = connection.execute("SELECT id, name FROM profiles").fetchall()
+                includes = connection.execute(
+                    "SELECT profile_id, included_profile_id FROM profile_includes"
+                ).fetchall()
+                active_primary = connection.execute(
+                    "SELECT primary_profile_id FROM profile_activation WHERE singleton = 1"
+                ).fetchone()
+                active_complements = connection.execute(
+                    "SELECT profile_id FROM profile_activation_complements"
+                ).fetchall()
+        except sqlite3.Error as error:
+            self._add(checks, "Perfiles", "Integridad", "failure", f"No pudieron comprobarse: {error}")
+            return
+
+        if set(rows) != {(profile.id, profile.name) for profile in config.profiles}:
+            self._add(
+                checks, "Perfiles", "Índice local", "failure",
+                "SQLite y concord.toml contienen perfiles diferentes.",
+                "Ejecuta: concord import --replace"
+            )
+        else:
+            self._add(
+                checks, "Perfiles", "Índice local", "pass",
+                f"{len(rows)} perfil(es) coinciden con el manifiesto."
+            )
+
+        graph: dict[str, list[str]] = {}
+        for profile_id, included_id in includes:
+            graph.setdefault(profile_id, []).append(included_id)
+        visited: set[str] = set()
+        visiting: set[str] = set()
+
+        def visit(profile_id: str) -> None:
+            if profile_id in visiting:
+                raise ValueError("Se detectó un ciclo entre perfiles.")
+            if profile_id in visited:
+                return
+            visiting.add(profile_id)
+            for included_id in graph.get(profile_id, []):
+                visit(included_id)
+            visiting.remove(profile_id)
+            visited.add(profile_id)
+
+        try:
+            for profile_id, _ in rows:
+                visit(profile_id)
+        except ValueError as error:
+            self._add(checks, "Perfiles", "Composición", "failure", str(error))
+        else:
+            self._add(
+                checks, "Perfiles", "Composición", "pass",
+                "No hay ciclos ni referencias estructurales rotas."
+            )
+
+        ids = {profile_id for profile_id, _ in rows}
+        active_ids = ([active_primary[0]] if active_primary else []) + [
+            profile_id for (profile_id,) in active_complements
+        ]
+        if any(profile_id not in ids for profile_id in active_ids):
+            self._add(
+                checks, "Perfiles", "Activación local", "failure",
+                "La activación referencia perfiles inexistentes.",
+                "Ejecuta: concord profile activate o concord profile deactivate --all"
+            )
+        elif active_primary:
+            self._add(
+                checks, "Perfiles", "Activación local", "pass",
+                "La activación local es válida."
+            )
+        else:
+            self._add(
+                checks, "Perfiles", "Activación local", "pass",
+                "No hay perfiles activos; se usarán todos los targets."
             )
 
     def _git_checks(self, config: Config, checks: list[DoctorCheck], *, fetch: bool) -> None:
