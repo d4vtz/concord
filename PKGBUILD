@@ -2,7 +2,7 @@
 
 pkgname=concord
 pkgver=2.3.1
-pkgrel=1
+pkgrel=2
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
 url='https://github.com/d4vtz/concord'
@@ -23,7 +23,7 @@ makedepends=(
 )
 checkdepends=('python-pytest')
 optdepends=('github-cli: crear y autenticar repositorios remotos en GitHub')
-_commit='a54cfaf77284e06fd065a8b66af6feb98619e9e5'
+_commit='aee12cab5b67946705c7283e39257384c48457e3'
 source=("${pkgname}::git+${url}.git#commit=${_commit}")
 b2sums=('SKIP')
 
