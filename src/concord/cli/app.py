@@ -19,6 +19,7 @@ from concord.application.doctor import Doctor
 from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
 from concord.application.profile_manager import Activation, ProfileManager
+from concord.application.reset import ResetManager
 from concord.application.target_manager import TargetManager
 from concord.cli.completion import (complete_editables,
                                     complete_removable_targets,
@@ -1050,6 +1051,55 @@ def bootstrap(
         warning("Los targets fueron importados pero todavía no se restauraron.")
         console.print("  [concord.muted]Cuando estés listo:[/] concord restore --all")
     render_git_status(GitManager(destination).status(remote=config.git.remote))
+
+
+@app.command()
+def reset(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Muestra qué eliminaría sin modificar archivos.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Confirma la eliminación sin interacción.",
+    ),
+) -> None:
+    """Elimina todo el estado local de Concord y conserva los targets de HOME."""
+    heading("REINICIAR CONCORD", "Eliminando configuración, datos y repositorio local")
+    reset_manager = ResetManager()
+    plan = execute(reset_manager.plan)
+    if not plan.paths:
+        success("No existe estado local de Concord que eliminar.")
+        return
+    details(
+        [("Eliminar", str(path)) for path in plan.paths],
+        title="Rutas internas",
+    )
+    console.print(
+        "[concord.muted]Los targets restaurados en HOME y el remoto no se modificarán.[/]"
+    )
+    if dry_run:
+        warning("Esta es una simulación; no se eliminó ningún archivo.")
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            execute(
+                lambda: (_ for _ in ()).throw(
+                    ValueError("La confirmación requiere una terminal; use --yes.")
+                )
+            )
+        confirmation = questionary.text("Escribe RESET para continuar:").ask()
+        if confirmation != "RESET":
+            warning("Reset cancelado; no se eliminó ningún archivo.")
+            return
+    execute(lambda: reset_manager.reset(plan))
+    success(
+        "Se eliminó todo el estado local de Concord.",
+        hint="Puedes reconstruirlo con: concord bootstrap <URL>",
+    )
 
 
 def active_git() -> tuple[GitManager, GitConfig]:

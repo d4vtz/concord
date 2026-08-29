@@ -23,6 +23,7 @@ def configure_environment(home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(concord, "config_dir", home / ".config/concord")
+    monkeypatch.setattr(concord, "data_dir", home / ".local/share/concord")
     monkeypatch.setattr(concord, "config_file", home / ".config/concord/concord.toml")
     monkeypatch.setattr(concord, "database_file", home / ".local/share/concord/concord.db")
     monkeypatch.setattr(concord, "default_repository_dir", home / ".local/share/concord/repository")
@@ -1108,6 +1109,66 @@ def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch
     assert "Tiempos" in timed.output
     assert "Targets" in timed.output
     assert "Total" in timed.output
+
+
+def test_reset_dry_run_and_reset_remove_only_concord_state(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = home / ".local/share/concord/repository"
+    Initializer().initialize(
+        repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    target = home / ".bashrc"
+    target.write_text("alias ll='ls -la'\n")
+    TargetManager().add(target, "bash")
+    runner = CliRunner()
+
+    preview = runner.invoke(app, ["reset", "--dry-run"])
+
+    assert preview.exit_code == 0, preview.output
+    assert "simulación" in preview.output
+    assert repository.exists()
+    assert target.exists()
+
+    result = runner.invoke(app, ["reset", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert not (home / ".config/concord").exists()
+    assert not (home / ".local/share/concord").exists()
+    assert target.read_text() == "alias ll='ls -la'\n"
+
+
+def test_reset_rejects_unsafe_repository_before_deleting(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    ConfigManager().save(Config(repository_path=home))
+
+    result = CliRunner().invoke(app, ["reset", "--yes"])
+
+    assert result.exit_code == 1
+    assert "Ruta insegura" in result.output
+    assert (home / ".config/concord/concord.toml").exists()
+
+
+def test_reset_removes_a_verified_custom_repository(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    configure_environment(home, monkeypatch)
+    repository = home / "dotfiles"
+    Initializer().initialize(
+        repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+
+    result = CliRunner().invoke(app, ["reset", "--yes"])
+
+    assert result.exit_code == 0, result.output
+    assert not repository.exists()
+    assert not (home / ".config/concord").exists()
+    assert not (home / ".local/share/concord").exists()
 
 
 def test_pkgbuild_matches_project_metadata():

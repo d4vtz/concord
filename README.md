@@ -615,6 +615,21 @@ concord bootstrap https://github.com/usuario/dotfiles.git --restore
 concord bootstrap https://github.com/usuario/dotfiles.git --no-restore
 ```
 
+## Reiniciar Concord
+
+Para eliminar la configuración, SQLite, respaldos y repositorio local de
+Concord sin tocar los targets restaurados en `$HOME` ni el remoto:
+
+```bash
+concord reset --dry-run
+concord reset
+```
+
+La operación muestra y valida todas las rutas antes de borrar. En una terminal
+exige escribir `RESET`; `--yes` permite confirmarla en pruebas automatizadas.
+El paquete instalado por Arch permanece disponible para ejecutar nuevamente
+`concord bootstrap <URL>`.
+
 ## Desarrollo
 
 ```bash
