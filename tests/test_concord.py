@@ -930,6 +930,33 @@ def test_sensitive_files_are_detected_before_first_push(tmp_path):
     assert git.sensitive_files() == [Path("app/.env")]
 
 
+def test_sensitive_files_use_precise_names_and_ignore_resources(tmp_path):
+    repository = tmp_path / "repository"
+    files = {
+        "app/.env.production": "TOKEN=secret",
+        "app/credentials.json": '{"token": "secret"}',
+        "ssh/id_ed25519": "private key",
+        "certificates/server.key": "private key",
+        "certificates/client.p12": "certificate",
+        "icons/credentials-preferences.svg": "<svg />",
+        "docs/token-guide.txt": "documentation",
+        "themes/secrets-dark.png": "image",
+    }
+    for relative, content in files.items():
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    git = GitManager(repository)
+
+    assert git.sensitive_files() == [
+        Path("app/.env.production"),
+        Path("app/credentials.json"),
+        Path("certificates/client.p12"),
+        Path("certificates/server.key"),
+        Path("ssh/id_ed25519"),
+    ]
+
+
 def test_doctor_reports_uninitialized_installation_without_creating_files(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()

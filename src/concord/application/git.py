@@ -25,14 +25,30 @@ class GitCommit:
 
 class GitManager:
     DEFAULT_GITIGNORE = "*.db\n*.sqlite\n*.sqlite3\n__pycache__/\n.DS_Store\n"
-    SENSITIVE_PATTERNS = (
-        ".env",
-        "*.pem",
-        "id_rsa",
-        "id_ed25519",
-        "credentials*",
-        "secrets*",
-        "token*",
+    SENSITIVE_FILENAMES = frozenset(
+        {
+            ".env",
+            "credentials.json",
+            "id_rsa",
+            "id_ed25519",
+            "secrets.toml",
+        }
+    )
+    SENSITIVE_SUFFIXES = frozenset({".pem", ".key", ".p12", ".pfx"})
+    IGNORED_RESOURCE_SUFFIXES = frozenset(
+        {
+            ".svg",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".gif",
+            ".ico",
+            ".ttf",
+            ".otf",
+            ".woff",
+            ".woff2",
+        }
     )
 
     def __init__(self, repository_path: Path) -> None:
@@ -223,12 +239,25 @@ class GitManager:
             if absolute.is_file():
                 files = [absolute]
             elif absolute.exists():
-                files = [path for path in absolute.rglob("*") if path.is_file()]
+                files = [
+                    path
+                    for path in absolute.rglob("*")
+                    if path.is_file() and ".git" not in path.relative_to(self.repository_path).parts
+                ]
             else:
                 continue
             for file in files:
                 relative = file.relative_to(self.repository_path)
-                if any(file.match(pattern) for pattern in self.SENSITIVE_PATTERNS):
+                name = file.name.casefold()
+                suffix = file.suffix.casefold()
+                if suffix in self.IGNORED_RESOURCE_SUFFIXES:
+                    continue
+                is_environment = name.startswith(".env.")
+                if (
+                    name in self.SENSITIVE_FILENAMES
+                    or is_environment
+                    or suffix in self.SENSITIVE_SUFFIXES
+                ):
                     result.add(relative)
         return sorted(result, key=str)
 
