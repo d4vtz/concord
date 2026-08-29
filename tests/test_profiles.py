@@ -9,7 +9,7 @@ from concord.application.database import Database
 from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
-from concord.cli.app import app
+from concord.cli.app import app, request_checkbox
 
 
 @pytest.fixture
@@ -235,3 +235,12 @@ def test_import_that_removes_active_profile_blocks_until_activation_is_repaired(
         profiles.activation()
     profiles.deactivate_all()
     assert profiles.activation() is None
+
+
+def test_empty_interactive_checkbox_returns_empty_selection(monkeypatch):
+    def unexpected_checkbox(*args, **kwargs):
+        raise AssertionError("Questionary no debe recibir choices=[]")
+
+    monkeypatch.setattr("concord.cli.app.questionary.checkbox", unexpected_checkbox)
+
+    assert request_checkbox("Sin opciones:", []) == []

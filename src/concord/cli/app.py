@@ -162,6 +162,27 @@ def request_text(message: str, default: str = "") -> str:
     return answer.strip()
 
 
+def request_checkbox(
+    message: str,
+    choices: list[str],
+    *,
+    checked: list[str] | None = None,
+) -> list[str]:
+    """Solicita varias opciones sin invocar Questionary con una lista vacía."""
+    if not choices:
+        return []
+    selected = set(checked or [])
+    answer = questionary.checkbox(
+        message,
+        choices=[
+            questionary.Choice(item, checked=item in selected) for item in choices
+        ],
+    ).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return answer
+
+
 def request_commit_message(default: str, options: GitOptions) -> str | None:
     if options.message:
         return options.message
@@ -452,12 +473,9 @@ def add(
     active = execute(profile_manager.activation)
     if not selected_profiles and active and sys.stdin.isatty():
         choices = [active.primary, *active.complements]
-        answer = questionary.checkbox(
-            "¿A qué perfiles activos deseas agregar el target?", choices=choices
-        ).ask()
-        if answer is None:
-            raise KeyboardInterrupt
-        selected_profiles = answer
+        selected_profiles = request_checkbox(
+            "¿A qué perfiles activos deseas agregar el target?", choices
+        )
     selected_profile_models = [
         execute(lambda profile_name=profile_name: profile_manager.get(profile_name))
         for profile_name in selected_profiles
@@ -1253,12 +1271,10 @@ def choose_profile_activation(profile_manager: ProfileManager) -> Activation:
     primary = questionary.select("Perfil principal:", choices=available).ask()
     if primary is None:
         raise KeyboardInterrupt
-    complements = questionary.checkbox(
+    complements = request_checkbox(
         "Perfiles complementarios (el orden mostrado será el orden de aplicación):",
-        choices=[name for name in available if name != primary],
-    ).ask()
-    if complements is None:
-        raise KeyboardInterrupt
+        [name for name in available if name != primary],
+    )
     return Activation(primary, complements)
 
 
@@ -1304,23 +1320,24 @@ def profile_edit(
     if interactive:
         description = request_text("Descripción:", current.description)
         available_profiles = [item.name for item in profile_manager.list() if item.id != current.id]
-        includes = questionary.checkbox(
+        includes = request_checkbox(
             "Perfiles incluidos:",
-            choices=[questionary.Choice(item, checked=item in current.includes) for item in available_profiles],
-        ).ask()
+            available_profiles,
+            checked=current.includes,
+        )
         available_targets = [target.name for target in target_manager.list()]
-        targets = questionary.checkbox(
+        targets = request_checkbox(
             "Targets directos:",
-            choices=[questionary.Choice(item, checked=item in current.targets) for item in available_targets],
-        ).ask()
-        excludes = questionary.checkbox(
+            available_targets,
+            checked=current.targets,
+        )
+        excludes = request_checkbox(
             "Targets excluidos:",
-            choices=[questionary.Choice(item, checked=item in current.excludes) for item in available_targets],
-        ).ask()
+            available_targets,
+            checked=current.excludes,
+        )
         tag_text = request_text("Etiquetas separadas por comas:", ", ".join(current.tags))
         tags = [tag.strip() for tag in tag_text.split(",") if tag.strip()]
-        if includes is None or targets is None or excludes is None:
-            raise KeyboardInterrupt
         if not questionary.confirm("¿Guardar todos los cambios?", default=True).ask():
             warning("Edición cancelada; no se modificó el perfil.")
             return
