@@ -119,18 +119,24 @@ La edición sin opciones abre un selector interactivo:
 concord profile edit linux
 ```
 
-Una activación contiene un perfil principal y complementarios ordenados:
+Una activación contiene un perfil principal y complementos ordenados. Sin
+opciones, Concord guía la selección de la base, los complementos, su orden,
+muestra una vista previa de targets y exclusiones, y pide confirmación:
 
 ```bash
 concord profile activate
 concord profile activate --primary linux --with trabajo
 ```
 
-El principal forma una base protegida. Los complementarios pueden agregar
-targets y excluir targets aportados por complementarios anteriores, pero no
+El principal forma una base protegida. Los complementos pueden agregar
+targets y excluir targets aportados por complementos anteriores, pero no
 pueden retirar los del principal. Las inclusiones se expanden primero, después
 se agregan los targets directos y al final se aplican las exclusiones. Los ciclos
 y referencias inexistentes se rechazan antes de guardar.
+
+El target interno `concord` no aparece en los selectores y no puede agregarse
+ni excluirse desde un perfil. `profile list` ofrece un resumen compacto;
+`profile show <nombre>` conserva el árbol completo y el resultado expandido.
 
 Con una activación, `list`, `status`, `diff`, `sync` y `restore --all` trabajan
 por defecto sobre sus targets efectivos. Un target indicado explícitamente
@@ -219,7 +225,7 @@ paths = [
 Los perfiles se guardan mediante UUID estables y nombres legibles. SQLite es la
 fuente de trabajo para administrarlos y cada cambio exporta inmediatamente su
 representación portable al manifiesto. Cuando el manifiesto contiene perfiles,
-declara `minimum_concord_version = "2.3.0"`.
+declara `minimum_concord_version = "2.3.1"`.
 
 Concord se registra automáticamente como el primer target. Después de agregar
 o eliminar una configuración, actualiza el manifiesto y sincroniza su propia

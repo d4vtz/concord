@@ -63,16 +63,8 @@ class Database:
                     description TEXT NOT NULL DEFAULT ''
                 )
                 """)
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS profile_tags (
-                    profile_id TEXT NOT NULL,
-                    tag TEXT NOT NULL,
-                    position INTEGER NOT NULL,
-                    PRIMARY KEY (profile_id, tag),
-                    FOREIGN KEY (profile_id) REFERENCES profiles(id) ON DELETE CASCADE,
-                    UNIQUE (profile_id, position)
-                )
-                """)
+            # Las etiquetas se retiraron en 2.3.1; sus datos anteriores se descartan.
+            connection.execute("DROP TABLE IF EXISTS profile_tags")
             connection.execute("""
                 CREATE TABLE IF NOT EXISTS profile_includes (
                     profile_id TEXT NOT NULL,

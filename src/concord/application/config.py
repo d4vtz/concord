@@ -11,7 +11,7 @@ from questionary import ValidationError, Validator
 from concord import application as concord
 
 MANIFEST_VERSION = 2
-CONCORD_VERSION = "2.3.0"
+CONCORD_VERSION = "2.3.1"
 CONCORD_TARGET = "concord"
 
 
@@ -41,7 +41,6 @@ class ProfileConfig:
     id: str
     name: str
     description: str = ""
-    tags: list[str] = field(default_factory=list)
     includes: list[ManifestReference] = field(default_factory=list)
     targets: list[ManifestReference] = field(default_factory=list)
     excludes: list[ManifestReference] = field(default_factory=list)
@@ -143,7 +142,6 @@ class ConfigManager:
                     "id": profile.id,
                     "name": profile.name,
                     "description": profile.description,
-                    "tags": profile.tags,
                     "includes": [
                         {"id": reference.id, "name": reference.name}
                         for reference in profile.includes
@@ -224,7 +222,6 @@ class ConfigManager:
                     id=item["id"],
                     name=item["name"],
                     description=item.get("description", ""),
-                    tags=[str(tag) for tag in item.get("tags", [])],
                     includes=[reference(value) for value in item.get("includes", [])],
                     targets=[reference(value) for value in item.get("targets", [])],
                     excludes=[reference(value) for value in item.get("excludes", [])],

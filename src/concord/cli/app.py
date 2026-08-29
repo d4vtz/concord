@@ -93,7 +93,7 @@ def render_activation(profile_manager: ProfileManager) -> None:
     details(
         [
             ("Principal", activation.primary),
-            ("Complementarios", ", ".join(activation.complements) or "ninguno"),
+            ("Complementos", ", ".join(activation.complements) or "ninguno"),
         ],
         title="Selección activa",
     )
@@ -181,6 +181,22 @@ def request_checkbox(
     if answer is None:
         raise KeyboardInterrupt
     return answer
+
+
+def request_order(choices: list[str]) -> list[str]:
+    """Permite ordenar una selección eligiendo cada capa sucesivamente."""
+    remaining = list(choices)
+    ordered: list[str] = []
+    while len(remaining) > 1:
+        selected = questionary.select(
+            f"Siguiente complemento ({len(ordered) + 1}/{len(choices)}):",
+            choices=remaining,
+        ).ask()
+        if selected is None:
+            raise KeyboardInterrupt
+        ordered.append(selected)
+        remaining.remove(selected)
+    return [*ordered, *remaining]
 
 
 def request_commit_message(default: str, options: GitOptions) -> str | None:
@@ -1264,7 +1280,9 @@ def profile_tree(profile_manager: ProfileManager, name: str, *, root: Tree | Non
     return tree
 
 
-def choose_profile_activation(profile_manager: ProfileManager) -> Activation:
+def choose_profile_activation(
+    profile_manager: ProfileManager, *, confirmation: str = "¿Activar esta combinación?"
+) -> Activation | None:
     available = [profile.name for profile in profile_manager.list()]
     if not available:
         raise ValueError("No hay perfiles; cree uno con: concord profile create <nombre>.")
@@ -1272,29 +1290,45 @@ def choose_profile_activation(profile_manager: ProfileManager) -> Activation:
     if primary is None:
         raise KeyboardInterrupt
     complements = request_checkbox(
-        "Perfiles complementarios (el orden mostrado será el orden de aplicación):",
+        "Complementos:",
         [name for name in available if name != primary],
     )
-    return Activation(primary, complements)
+    complements = request_order(complements)
+    resolution = profile_manager.resolve_activation(primary, complements)
+    details(
+        [
+            ("Principal", primary),
+            ("Complementos (en orden)", "\n".join(complements) or "—"),
+            ("Targets efectivos", "\n".join(resolution.target_names) or "vacío"),
+            ("Exclusiones aplicadas", "\n".join(resolution.applied_exclusions) or "—"),
+        ],
+        title="Vista previa",
+    )
+    if resolution.warnings:
+        warning("Advertencias de resolución:\n- " + "\n- ".join(resolution.warnings))
+    if not resolution.target_names:
+        warning("La combinación es válida, pero su resultado está vacío.")
+    if not questionary.confirm(confirmation, default=True).ask():
+        warning("Operación cancelada; no se modificó la activación.")
+        return None
+    return resolution.activation
 
 
 @profile_app.command("create")
 def profile_create(
     name: str,
     description: str = typer.Option("", "--description", "-d"),
-    tags: list[str] | None = typer.Option(None, "--tag", help="Etiqueta; puede repetirse."),
 ) -> None:
     """Crea un perfil vacío."""
     heading("NUEVO PERFIL", "Creando una selección reutilizable de targets")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
-    profile = execute(lambda: profile_manager.create(name, description=description, tags=tags))
+    profile = execute(lambda: profile_manager.create(name, description=description))
     execute(lambda: persist_profile_manifest(target_manager, f"concord: create profile {profile.name}"))
     details(
         [
             ("Nombre", profile.name),
             ("Descripción", profile.description or "—"),
-            ("Etiquetas", ", ".join(profile.tags) or "—"),
             ("Targets", "0"),
         ],
         title="Perfil creado",
@@ -1306,7 +1340,6 @@ def profile_create(
 def profile_edit(
     name: str,
     description: str | None = typer.Option(None, "--description", "-d"),
-    tags: list[str] | None = typer.Option(None, "--tag"),
     includes: list[str] | None = typer.Option(None, "--include"),
     targets: list[str] | None = typer.Option(None, "--target"),
     excludes: list[str] | None = typer.Option(None, "--exclude"),
@@ -1316,7 +1349,7 @@ def profile_edit(
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
     current = execute(lambda: profile_manager.get(name))
-    interactive = all(value is None for value in (description, tags, includes, targets, excludes))
+    interactive = all(value is None for value in (description, includes, targets, excludes))
     if interactive:
         description = request_text("Descripción:", current.description)
         available_profiles = [item.name for item in profile_manager.list() if item.id != current.id]
@@ -1325,7 +1358,10 @@ def profile_edit(
             available_profiles,
             checked=current.includes,
         )
-        available_targets = [target.name for target in target_manager.list()]
+        available_targets = [
+            target.name for target in target_manager.list()
+            if target.name != CONCORD_TARGET
+        ]
         targets = request_checkbox(
             "Targets directos:",
             available_targets,
@@ -1336,8 +1372,6 @@ def profile_edit(
             available_targets,
             checked=current.excludes,
         )
-        tag_text = request_text("Etiquetas separadas por comas:", ", ".join(current.tags))
-        tags = [tag.strip() for tag in tag_text.split(",") if tag.strip()]
         if not questionary.confirm("¿Guardar todos los cambios?", default=True).ask():
             warning("Edición cancelada; no se modificó el perfil.")
             return
@@ -1345,7 +1379,6 @@ def profile_edit(
         lambda: profile_manager.update(
             current.name,
             description=description,
-            tags=tags,
             includes=includes,
             targets=targets,
             excludes=excludes,
@@ -1395,22 +1428,24 @@ def profile_list() -> None:
         warning("No hay perfiles definidos.")
         return
     active = execute(profile_manager.activation)
+    table = Table(box=box.SIMPLE_HEAVY, expand=True)
+    table.add_column("Nombre", style="bold #88C0D0")
+    table.add_column("Descripción")
+    table.add_column("Composición", style="concord.muted")
+    table.add_column("Estado", no_wrap=True)
     for profile in available:
-        state = ""
+        state = "—"
         if active and profile.name == active.primary:
-            state = "  [concord.success](principal)[/]"
+            state = "[concord.success]Principal[/]"
         elif active and profile.name in active.complements:
             position = active.complements.index(profile.name) + 1
-            state = f"  [concord.accent](complementario {position})[/]"
-        console.print(f"\n[bold #88C0D0]{profile.name}[/]{state}")
-        if profile.description:
-            console.print(f"[concord.muted]{profile.description}[/]")
-        console.print(profile_tree(profile_manager, profile.name))
-        resolution = execute(lambda profile=profile: profile_manager.resolve(profile.name))
-        console.print(
-            "[concord.muted]Resultado:[/] "
-            + (", ".join(resolution.target_names) if resolution.target_names else "vacío")
+            state = f"[concord.accent]Complemento {position}[/]"
+        composition = (
+            f"{len(profile.includes)} incluidos · {len(profile.targets)} targets · "
+            f"{len(profile.excludes)} exclusiones"
         )
+        table.add_row(profile.name, profile.description or "—", composition, state)
+    console.print(table)
 
 
 @profile_app.command("show")
@@ -1425,7 +1460,6 @@ def profile_show(name: str) -> None:
             ("UUID", profile.id),
             ("Nombre", profile.name),
             ("Descripción", profile.description or "—"),
-            ("Etiquetas", ", ".join(profile.tags) or "—"),
         ],
         title="Perfil",
     )
@@ -1442,14 +1476,16 @@ def profile_show(name: str) -> None:
 @profile_app.command("activate")
 def profile_activate(
     primary: str | None = typer.Option(None, "--primary", help="Perfil principal."),
-    complements: list[str] | None = typer.Option(None, "--with", help="Perfil complementario; puede repetirse."),
+    complements: list[str] | None = typer.Option(None, "--with", help="Complemento; puede repetirse."),
 ) -> None:
-    """Activa un perfil principal y complementarios ordenados."""
+    """Activa un perfil principal y complementos ordenados."""
     heading("ACTIVAR PERFILES", "Seleccionando los targets efectivos de este equipo")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
     if primary is None:
         chosen = execute(lambda: choose_profile_activation(profile_manager))
+        if chosen is None:
+            return
         activation = execute(
             lambda: profile_manager.activate(chosen.primary, chosen.complements)
         )
@@ -1495,7 +1531,13 @@ def profile_suggest(
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
     if primary is None:
-        chosen = execute(lambda: choose_profile_activation(profile_manager))
+        chosen = execute(
+            lambda: choose_profile_activation(
+                profile_manager, confirmation="¿Guardar esta combinación como sugerencia?"
+            )
+        )
+        if chosen is None:
+            return
         activation = execute(lambda: profile_manager.suggest(chosen.primary, chosen.complements))
     else:
         activation = execute(lambda: profile_manager.suggest(primary, complements))

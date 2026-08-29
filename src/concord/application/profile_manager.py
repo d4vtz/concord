@@ -4,7 +4,7 @@ import re
 import uuid
 from dataclasses import dataclass, field, replace
 
-from concord.application.config import (CONCORD_VERSION, Config, ConfigManager,
+from concord.application.config import (CONCORD_TARGET, CONCORD_VERSION, Config, ConfigManager,
                                         ManifestReference, ProfileConfig,
                                         SuggestedActivationConfig)
 from concord.application.database import Database
@@ -15,7 +15,6 @@ class Profile:
     id: str
     name: str
     description: str = ""
-    tags: list[str] = field(default_factory=list)
     includes: list[str] = field(default_factory=list)
     targets: list[str] = field(default_factory=list)
     excludes: list[str] = field(default_factory=list)
@@ -33,6 +32,7 @@ class ProfileResolution:
     target_names: list[str]
     warnings: list[str]
     activation: Activation
+    applied_exclusions: list[str] = field(default_factory=list)
 
 
 class ProfileManager:
@@ -58,14 +58,6 @@ class ProfileManager:
             raise ValueError(f"'{normalized}' es un nombre reservado por Concord.")
         return normalized
 
-    def _normalize_tags(self, tags: list[str] | None) -> list[str]:
-        result = []
-        for tag in tags or []:
-            normalized = tag.strip().lower()
-            if normalized and normalized not in result:
-                result.append(normalized)
-        return result
-
     def _profile_from_row(self, connection, row) -> Profile:
         profile_id = row[0]
 
@@ -84,18 +76,10 @@ class ProfileManager:
                 )
             ]
 
-        tags = [
-            item[0]
-            for item in connection.execute(
-                "SELECT tag FROM profile_tags WHERE profile_id = ? ORDER BY position",
-                (profile_id,),
-            )
-        ]
         return Profile(
             id=profile_id,
             name=row[1],
             description=row[2],
-            tags=tags,
             includes=names("profile_includes", "included_profile_id", "profiles"),
             targets=names("profile_targets", "target_id", "targets"),
             excludes=names("profile_exclusions", "target_id", "targets"),
@@ -139,6 +123,8 @@ class ProfileManager:
         connection.execute(f"DELETE FROM {table} WHERE profile_id = ?", (profile_id,))
         ids = []
         for name in values:
+            if source_table == "targets" and name.strip().lower() == CONCORD_TARGET:
+                raise ValueError("El target interno 'concord' no puede pertenecer a un perfil.")
             item_id = self._id(connection, source_table, name, kind)
             if item_id not in ids:
                 ids.append(item_id)
@@ -157,7 +143,6 @@ class ProfileManager:
         name: str,
         *,
         description: str = "",
-        tags: list[str] | None = None,
     ) -> Profile:
         normalized = self._normalize_name(name)
         profile_id = str(uuid.uuid4())
@@ -171,13 +156,6 @@ class ProfileManager:
                 if "UNIQUE" in str(error):
                     raise ValueError(f"El perfil '{normalized}' ya existe.") from error
                 raise
-            connection.executemany(
-                "INSERT INTO profile_tags VALUES (?, ?, ?)",
-                [
-                    (profile_id, tag, position)
-                    for position, tag in enumerate(self._normalize_tags(tags))
-                ],
-            )
             self._save_manifest(connection)
         return self.get(normalized)
 
@@ -186,7 +164,6 @@ class ProfileManager:
         name: str,
         *,
         description: str | None = None,
-        tags: list[str] | None = None,
         includes: list[str] | None = None,
         targets: list[str] | None = None,
         excludes: list[str] | None = None,
@@ -197,15 +174,6 @@ class ProfileManager:
                 connection.execute(
                     "UPDATE profiles SET description = ? WHERE id = ?",
                     (description.strip(), current.id),
-                )
-            if tags is not None:
-                connection.execute("DELETE FROM profile_tags WHERE profile_id = ?", (current.id,))
-                connection.executemany(
-                    "INSERT INTO profile_tags VALUES (?, ?, ?)",
-                    [
-                        (current.id, tag, position)
-                        for position, tag in enumerate(self._normalize_tags(tags))
-                    ],
                 )
             if includes is not None:
                 self._replace_ordered(
@@ -275,458 +243,15 @@ class ProfileManager:
                     "DELETE FROM profile_suggestion_complements WHERE profile_id = ?",
                     (profile.id,),
                 )
-            connection.execute("DELETE FROM profiles WHERE id = ?", (profile.id,))
-            self._save_manifest(connection)
-
-    def _validate_graph(self, connection) -> None:
-        graph: dict[str, list[str]] = {}
-        for profile_id, included_id in connection.execute(
-            "SELECT profile_id, included_profile_id FROM profile_includes ORDER BY position"
-        ):
-            graph.setdefault(profile_id, []).append(included_id)
-
-        visited: set[str] = set()
-        active: set[str] = set()
-
-        def visit(profile_id: str) -> None:
-            if profile_id in active:
-                name = connection.execute(
-                    "SELECT name FROM profiles WHERE id = ?", (profile_id,)
-                ).fetchone()[0]
-                raise ValueError(f"La composiciÃ³n contiene un ciclo en el perfil '{name}'.")
-            if profile_id in visited:
-                return
-            active.add(profile_id)
-            for included_id in graph.get(profile_id, []):
-                visit(included_id)
-            active.remove(profile_id)
-            visited.add(profile_id)
-
-        for profile_id in [row[0] for row in connection.execute("SELECT id FROM profiles")]:
-            visit(profile_id)
-
-    def validate(self) -> list[str]:
-        with self.database.connect() as connection:
-            self._validate_graph(connection)
-        resolution = self.resolve_active()
-        return resolution.warnings if resolution else []
-
-    def activation(self) -> Activation | None:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                "SELECT primary_profile_id FROM profile_activation WHERE singleton = 1"
-            ).fetchone()
-            if row is None:
-                return None
-            primary = connection.execute(
-                "SELECT name FROM profiles WHERE id = ?", (row[0],)
-            ).fetchone()
-            if primary is None:
-                raise ValueError(
-                    "La activaciÃ³n local referencia un perfil inexistente; corrÃ­jala con "
-                    "concord profile activate o concord profile deactivate --all."
-                )
-            complements = [
-                item
-                for item in connection.execute(
-                    "SELECT profile_id FROM profile_activation_complements ORDER BY position"
-                )
-            ]
-            complement_names = []
-            for (profile_id,) in complements:
-                item = connection.execute(
-                    "SELECT name FROM profiles WHERE id = ?", (profile_id,)
-                ).fetchone()
-                if item is None:
-                    raise ValueError(
-                        "La activaciÃ³n local contiene perfiles complementarios inexistentes; "
-                        "corrÃ­jala con concord profile activate o concord profile deactivate --all."
-                    )
-                complement_names.append(item[0])
-        return Activation(primary[0], complement_names)
-
-    def activate(self, primary: str, complements: list[str] | None = None) -> Activation:
-        complements = complements or []
-        primary_name = primary.strip().lower()
-        ordered = []
-        for name in complements:
-            normalized = name.strip().lower()
-            if normalized in ordered:
-                ordered.remove(normalized)
-            ordered.append(normalized)
-        if primary_name in ordered:
-            raise ValueError("El perfil principal no puede ser tambiÃ©n complementario.")
-        with self.database.connect() as connection:
-            primary_id = self._id(connection, "profiles", primary_name, "un perfil")
-            complement_ids = [
-                self._id(connection, "profiles", name, "un perfil") for name in ordered
-            ]
-            connection.execute("DELETE FROM profile_activation_complements")
-            connection.execute("DELETE FROM profile_activation")
-            connection.execute(
-                "INSERT INTO profile_activation VALUES (1, ?)", (primary_id,)
-            )
-            connection.executemany(
-                "INSERT INTO profile_activation_complements VALUES (?, ?)",
-                [(profile_id, position) for position, profile_id in enumerate(complement_ids)],
-            )
-        return self.activation()  # type: ignore[return-value]
-
-    def deactivate_all(self) -> None:
-        with self.database.connect() as connection:
-            connection.execute("DELETE FROM profile_activation_complements")
-            connection.execute("DELETE FROM profile_activation")
-
-    def deactivate(self, name: str, *, replace_with: str | None = None) -> Activation | None:
-        active = self.activation()
-        if active is None:
-            return None
-        normalized = name.strip().lower()
-        if normalized == active.primary:
-            if replace_with is None:
-                raise ValueError("Indique el nuevo perfil principal con --replace-with o use --all.")
-            replacement = replace_with.strip().lower()
-            complements = [item for item in active.complements if item != replacement]
-            return self.activate(replacement, complements)
-        if normalized not in active.complements:
-            raise ValueError(f"El perfil '{normalized}' no estÃ¡ activo.")
-        return self.activate(active.primary, [item for item in active.complements if item != normalized])
-
-    def _apply_profile(
-        self,
-        connection,
-        profile_id: str,
-        ordered: dict[str, None],
-        protected: set[str],
-        warnings: list[str],
-        stack: list[str],
-    ) -> None:
-        if profile_id in stack:
-            raise ValueError("La composiciÃ³n de perfiles contiene un ciclo.")
-        stack.append(profile_id)
-        profile_name = connection.execute(
-            "SELECT name FROM profiles WHERE id = ?", (profile_id,)
-        ).fetchone()[0]
-        included_ids = [
-            row[0]
-            for row in connection.execute(
-                "SELECT included_profile_id FROM profile_includes WHERE profile_id = ? ORDER BY position",
-                (profile_id,),
-            )
-        ]
-        for included_id in included_ids:
-            self._apply_profile(
-                connection, included_id, ordered, protected, warnings, stack
-            )
-        target_ids = [
-            row[0]
-            for row in connection.execute(
-                "SELECT target_id FROM profile_targets WHERE profile_id = ? ORDER BY position",
-                (profile_id,),
-            )
-        ]
-        for target_id in target_ids:
-            ordered.setdefault(target_id, None)
-        excluded_ids = [
-            row[0]
-            for row in connection.execute(
-                "SELECT target_id FROM profile_exclusions WHERE profile_id = ? ORDER BY position",
-                (profile_id,),
-            )
-        ]
-        for target_id in excluded_ids:
-            target_name = connection.execute(
-                "SELECT name FROM targets WHERE id = ?", (target_id,)
-            ).fetchone()[0]
-            if target_id in protected:
-                warnings.append(
-                    f"'{profile_name}' no puede excluir el target protegido '{target_name}'."
-                )
-            elif target_id in ordered:
-                del ordered[target_id]
-            else:
-                warnings.append(
-                    f"La exclusiÃ³n de '{target_name}' en '{profile_name}' no tuvo coincidencia."
-                )
-        stack.pop()
-
-    def resolve_active(self) -> ProfileResolution | None:
-        activation = self.activation()
-        if activation is None:
-            return None
-        with self.database.connect() as connection:
-            primary_id = self._id(connection, "profiles", activation.primary, "un perfil")
-            ordered: dict[str, None] = {}
-            warnings: list[str] = []
-            self._apply_profile(connection, primary_id, ordered, set(), warnings, [])
-            protected = set(ordered)
-            for complement in activation.complements:
-                complement_id = self._id(connection, "profiles", complement, "un perfil")
-                self._apply_profile(
-                    connection, complement_id, ordered, protected, warnings, []
-                )
-            names = []
-            for target_id in ordered:
-                row = connection.execute(
-                    "SELECT name FROM targets WHERE id = ?", (target_id,)
-                ).fetchone()
-                if row is None:
-                    raise ValueError(f"La activaciÃ³n referencia un target inexistente: {target_id}.")
-                names.append(row[0])
-        return ProfileResolution(list(ordered), names, warnings, activation)
-
-    def resolve(self, name: str) -> ProfileResolution:
-        profile = self.get(name)
-        with self.database.connect() as connection:
-            ordered: dict[str, None] = {}
-            warnings: list[str] = []
-            self._apply_profile(connection, profile.id, ordered, set(), warnings, [])
-            names = [
-                connection.execute("SELECT name FROM targets WHERE id = ?", (target_id,)).fetchone()[0]
-                for target_id in ordered
-            ]
-        return ProfileResolution(
-            list(ordered), names, warnings, Activation(profile.name, [])
-        )
-
-    def suggest(self, primary: str, complements: list[str] | None = None) -> Activation:
-        complements = complements or []
-        primary_name = primary.strip().lower()
-        ordered = []
-        for name in complements:
-            normalized = name.strip().lower()
-            if normalized in ordered:
-                ordered.remove(normalized)
-            ordered.append(normalized)
-        if primary_name in ordered:
-            raise ValueError("El perfil principal no puede ser tambiÃ©n complementario.")
-        with self.database.connect() as connection:
-            primary_id = self._id(connection, "profiles", primary_name, "un perfil")
-            ids = [self._id(connection, "profiles", name, "un perfil") for name in ordered]
-            connection.execute("DELETE FROM profile_suggestion_complements")
-            connection.execute("DELETE FROM profile_suggestion")
-            connection.execute("INSERT INTO profile_suggestion VALUES (1, ?)", (primary_id,))
-            connection.executemany(
-                "INSERT INTO profile_suggestion_complements VALUES (?, ?)",
-                [(profile_id, position) for position, profile_id in enumerate(ids)],
-            )
-            self._save_manifest(connection)
-        return Activation(primary_name, ordered)
-
-    def suggestion(self) -> Activation | None:
-        with self.database.connect() as connection:
-            row = connection.execute(
-                """
-                SELECT profiles.name FROM profile_suggestion
-                JOIN profiles ON profiles.id = profile_suggestion.primary_profile_id
-                WHERE singleton = 1
-                """
-            ).fetchone()
-            if row is None:
-                return None
-            complements = [
-                item[0]
-                for item in connection.execute(
-                    """
-                    SELECT profiles.name FROM profile_suggestion_complements
-                    JOIN profiles ON profiles.id = profile_suggestion_complements.profile_id
-                    ORDER BY position
-                    """
-                )
-            ]
-        return Activation(row[0], complements)
-
-    def suggestion_fingerprint(self) -> str | None:
-        suggestion = self.suggestion()
-        if suggestion is None:
-            return None
-        value = json.dumps([suggestion.primary, suggestion.complements])
-        return hashlib.sha256(value.encode()).hexdigest()
-
-    def should_offer_suggestion(self) -> bool:
-        if self.activation() is not None:
-            return False
-        fingerprint = self.suggestion_fingerprint()
-        if fingerprint is None:
-            return False
-        with self.database.connect() as connection:
-            row = connection.execute(
-                "SELECT value FROM local_settings WHERE key = 'declined_profile_suggestion'"
-            ).fetchone()
-        return row is None or row[0] != fingerprint
-
-    def decline_suggestion(self) -> None:
-        fingerprint = self.suggestion_fingerprint()
-        if fingerprint is None:
-            return
-        with self.database.connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO local_settings (key, value) VALUES ('declined_profile_suggestion', ?)
-                ON CONFLICT(key) DO UPDATE SET value = excluded.value
-                """,
-                (fingerprint,),
-            )
-
-    def apply_to_config(self, config: Config, *, connection=None) -> None:
-        owns_connection = connection is None
-        if owns_connection:
-            connection = self.database.connect()
-        try:
-            target_ids = {
-                name: target_id
-                for target_id, name in connection.execute("SELECT id, name FROM targets")
-            }
-            config.targets = [
-                replace(target, id=target_ids.get(target.name, target.id))
-                for target in config.targets
-            ]
-            profile_rows = connection.execute(
-                "SELECT id, name, description FROM profiles ORDER BY name"
-            ).fetchall()
-
-            def references(table: str, column: str, joined: str, profile_id: str):
-                return [
-                    ManifestReference(item[0], item[1])
-                    for item in connection.execute(
-                        f"""
-                        SELECT {joined}.id, {joined}.name FROM {table}
-                        JOIN {joined} ON {joined}.id = {table}.{column}
-                        WHERE {table}.profile_id = ? ORDER BY {table}.position
-                        """,
-                        (profile_id,),
-                    )
-                ]
-
-            config.profiles = []
-            for profile_id, name, description in profile_rows:
-                tags = [
-                    item[0]
-                    for item in connection.execute(
-                        "SELECT tag FROM profile_tags WHERE profile_id = ? ORDER BY position",
-                        (profile_id,),
-                    )
-                ]
-                config.profiles.append(
-                    ProfileConfig(
-                        id=profile_id,
-                        name=name,
-                        description=description,
-                        tags=tags,
-                        includes=references(
-                            "profile_includes", "included_profile_id", "profiles", profile_id
-                        ),
-                        targets=references(
-                            "profile_targets", "target_id", "targets", profile_id
-                        ),
-                        excludes=references(
-                            "profile_exclusions", "target_id", "targets", profile_id
-                        ),
-                    )
-                )
-            suggestion = self._suggestion_from_connection(connection)
-            config.suggested_activation = suggestion
-            config.minimum_concord_version = CONCORD_VERSION if config.profiles else None
-        finally:
-            if owns_connection:
-                connection.close()
-
-    def matches_config(self, config: Config) -> bool:
-        local = Config(repository_path=config.repository_path)
-        self.apply_to_config(local)
-        return (
-            local.profiles == config.profiles
-            and local.suggested_activation == config.suggested_activation
-        )
-
-    def _suggestion_from_connection(self, connection) -> SuggestedActivationConfig | None:
-        row = connection.execute(
-            """
-            SELECT profiles.id, profiles.name FROM profile_suggestion
-            JOIN profiles ON profiles.id = profile_suggestion.primary_profile_id
-            WHERE singleton = 1
-            """
-        ).fetchone()
-        if row is None:
-            return None
-        complements = [
-            ManifestReference(item[0], item[1])
-            for item in connection.execute(
-                """
-                SELECT profiles.id, profiles.name FROM profile_suggestion_complements
-                JOIN profiles ON profiles.id = profile_suggestion_complements.profile_id
-                ORDER BY position
-                """
-            )
-        ]
-        return SuggestedActivationConfig(ManifestReference(row[0], row[1]), complements)
-
-    def import_config(self, config: Config, *, connection=None) -> None:
-        owns_connection = connection is None
-        if owns_connection:
-            connection = self.database.connect()
-        try:
-            connection.execute("DELETE FROM profiles")
-            target_ids = {row[0] for row in connection.execute("SELECT id FROM targets")}
-            for profile in config.profiles:
-                connection.execute(
-                    "INSERT INTO profiles VALUES (?, ?, ?)",
-                    (profile.id, self._normalize_name(profile.name), profile.description),
-                )
-            profile_ids = {row[0] for row in connection.execute("SELECT id FROM profiles")}
-            for profile in config.profiles:
-                if any(reference.id not in profile_ids for reference in profile.includes):
-                    raise ValueError(f"El perfil '{profile.name}' incluye una referencia inexistente.")
-                if any(
-                    reference.id not in target_ids
-                    for reference in [*profile.targets, *profile.excludes]
-                ):
-                    raise ValueError(f"El perfil '{profile.name}' referencia un target inexistente.")
-                connection.executemany(
-                    "INSERT INTO profile_tags VALUES (?, ?, ?)",
-                    [
-                        (profile.id, tag, position)
-                        for position, tag in enumerate(self._normalize_tags(profile.tags))
-                    ],
-                )
-                connection.executemany(
-                    "INSERT INTO profile_includes VALUES (?, ?, ?)",
-                    [
-                        (profile.id, reference.id, position)
-                        for position, reference in enumerate(profile.includes)
-                    ],
-                )
-                connection.executemany(
-                    "INSERT INTO profile_targets VALUES (?, ?, ?)",
-                    [
-                        (profile.id, reference.id, position)
-                        for position, reference in enumerate(profile.targets)
-                    ],
-                )
-                connection.executemany(
-                    "INSERT INTO profile_exclusions VALUES (?, ?, ?)",
-                    [
-                        (profile.id, reference.id, position)
-                        for position, reference in enumerate(profile.excludes)
-                    ],
-                )
-            connection.execute("DELETE FROM profile_suggestion_complements")
-            connection.execute("DELETE FROM profile_suggestion")
-            if config.suggested_activation:
-                primary_id = config.suggested_activation.primary.id
-                if primary_id not in profile_ids:
-                    raise ValueError("La activaciÃ³n sugerida referencia un perfil inexistente.")
-                connection.execute("INSERT INTO profile_suggestion VALUES (1, ?)", (primary_id,))
-                connection.executemany(
-                    "INSERT INTO profile_suggestion_complements VALUES (?, ?)",
-                    [
-                        (reference.id, position)
-                        for position, reference in enumerate(
-                            config.suggested_activation.complements
-                        )
-                    ],
-                )
-            self._validate_graph(connection)
-        finally:
-            if owns_connection:
-                connection.close()
+            connection.execute("DELETE FROM profiles WHERE id = ?", (profu×Ý6¶‰žËkºwµçt°Ñ•áÐõQÉÕ”°…ÁÑÕÉ•}½ÕÑÁÕÐõQÉÕ”°¡•¬õ…±Í”(€€€€€€€€€€€€¤¥˜Í¡ÕÑ¥°¹Ý¡¥  ‰¥Ðˆ¤•±Í”9½¹”(€€€€€€€€€€€•µ…¥±}É•ÍÕ±Ð€ôÍÕ‰ÁÉ½•ÍÌ¹ÉÕ¸ (€€€€€€€€€€€€€€€l‰¥Ðˆ°€‰½¹™¥œˆ°€ˆ´µ±½‰…°ˆ°€‰ÕÍ•È¹•µ…¥°‰t°Ñ•áÐõQÉÕ”°…ÁÑÕÉ•}½ÕÑÁÕÐõQÉÕ”°¡•¬õ…±Í”(€€€€€€€€€€€€¤¥˜Í¡ÕÑ¥°¹Ý¡¥  ‰¥Ðˆ¤•±Í”9½¹”(€€€€€€€€€€€¥Ñ}¹…µ”€ô¹…µ•}É•ÍÕ±Ð¹ÍÑ‘½ÕÐ¹ÍÑÉ¥À ¤¥˜¹…µ•}É•ÍÕ±Ð…¹¹…µ•}É•ÍÕ±Ð¹É•ÑÕÉ¹½‘”€ôô€À•±Í”€ˆˆ(€€€€€€€€€€€¥Ñ}•µ…¥°€ô•µ…¥±}É•ÍÕ±Ð¹ÍÑ‘½ÕÐ¹ÍÑÉ¥À ¤¥˜•µ…¥±}É•ÍÕ±Ð…¹•µ…¥±}É•ÍÕ±Ð¹É•ÑÕÉ¹½‘”€ôô€À•±Í”€ˆˆ(€€€€€€€€€€€¥˜¹½Ð¥Ñ}¹…µ”è(€€€€€€€€€€€€€€€¥Ñ}¹…µ”€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰9½µ‰É”Á…É„±½Ì½µµ¥ÑÌèˆ¤(€€€€€€€€€€€¥˜¹½Ð¥Ñ}•µ…¥°è(€€€€€€€€€€€€€€€¥Ñ}•µ…¥°€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰½ÉÉ•¼Á…É„±½Ì½µµ¥ÑÌèˆ¤(€€€€€€€€€€€¥‘•¹Ñ¥Ñä€ô€¡¥Ñ}¹…µ”°¥Ñ}•µ…¥°¤(€€€€€€€€€€€¥˜…ÕÑ½}½µµ¥Ðè(€€€€€€€€€€€€€€€½µµ¥Ñ}µ•ÍÍ…”€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰5•¹Í…©”‘•°½µµ¥Ð¥¹¥¥…°èˆ°½µµ¥Ñ}µ•ÍÍ…”¤(€€€€€€€€€€€É•…Ñ•}É•µ½Ñ”€ô‰½½° (€€€€€€€€€€€€€€€ÅÕ•ÍÑ¥½¹…Éä¹½¹™¥É´ ‹
+ýÉ•…È…¡½É„•°É•Á½Í¥Ñ½É¥¼É•µ½Ñ¼•¸¥Ñ!Õˆüˆ°‘•™…Õ±ÐõQÉÕ”¤¹…Í¬ ¤(€€€€€€€€€€€€¤(€€€€€€€€€€€¥˜É•…Ñ•}É•µ½Ñ”è(€€€€€€€€€€€€€€€¥Ñ¡Õ‰}¹…µ”€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰9½µ‰É”‘•°É•Á½Í¥Ñ½É¥¼‘”¥Ñ!Õˆèˆ°€‰‘½Ñ™¥±•Ìˆ¤(€€€€€€€€€€€€€€€Ù¥Í¥‰¥±¥Ñä€ôÅÕ•ÍÑ¥½¹…Éä¹Í•±•Ð (€€€€€€€€€€€€€€€€€€€€‰Y¥Í¥‰¥±¥‘…‘•°É•Á½Í¥Ñ½É¥¼èˆ°¡½¥•Ìõl‰AÉ¥Ù…‘¼ˆ°€‰Cé‰±¥¼‰t°‘•™…Õ±Ðô‰AÉ¥Ù…‘¼ˆ(€€€€€€€€€€€€€€€€¤¹…Í¬ ¤(€€€€€€€€€€€€€€€¥˜Ù¥Í¥‰¥±¥Ñä¥Ì9½¹”è(€€€€€€€€€€€€€€€€€€€É…¥Í”-•å‰½…É‘%¹Ñ•ÉÉÕÁÐ(€€€€€€€€€€€€€€€¥Ñ¡Õ‰}ÁÉ¥Ù…Ñ”€ôÙ¥Í¥‰¥±¥Ñä€ôô€‰AÉ¥Ù…‘¼ˆ((€€€É•ÅÕ•ÍÑ•‘}¥Ð€ô¥Ñ}½¹™¥œ¹•¹…‰±•(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è%¹¥Ñ¥…±¥é•È ¤¹¥¹¥Ñ¥…±¥é” (€€€€€€€€€€€É•Á½Í¥Ñ½Éä°(€€€€€€€€€€€¥Ñ}½¹™¥œõ¥Ñ}½¹™¥œ°(€€€€€€€€€€€¥Ñ}¥‘•¹Ñ¥Ñäõ¥‘•¹Ñ¥Ñä°(€€€€€€€€€€€½µµ¥Ñ}µ•ÍÍ…”õ½µµ¥Ñ}µ•ÍÍ…”°(€€€€€€€€¤(€€€€¤(€€€½¹™¥œ€ô½¹™¥5…¹…•È ¤¹±½… ¤(€€€¥Ð€ô¥Ñ5…¹…•È¡½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ ¤(€€€¥˜É•ÅÕ•ÍÑ•‘}¥Ð…¹¹½Ð½¹™¥œ¹¥Ð¹•¹…‰±•è(€€€€€€€Ý…É¹¥¹œ ‰¥Ð¹¼•ÍÓ„¥¹ÍÑ…±…‘¼ì½¹½É½¹Ñ¥¹Õ…Ë„…‘µ¥¹¥ÍÑÉ…¹‘¼…É¡¥Ù½ÌÍ¥¸½µµ¥ÑÌ¸ˆ¤(€€€¥˜½¹™¥œ¹¥Ð¹•¹…‰±•è(€€€€€€€¥˜¹½Ð…±°¡¥Ð¹¥‘•¹Ñ¥Ñä ¤¤è(€€€€€€€€€€€Ý…É¹¥¹œ ‰¥Ð¹¼Ñ¥•¹”¥‘•¹Ñ¥‘…ì±½Ì…µ‰¥½Ì¥¹¥¥…±•ÌÅÕ•‘…É½¸Í¥¸½µµ¥Ð¸ˆ¤(€€€€€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð ˆ€m½¹½É¹µÕÑ•‘u½¹™¥ŸéÉ…±„½¸½¹½ÉÉ•Á¼¥¹¥Ð¹l½tˆ¤(€€€€€€€¥˜É•…Ñ•}É•µ½Ñ”è(€€€€€€€€€€€ÑÉäè(€€€€€€€€€€€€€€€ÕÉ°€ô¥Ð¹É•…Ñ•}¥Ñ¡Õ‰}É•Á½Í¥Ñ½Éä¡¥Ñ¡Õ‰}¹…µ”°ÁÉ¥Ù…Ñ”õ¥Ñ¡Õ‰}ÁÉ¥Ù…Ñ”¤(€€€€€€€€€€€€€€€ÍÕ•ÍÌ¡˜‰I•Á½Í¥Ñ½É¥¼É•µ½Ñ¼É•…‘¼èíÕÉ±ôˆ¤(€€€€€€€€€€€•á•ÁÐ€¡¥±•9½Ñ½Õ¹‘ÉÉ½È°Y…±Õ•ÉÉ½È¤…Ì•ÉÉ½Èè(€€€€€€€€€€€€€€€Ý…É¹¥¹œ¡ÍÑÈ¡•ÉÉ½È¤¤(€€€€€€€€€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð ˆ€m½¹½É¹µÕÑ•‘u1„¥¹ÍÑ…±…§Í¸±½…°•ÍÓ„½µÁ±•Ñ„ì½¹•Ñ„‘•ÍÁ×¥Ì½¸½¹½ÉÉ•Á¼¥¹¥Ð¹l½tˆ¤(€€€€€€€¥˜½¹™¥œ¹¥Ð¹…ÕÑ½}ÁÕÍ …¹¥Ð¹¡…Í}É•µ½Ñ”¡½¹™¥œ¹¥Ð¹É•µ½Ñ”¤è(€€€€€€€€€€€ÑÉäè(€€€€€€€€€€€€€€€ÁÕÍ¡}Ý¥Ñ¡}Í•É•Ñ}¡•¬¡¥Ð°½¹™¥œ¹¥Ð¹É•µ½Ñ”¤(€€€€€€€€€€€•á•ÁÐ€¡¥±•9½Ñ½Õ¹‘ÉÉ½È°Y…±Õ•ÉÉ½È¤…Ì•ÉÉ½Èè(€€€€€€€€€€€€€€€Ý…É¹¥¹œ¡ÍÑÈ¡•ÉÉ½È¤¤(€€€€€€€€€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð ˆ€m½¹½É¹µÕÑ•‘u°½µµ¥Ð±½…°Í”½¹Í•ÉÛÌ¸I•¥¹Ñ•¹Ñ„½¸è½¹½ÉÉ•Á¼ÁÕÍ¡l½tˆ¤(€€€€€€€•±¥˜½¹™¥œ¹¥Ð¹…ÕÑ½}ÁÕÍ è(€€€€€€€€€€€Ý…É¹¥¹œ ‰…ÕÑ½}ÁÕÍ •ÍÓ„…Ñ¥Ù¼°Á•É¼Ñ½‘…Ûµ„¹¼•á¥ÍÑ”Õ¸É•µ½Ñ¼½¹™¥ÕÉ…‘¼¸ˆ¤(€€€€€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð ˆ€m½¹½É¹µÕÑ•‘u½»¥Ñ…±¼½¸è½¹½ÉÉ•Á¼É•µ½Ñ”Í•Ð€ñUI0ùl½tˆ¤(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰½¹™¥ÕÉ…§Í¸ˆ°ÍÑÈ¡½¹½É¹½¹™¥}™¥±”¤¤°(€€€€€€€€€€€€ ‰	…Í”‘”‘…Ñ½Ìˆ°ÍÑÈ¡½¹½É¹‘…Ñ…‰…Í•}™¥±”¤¤°(€€€€€€€€€€€€ ‰I•Á½Í¥Ñ½É¥¼ˆ°ÍÑÈ¡½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ ¤¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰IÕÑ…Ì…Ñ¥Ù…Ìˆ°(€€€€¤(€€€ÍÕ•ÍÌ ‰½¹½É•ÍÓ„±¥ÍÑ¼Á…É„ÕÍ…ÉÍ”¸ˆ°¡¥¹Ðô‰É•„ÑÔÁÉ¥µ•ÈÑ…É•Ð½¸è½¹½É…‘€ñÉÕÑ„øˆ¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜…‘ (€€€Á…Ñ èA…Ñ °(€€€¹…µ”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µ¹…µ”ˆ°€ˆµ¸ˆ°¡•±Àô‰9½µ‰É”ƒé¹¥¼‘•°Ñ…É•Ð¸ˆ¤°(€€€ÁÉ½™¥±”è±¥ÍÑmÍÑÉtð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸ (€€€€€€€9½¹”°€ˆ´µÁÉ½™¥±”ˆ°¡•±Àô‰A•É™¥°…°ÅÕ”Í”…Í¥¹…Ë„ìÁÕ•‘”É•Á•Ñ¥ÉÍ”¸ˆ(€€€€¤°(€€€µ•ÍÍ…”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µµ•ÍÍ…”ˆ°€ˆµ´ˆ°¡•±Àô‰5•¹Í…©”‘•°½µµ¥Ð¸ˆ¤°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ°¡•±Àô‰•ÁÑ„•°µ•¹Í…©”ÁÉ•‘•Ñ•Éµ¥¹…‘¼¸ˆ¤°(€€€¹½}½µµ¥Ðè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ¹¼µ½µµ¥Ðˆ°¡•±Àô‰9¼É•„•°½µµ¥Ð…ÕÑ½·…Ñ¥¼¸ˆ¤°(€€€ÁÕÍ è‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÕÍ ¼´µ¹¼µÁÕÍ ˆ°¡•±Àô‰M½‰É•ÍÉ¥‰”…ÕÑ½}ÁÕÍ Á…É„•ÍÑ„½Á•É…§Í¸¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰I•¥ÍÑÉ„Õ¸…É¡¥Ù¼¼‘¥É•Ñ½É¥¼äÉ•„ÍÔÁÉ¥µ•É„½Á¥„¸ˆˆˆ(€€€¡•…‘¥¹œ ‰9UY<QIPˆ°€‰I•¥ÍÑÉ…¹‘¼Õ¹„½¹™¥ÕÉ…§Í¸•¸½¹½Éˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€Í•±•Ñ•‘}ÁÉ½™¥±•Ì€ô±¥ÍÐ¡ÁÉ½™¥±”½Èmt¤(€€€…Ñ¥Ù”€ô•á•ÕÑ”¡ÁÉ½™¥±•}µ…¹…•È¹…Ñ¥Ù…Ñ¥½¸¤(€€€¥˜¹½ÐÍ•±•Ñ•‘}ÁÉ½™¥±•Ì…¹…Ñ¥Ù”…¹ÍåÌ¹ÍÑ‘¥¸¹¥Í…ÑÑä ¤è(€€€€€€€¡½¥•Ì€ôm…Ñ¥Ù”¹ÁÉ¥µ…Éä°€©…Ñ¥Ù”¹½µÁ±•µ•¹ÑÍt(€€€€€€€Í•±•Ñ•‘}ÁÉ½™¥±•Ì€ôÉ•ÅÕ•ÍÑ}¡•­‰½à (€€€€€€€€€€€€‹
+ýÅ×¤Á•É™¥±•Ì…Ñ¥Ù½Ì‘•Í•…Ì…É•…È•°Ñ…É•Ðüˆ°¡½¥•Ì(€€€€€€€€¤(€€€Í•±•Ñ•‘}ÁÉ½™¥±•}µ½‘•±Ì€ôl(€€€€€€€•á•ÕÑ”¡±…µ‰‘„ÁÉ½™¥±•}¹…µ”õÁÉ½™¥±•}¹…µ”èÁÉ½™¥±•}µ…¹…•È¹•Ð¡ÁÉ½™¥±•}¹…µ”¤¤(€€€€€€€™½ÈÁÉ½™¥±•}¹…µ”¥¸Í•±•Ñ•‘}ÁÉ½™¥±•Ì(€€€t(€€€Ñ…É•Ð€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹…‘¡Á…Ñ °¹…µ”õ¹…µ”¤°(€€€€€€€¡¥¹Ðô‰UÍ„Õ¹„ÉÕÑ„•á¥ÍÑ•¹Ñ”‘•¹ÑÉ¼‘”!=5äÕ¸¹½µ‰É”ÅÕ”¹¼•ÍÓ¤É•¥ÍÑÉ…‘¼¸ˆ°(€€€€¤(€€€™½ÈÕÉÉ•¹Ð¥¸Í•±•Ñ•‘}ÁÉ½™¥±•}µ½‘•±Ìè(€€€€€€€•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„ÕÉÉ•¹ÐõÕÉÉ•¹ÐèÁÉ½™¥±•}µ…¹…•È¹ÕÁ‘…Ñ” (€€€€€€€€€€€€€€€ÕÉÉ•¹Ð¹¹…µ”°Ñ…É•ÑÌõl©ÕÉÉ•¹Ð¹Ñ…É•ÑÌ°Ñ…É•Ð¹¹…µ•t(€€€€€€€€€€€€¤(€€€€€€€€¤(€€€¥˜Í•±•Ñ•‘}ÁÉ½™¥±•Ìè(€€€€€€€•á•ÕÑ”¡±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹Íå¹Œ¡=9=I}QIP¤¤(€€€Ñ…É•Ñ}Á…Ñ €ôÑ…É•Ð¹Á…Ñ¡ÍlÁt(€€€‘•ÍÑ¥¹…Ñ¥½¸€ôÑ…É•Ñ}µ…¹…•È¹É•Á½Í¥Ñ½Éä¹Ñ…É•Ñ}Á…Ñ ¡Ñ…É•Ð¹¹…µ”¤€¼Ñ…É•Ñ}Á…Ñ ¹É•±…Ñ¥Ù•}Á…Ñ (€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰9½µ‰É”ˆ°Ñ…É•Ð¹¹…µ”¤°(€€€€€€€€€€€€ ‰Q¥Á¼ˆ°€‰‘¥É•Ñ½É¥¼ˆ¥˜Ñ…É•Ñ}Á…Ñ ¹ÑåÁ”¹Ù…±Õ”€ôô€‰‘¥É•Ñ½Éäˆ•±Í”€‰…É¡¥Ù¼ˆ¤°(€€€€€€€€€€€€ ‰=É¥•¸ˆ°ÍÑÈ¡Ñ…É•Ñ}Á…Ñ ¹±½…±}Á…Ñ ¤¤°(€€€€€€€€€€€€ ‰½Á¥„ˆ°ÍÑÈ¡‘•ÍÑ¥¹…Ñ¥½¸¤¤°(€€€€€€€€€€€€ ‰É¡¥Ù½Ìˆ°ÍÑÈ¡±•¸¡Ñ…É•Ð¹•Ñ}™¥±•Ì ¤¤¤¤°(€€€€€€€€€€€€ ‰É•…‘¼ˆ°™½Éµ…Ñ}‘…Ñ”¡Ñ…É•Ð¹É•…Ñ•‘}…Ð¤¤°(€€€€€€€€€€€€ ‰ÑÕ…±¥é…‘¼ˆ°™½Éµ…Ñ}‘…Ñ”¡Ñ…É•Ð¹ÕÁ‘…Ñ•‘}…Ð¤¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰Q…É•ÐÉ•¥ÍÑÉ…‘¼ˆ°(€€€€¤(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è™¥¹…±¥é•}¥Ð (€€€€€€€€€€€¥Ñ}Á…Ñ¡Ì¡Ñ…É•Ð¹¹…µ”¤°(€€€€€€€€€€€˜‰½¹½Éè…‘íÑ…É•Ð¹¹…µ•ôˆ°(€€€€€€€€€€€¥Ñ}½µµ…¹‘}½ÁÑ¥½¹Ì¡µ•ÍÍ…”°å•Ì°¹½}½µµ¥Ð°ÁÕÍ ¤°(€€€€€€€€¤°(€€€€€€€¡¥¹Ðô‰1½Ì…É¡¥Ù½ÌÍ”½¹Í•ÉÙ…É½¸¸I•Ù¥Í„¥Ð½¸è½¹½ÉÉ•Á¼ÍÑ…ÑÕÌˆ°(€€€€¤(€€€ÍÕ•ÍÌ¡˜ˆíÑ…É•Ð¹¹…µ•ôœ™Õ”…É•…‘¼½ÉÉ•Ñ…µ•¹Ñ”¸ˆ°¡¥¹Ðõ˜‰½µÁÉÕ•‰„ÍÔ•ÍÑ…‘¼½¸è½¹½ÉÍÑ…ÑÕÌˆ¤(()…ÁÀ¹½µµ…¹ ‰…‘µÁ…Ñ ˆ¤)‘•˜…‘‘}Á…Ñ  (€€€¹…µ”èÍÑÈ€ôÑåÁ•È¹ÉÕµ•¹Ð ¸¸¸°…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}Ñ…É•ÑÌ¤°(€€€Á…Ñ èA…Ñ €ôÑåÁ•È¹ÉÕµ•¹Ð ¸¸¸°¡•±Àô‰9Õ•Ù„ÉÕÑ„±½…°‘•°Ñ…É•Ð¸ˆ¤°(€€€µ•ÍÍ…”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µµ•ÍÍ…”ˆ°€ˆµ´ˆ¤°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ¤°(€€€¹½}½µµ¥Ðè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ¹¼µ½µµ¥Ðˆ¤°(€€€ÁÕÍ è‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÕÍ ¼´µ¹¼µÁÕÍ ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰É•„Õ¹„ÉÕÑ„„Õ¸Ñ…É•Ð•á¥ÍÑ•¹Ñ”¸ˆˆˆ(€€€¡•…‘¥¹œ ‰IHIUQˆ°€‰µÁ±¥…¹‘¼Õ¹„½¹™¥ÕÉ…§Í¸•á¥ÍÑ•¹Ñ”ˆ¤(€€€Ñ…É•Ð€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èµ…¹…•È ¤¹…‘‘}Á…Ñ ¡¹…µ”°Á…Ñ ¤°(€€€€€€€¡¥¹Ðô‰1„ÉÕÑ„‘•‰”•á¥ÍÑ¥È°•ÍÑ…È‘•¹ÑÉ¼‘”!=5ä¹¼Í½±…Á…ÉÍ”½¸½ÑÉ„¸ˆ°(€€€€¤(€€€…‘‘•€ô•á•ÕÑ”¡±…µ‰‘„èÉ•±…Ñ¥Ù•}Ñ½}¡½µ”¡Á…Ñ ¤¤¹…Í}Á½Í¥à ¤(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è™¥¹…±¥é•}¥Ð (€€€€€€€€€€€¥Ñ}Á…Ñ¡Ì¡¹…µ”¤°(€€€€€€€€€€€˜‰í¹…µ•ôè…‘í…‘‘•‘ôˆ°(€€€€€€€€€€€¥Ñ}½µµ…¹‘}½ÁÑ¥½¹Ì¡µ•ÍÍ…”°å•Ì°¹½}½µµ¥Ð°ÁÕÍ ¤°(€€€€€€€€¤(€€€€¤(€€€ÍÕ•ÍÌ¡˜‰M”…É•ŸÌ€í…‘‘•‘ôœ„€í¹…µ•ôœ¸ˆ°¡¥¹Ðõ˜‰°Ñ…É•Ð½¹Ñ¥•¹”í±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¥ôÉÕÑ…Ì¸ˆ¤(()…ÁÀ¹½µµ…¹ ‰É•µ½Ù”µÁ…Ñ ˆ¤)‘•˜É•µ½Ù•}Á…Ñ  (€€€¹…µ”èÍÑÈ€ôÑåÁ•È¹ÉÕµ•¹Ð ¸¸¸°…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}É•µ½Ù…‰±•}Ñ…É•ÑÌ¤°(€€€Á…Ñ èA…Ñ €ôÑåÁ•È¹ÉÕµ•¹Ð (€€€€€€€€¸¸¸°(€€€€€€€¡•±Àô‰IÕÑ„É•¥ÍÑÉ…‘„ÅÕ”‘•©…Ë„‘”…‘µ¥¹¥ÍÑÉ…ÉÍ”¸ˆ°(€€€€€€€…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}Ñ…É•Ñ}Á…Ñ¡Ì°(€€€€¤°(€€€µ•ÍÍ…”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µµ•ÍÍ…”ˆ°€ˆµ´ˆ¤°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ¤°(€€€¹½}½µµ¥Ðè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ¹¼µ½µµ¥Ðˆ¤°(€€€ÁÕÍ è‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÕÍ ¼´µ¹¼µÁÕÍ ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰I•Ñ¥É„Õ¹„ÉÕÑ„‘”Õ¸Ñ…É•ÐÍ¥¸‰½ÉÉ…É±„‘”!=5¸ˆˆˆ(€€€¡•…‘¥¹œ ‰IQ%IHIUQˆ°€‰•©…¹‘¼‘”…‘µ¥¹¥ÍÑÉ…ÈÕ¹„Á…ÉÑ”‘•°Ñ…É•Ðˆ¤(€€€É•±…Ñ¥Ù”€ô•á•ÕÑ”¡±…µ‰‘„èÉ•±…Ñ¥Ù•}Ñ½}¡½µ”¡Á…Ñ ¤¤¹…Í}Á½Í¥à ¤(€€€Ñ…É•Ð€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èµ…¹…•È ¤¹É•µ½Ù•}Á…Ñ ¡¹…µ”°Á…Ñ ¤°(€€€€€€€¡¥¹Ðõ˜‰M¤•Ì±„ƒé¹¥„ÉÕÑ„°•±¥µ¥¹„•°Ñ…É•Ð½µÁ±•Ñ¼½¸è½¹½ÉÉ•µ½Ù”í¹…µ•ôˆ°(€€€€¤(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è™¥¹…±¥é•}¥Ð (€€€€€€€€€€€¥Ñ}Á…Ñ¡Ì¡¹…µ”¤°(€€€€€€€€€€€˜‰í¹…µ•ôèÉ•µ½Ù”íÉ•±…Ñ¥Ù•ôˆ°(€€€€€€€€€€€¥Ñ}½µµ…¹‘}½ÁÑ¥½¹Ì¡µ•ÍÍ…”°å•Ì°¹½}½µµ¥Ð°ÁÕÍ ¤°(€€€€€€€€¤(€€€€¤(€€€ÍÕ•ÍÌ (€€€€€€€˜ˆíÉ•±…Ñ¥Ù•ôœÁ•Éµ…¹•”•¸!=5°Á•É¼å„¹¼Á•ÉÑ•¹•”„€í¹…µ•ôœ¸ˆ°(€€€€€€€¡¥¹Ðõ˜‰°Ñ…É•Ð½¹Í•ÉÙ„í±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¥ôÉÕÑ…Ì¸ˆ°(€€€€¤(()…ÁÀ¹½µµ…¹ ‰±¥ÍÐˆ¤)‘•˜±¥ÍÑ}Ñ…É•ÑÌ (€€€…±±}Ñ…É•ÑÌè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ…±°ˆ°¡•±Àô‰5Õ•ÍÑÉ„Ñ…µ‰§¥¸Ñ…É•ÑÌ™Õ•É„‘”±½ÌÁ•É™¥±•Ì…Ñ¥Ù½Ì¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„±½ÌÑ…É•ÑÌÉ•¥ÍÑÉ…‘½ÌäÍÕÌÉÕÑ…Ì¸ˆˆˆ(€€€¡•…‘¥¹œ ‰QIQLˆ°€‰½¹™¥ÕÉ…¥½¹•Ì…‘µ¥¹¥ÍÑÉ…‘…ÌÁ½È½¹½Éˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€¥˜ÁÉ½™¥±•}µ…¹…•È¹…Ñ¥Ù…Ñ¥½¸ ¤¥Ì¹½Ð9½¹”è(€€€€€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€Ñ…É•ÑÌ€ôÑ…É•Ñ}µ…¹…•È¹±¥ÍÐ ¤¥˜…±±}Ñ…É•ÑÌ•±Í”Ñ…É•Ñ}µ…¹…•È¹Í•±•Ñ• ¤(€€€¥˜¹½ÐÑ…É•ÑÌè(€€€€€€€Ý…É¹¥¹œ ‰9¼¡…äÑ…É•ÑÌÉ•¥ÍÑÉ…‘½Ì¸ˆ¤(€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð ˆ€m½¹½É¹µÕÑ•‘uÉ•„Õ¹¼½¸él½t½¹½É…‘€ñÉÕÑ„øˆ¤(€€€€€€€É•ÑÕÉ¸(€€€Ñ…‰±”€ôQ…‰±”¡‰½àõ‰½à¹I=U9°‰½É‘•É}ÍÑå±”ôˆŒÑÔØÙˆ°¡•…‘•É}ÍÑå±”ô‰‰½±€ŒàáÁÀˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰9½µ‰É”ˆ°ÍÑå±”ô‰‰½±€áäˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰IÕÑ…Ì±½…±•Ìˆ°ÍÑå±”ô‰½¹½É¹Á…Ñ ˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰É•…‘¼ˆ°ÍÑå±”ô‰½¹½É¹µÕÑ•ˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰ÑÕ…±¥é…‘¼ˆ°ÍÑå±”ô‰½¹½É¹µÕÑ•ˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€™½È¥¹‘•à°Ñ…É•Ð¥¸•¹Õµ•É…Ñ”¡Ñ…É•ÑÌ¤è(€€€€€€€Ñ…‰±”¹…‘‘}É½Ü (€€€€€€€€€€€Ñ…É•Ð¹¹…µ”°(€€€€€€€€€€€€‰q¸ˆ¹©½¥¸¡™½Éµ…Ñ}¡½µ•}Á…Ñ ¡Á…Ñ ¹±½…±}Á…Ñ ¤™½ÈÁ…Ñ ¥¸Ñ…É•Ð¹Á…Ñ¡Ì¤°(€€€€€€€€€€€™½Éµ…Ñ}‘…Ñ”¡Ñ…É•Ð¹É•…Ñ•‘}…Ð¤°(€€€€€€€€€€€™½Éµ…Ñ}‘…Ñ”¡Ñ…É•Ð¹ÕÁ‘…Ñ•‘}…Ð¤°(€€€€€€€€€€€•¹‘}Í•Ñ¥½¸õ¥¹‘•à€ð±•¸¡Ñ…É•ÑÌ¤€´€Ä°(€€€€€€€€¤(€€€½¹Í½±”¹ÁÉ¥¹Ð¡Ñ…‰±”¤(€€€½¹Í½±”¹ÁÉ¥¹Ð¡˜‰m½¹½É¹µÕÑ•‘uQ½Ñ…°él½tí±•¸¡Ñ…É•ÑÌ¥ôÑ…É•Ð¡Ì¤ˆ¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜•‘¥Ð (€€€¹…µ”èÍÑÈ€ôÑåÁ•È¹ÉÕµ•¹Ð (€€€€€€€€¸¸¸°(€€€€€€€¡•±Àô‰Q…É•Ð¼É•ÕÉÍ¼•ÍÁ•¥…°ÅÕ”Í”…‰É¥Ë„¸ˆ°(€€€€€€€…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}•‘¥Ñ…‰±•Ì°(€€€€¤°(€€€¹½}ÁÕÍ è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸ (€€€€€€€…±Í”°(€€€€€€€€ˆ´µ¹¼µÁÕÍ ˆ°(€€€€€€€¡•±Àô‰½¹Í•ÉÙ„±½…±µ•¹Ñ”•°½µµ¥Ð•¹•É…‘¼…°•‘¥Ñ…È¥¹½É”¸ˆ°(€€€€¤°(€€€Á…Ñ èA…Ñ ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸ (€€€€€€€9½¹”°(€€€€€€€€ˆ´µÁ…Ñ ˆ°(€€€€€€€¡•±Àô‰IÕÑ„É•¥ÍÑÉ…‘„ÅÕ”Í”…‰É¥Ë„¸ˆ°(€€€€€€€…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}Ñ…É•Ñ}Á…Ñ¡Ì°(€€€€¤°(¤€´ø9½¹”è(€€€€ˆˆ‰‰É”Õ¸Ñ…É•Ð±½…°¼•‘¥Ñ„Õ¸É•ÕÉÍ¼•ÍÁ•¥…°‘”½¹½É¸ˆˆˆ(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€¥˜¹…µ”€„ô€‰¥¹½É”ˆè(€€€€€€€¥˜¹…µ”¥¸Q…É•Ñ5…¹…•È¹IMIY}95Lè(€€€€€€€€€€€•á•ÕÑ” (€€€€€€€€€€€€€€€±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü (€€€€€€€€€€€€€€€€€€€Y…±Õ•ÉÉ½È¡˜‰°É•ÕÉÍ¼•ÍÁ•¥…°€í¹…µ•ôœÑ½‘…Ûµ„¹¼•ÍÓ„¥µÁ±•µ•¹Ñ…‘¼¸ˆ¤(€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€€¤(€€€€€€€Ñ…É•Ð€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹•Ð¡¹…µ”¤°(€€€€€€€€€€€¡¥¹Ðô‰½¹ÍÕ±Ñ„±½Ì¹½µ‰É•Ì‘¥ÍÁ½¹¥‰±•Ì½¸è½¹½É±¥ÍÐˆ°(€€€€€€€€¤(€€€€€€€Í•±•Ñ•€ô9½¹”(€€€€€€€¥˜Á…Ñ ¥Ì¹½Ð9½¹”è(€€€€€€€€€€€É•ÅÕ•ÍÑ•€ôÁ…Ñ ¹•áÁ…¹‘ÕÍ•È ¤¹É•Í½±Ù” ¤(€€€€€€€€€€€Í•±•Ñ•€ô¹•áÐ ¡¥Ñ•´™½È¥Ñ•´¥¸Ñ…É•Ð¹Á…Ñ¡Ì¥˜¥Ñ•´¹±½…±}Á…Ñ €ôôÉ•ÅÕ•ÍÑ•¤°9½¹”¤(€€€€€€€€€€€¥˜Í•±•Ñ•¥Ì9½¹”è(€€€€€€€€€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È¡˜‰1„ÉÕÑ„¹¼Á•ÉÑ•¹•”„€í¹…µ•ôœ¸ˆ¤¤¤(€€€€€€€•±¥˜±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¤€ôô€Äè(€€€€€€€€€€€Í•±•Ñ•€ôÑ…É•Ð¹Á…Ñ¡ÍlÁt(€€€€€€€•±¥˜ÍåÌ¹ÍÑ‘¥¸¹¥Í…ÑÑä ¤è(€€€€€€€€€€€…¹ÍÝ•È€ôÅÕ•ÍÑ¥½¹…Éä¹Í•±•Ð (€€€€€€€€€€€€€€€€‰IÕÑ„ÅÕ”Í”…‰É¥Ë„èˆ°¡½¥•ÌõmÍÑÈ¡¥Ñ•´¹±½…±}Á…Ñ ¤™½È¥Ñ•´¥¸Ñ…É•Ð¹Á…Ñ¡Ít(€€€€€€€€€€€€¤¹…Í¬ ¤(€€€€€€€€€€€¥˜…¹ÍÝ•È¥Ì9½¹”è(€€€€€€€€€€€€€€€É…¥Í”-•å‰½…É‘%¹Ñ•ÉÉÕÁÐ(€€€€€€€€€€€Í•±•Ñ•€ô¹•áÐ¡¥Ñ•´™½È¥Ñ•´¥¸Ñ…É•Ð¹Á…Ñ¡Ì¥˜ÍÑÈ¡¥Ñ•´¹±½…±}Á…Ñ ¤€ôô…¹ÍÝ•È¤(€€€€€€€•±Í”è(€€€€€€€€€€€•á•ÕÑ” (€€€€€€€€€€€€€€€±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü (€€€€€€€€€€€€€€€€€€€Y…±Õ•ÉÉ½È¡˜ˆí¹…µ•ôœ½¹Ñ¥•¹”Ù…É¥…ÌÉÕÑ…ÌìÕÍ”€´µÁ…Ñ €ñÉÕÑ„ø¸ˆ¤(€€€€€€€€€€€€€€€€¤(€€€€€€€€€€€€¤(€€€€€€€¡•…‘¥¹œ ‰%QHQIPˆ°€‰‰É¥•¹‘¼±„½¹™¥ÕÉ…§Í¸±½…°Í¥¸Í¥¹É½¹¥é…É±„ˆ¤(€€€€€€€É•ÍÕ±Ð€ô•á•ÕÑ”¡±…µ‰‘„è½Á•¹}¥¹}•‘¥Ñ½È¡Í•±•Ñ•¹±½…±}Á…Ñ ¤¤(€€€€€€€¥˜É•ÍÕ±Ðè(€€€€€€€€€€€É…¥Í”ÑåÁ•È¹á¥Ð¡É•ÍÕ±Ð¤(€€€€€€€ÍÕ•ÍÌ (€€€€€€€€€€€˜‰M”•ÉËÌ•°•‘¥Ñ½È‘”€í¹…µ•ôœ¸ˆ°(€€€€€€€€€€€¡¥¹Ðõ˜‰Õ…¹‘¼Ñ•Éµ¥¹•Ì‘”ÁÉ½‰…È±½Ì…µ‰¥½Ìè½¹½ÉÍå¹Œí¹…µ•ôˆ°(€€€€€€€€¤(€€€€€€€É•ÑÕÉ¸((€€€¡•…‘¥¹œ ‰%QH%9=Iˆ°€‰ÑÕ…±¥é…¹‘¼±…Ì•á±ÕÍ¥½¹•Ì‘•°É•Á½Í¥Ñ½É¥¼ˆ¤(€€€½¹™¥œ€ô½¹™¥5…¹…•È ¤¹±½… ¤(€€€¥˜¹½Ð½¹™¥œ¹¥Ð¹•¹…‰±•è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È ‰¥Ð•ÍÓ„‘•Í…Ñ¥Ù…‘¼•¸½¹½É¸ˆ¤¤¤(€€€¥Ð€ô¥Ñ5…¹…•È¡½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ ¤(€€€¥˜¹½Ð¥Ð¹¥¹¥Ñ¥…±¥é•è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È ‰°É•Á½Í¥Ñ½É¥¼¥Ð¹¼•ÍÓ„¥¹¥¥…±¥é…‘¼¸ˆ¤¤¤(€€€¥˜¥Ð¹¡…¹• ¤è(€€€€€€€•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü (€€€€€€€€€€€€€€€Y…±Õ•ÉÉ½È ‰°É•Á½Í¥Ñ½É¥¼Ñ¥•¹”…µ‰¥½ÌÁ•¹‘¥•¹Ñ•Ìì½¹›µÉµ…±½Ì¼‘•Í…ÉÑ…±½Ì…¹Ñ•Ì‘”•‘¥Ñ…È¥¹½É”¸ˆ¤(€€€€€€€€€€€€¤°(€€€€€€€€€€€¡¥¹Ðô‰I•Ù¥Í„•°•ÍÑ…‘¼½¸è½¹½ÉÉ•Á¼ÍÑ…ÑÕÌˆ°(€€€€€€€€¤(€€€¥¹½É•}Á…Ñ €ô½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ €¼€ˆ¹¥Ñ¥¹½É”ˆ(€€€‰•™½É”€ô¥¹½É•}Á…Ñ ¹É•…‘}‰åÑ•Ì ¤¥˜¥¹½É•}Á…Ñ ¹•á¥ÍÑÌ ¤•±Í”9½¹”(€€€¥¹½É•}Á…Ñ ¹Ñ½Õ ¡•á¥ÍÑ}½¬õQÉÕ”¤(€€€É•ÍÕ±Ð€ô•á•ÕÑ”¡±…µ‰‘„è½Á•¹}¥¹}•‘¥Ñ½È¡¥¹½É•}Á…Ñ ¤¤(€€€¥˜É•ÍÕ±Ðè(€€€€€€€É…¥Í”ÑåÁ•È¹á¥Ð¡É•ÍÕ±Ð¤(€€€…™Ñ•È€ô¥¹½É•}Á…Ñ ¹É•…‘}‰åÑ•Ì ¤(€€€¥˜‰•™½É”€ôô…™Ñ•Èè(€€€€€€€ÍÕ•ÍÌ ˆ¹¥Ñ¥¹½É”¹¼…µ‰§Ìì¹¼Í”É—Ì¹¥¹Ÿé¸½µµ¥Ð¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€¥¹½É•€ô•á•ÕÑ”¡¥Ð¹ÑÉ…­•‘}¥¹½É•‘}™¥±•Ì¤(€€€¥˜¥¹½É•è(€€€€€€€Ý…É¹¥¹œ ‰ÍÑ½Ì…É¡¥Ù½Ì‘•©…Ë…¸‘”•ÍÑ…ÈÉ…ÍÑÉ•…‘½ÌÁ½È¥Ðèˆ¤(€€€€€€€™½ÈÁ…Ñ ¥¸¥¹½É•è(€€€€€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð¡˜ˆ€m½¹½É¹Á…Ñ¡uíÁ…Ñ ¹…Í}Á½Í¥à ¥õl½tˆ¤(€€€•á•ÕÑ”¡±…µ‰‘„è¥Ð¹ÍÑ…•}¥¹½É•}ÕÁ‘…Ñ”¡¥¹½É•¤¤(€€€½µµ¥Ð€ô•á•ÕÑ”¡±…µ‰‘„è¥Ð¹½µµ¥Ñ}ÍÑ…• ‰½¹½ÉèÕÁ‘…Ñ”¥¹½É”ÉÕ±•Ìˆ¤¤(€€€¥˜½µµ¥Ð¥Ì9½¹”è(€€€€€€€ÍÕ•ÍÌ ‰9¼¡Õ‰¼…µ‰¥½ÌÅÕ”½¹™¥Éµ…È¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€ÍÕ•ÍÌ¡˜‰½µµ¥ÐÉ•…‘¼èí½µµ¥Ð¹Í¡…ô€í½µµ¥Ð¹µ•ÍÍ…•ôˆ¤(€€€¥˜¹½}ÁÕÍ è(€€€€€€€Ý…É¹¥¹œ ‰°½µµ¥ÐÍ”½¹Í•ÉÛÌ±½…±µ•¹Ñ”Á½ÈÍ½±¥¥ÑÕ‘•°ÕÍÕ…É¥¼¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è¥Ð¹ÁÕÍ ¡½¹™¥œ¹¥Ð¹É•µ½Ñ”¤°(€€€€€€€¡¥¹Ðô‰°½µµ¥Ð±½…°Í”½¹Í•ÉÛÌ¸I•¥¹Ñ•¹Ñ„½¸è½¹½ÉÉ•Á¼ÁÕÍ ˆ°(€€€€¤(€€€ÍÕ•ÍÌ¡˜‰…µ‰¥½Ì•¹Ù¥…‘½Ì„í½¹™¥œ¹¥Ð¹É•µ½Ñ•ô½í¥Ð¹ÍÑ…ÑÕÌ¡É•µ½Ñ”õ½¹™¥œ¹¥Ð¹É•µ½Ñ”¤¹‰É…¹¡ô¸ˆ¤(()‘•˜É•¹‘•É}¥Ñ}ÍÑ…ÑÕÌ¡¥Ñ}ÍÑ…ÑÕÌ¤€´ø9½¹”è(€€€¥˜¹½Ð¥Ñ}ÍÑ…ÑÕÌ¹¥¹¥Ñ¥…±¥é•è(€€€€€€€Ý…É¹¥¹œ ‰°É•Á½Í¥Ñ½É¥¼‘”½¹½ÉÑ½‘…Ûµ„¹¼•ÍÓ„¥¹¥¥…±¥é…‘¼½¸¥Ð¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€‘¥Ù•É•¹”€ô€‰Í¥¸ÕÁÍÑÉ•…´ˆ(€€€¥˜¥Ñ}ÍÑ…ÑÕÌ¹…¡•…¥Ì¹½Ð9½¹”…¹¥Ñ}ÍÑ…ÑÕÌ¹‰•¡¥¹¥Ì¹½Ð9½¹”è(€€€€€€€‘¥Ù•É•¹”€ô˜‰í¥Ñ}ÍÑ…ÑÕÌ¹…¡•…‘ôÁ½ÈÁÕ‰±¥…Èƒ
+Üí¥Ñ}ÍÑ…ÑÕÌ¹‰•¡¥¹‘ôÁ½È‘•Í…É…Èˆ(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰ÍÑ…‘¼ˆ°€‰±¥µÁ¥¼ˆ¥˜¥Ñ}ÍÑ…ÑÕÌ¹±•…¸•±Í”€‰…µ‰¥½ÌÁ•¹‘¥•¹Ñ•Ìˆ¤°(€€€€€€€€€€€€ ‰I…µ„ˆ°¥Ñ}ÍÑ…ÑÕÌ¹‰É…¹ ½È€‰Í¥¸É…µ„ˆ¤°(€€€€€€€€€€€€ ‰I•µ½Ñ¼ˆ°¥Ñ}ÍÑ…ÑÕÌ¹É•µ½Ñ”½È€‰¹¼½¹™¥ÕÉ…‘¼ˆ¤°(€€€€€€€€€€€€ ‰M•Õ¥µ¥•¹Ñ¼ˆ°¥Ñ}ÍÑ…ÑÕÌ¹ÕÁÍÑÉ•…´½È€‰¹¼½¹™¥ÕÉ…‘¼ˆ¤°(€€€€€€€€€€€€ ‰¥Ù•É•¹¥„ˆ°‘¥Ù•É•¹”¤°(€€€€€€€€€€€€ ‰½µµ¥Ðˆ°¥Ñ}ÍÑ…ÑÕÌ¹½µµ¥Ð½È€‰Í¥¸½µµ¥ÑÌˆ¤°(€€€€€€€€€€€€ ‹i±Ñ¥µ¼µ•¹Í…©”ˆ°¥Ñ}ÍÑ…ÑÕÌ¹µ•ÍÍ…”½È€‰Í¥¸½µµ¥ÑÌˆ¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰I•Á½Í¥Ñ½É¥¼¥Ðˆ°(€€€€¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜‘½Ñ½È (€€€™•Ñ è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ™•Ñ ˆ°¡•±Àô‰½µÁÉÕ•‰„Ñ…µ‰§¥¸•°•ÍÑ…‘¼É•µ½Ñ¼¸ˆ¤°(€€€ÍÑÉ¥Ðè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µÍÑÉ¥Ðˆ°¡•±Àô‰QÉ…Ñ„±…Ì…‘Ù•ÉÑ•¹¥…Ì½µ¼•ÉÉ½É•Ì¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰¥…¹½ÍÑ¥„±„¥¹ÍÑ…±…§Í¸‘”½¹½ÉÍ¥¸µ½‘¥™¥…É±„¸ˆˆˆ(€€€¡•…‘¥¹œ ‰%;MMQ%<ˆ°€‰½µÁÉ½‰…¹‘¼ÅÕ”½¹½É•ÍÓ„±¥ÍÑ¼Á…É„ÑÉ…‰…©…Èˆ¤(€€€É•Á½ÉÐ€ô½Ñ½È ¤¹ÉÕ¸¡™•Ñ õ™•Ñ ¤(€€€±…‰•±Ì€ôì(€€€€€€€€‰Á…ÍÌˆè€ ‹ŠrL½ÉÉ•Ñ¼ˆ°€ˆÍ	áˆ¤°(€€€€€€€€‰Ý…É¹¥¹œˆè€ ˆ„‘Ù•ÉÑ•¹¥„ˆ°€ˆ	áˆ¤°(€€€€€€€€‰™…¥±ÕÉ”ˆè€ ‹\ÉÉ½Èˆ°€ˆ	ØÄÙˆ¤°(€€€ô(€€€Í•Ñ¥½¹Ì€ô±¥ÍÐ¡‘¥Ð¹™É½µ­•åÌ¡¡•¬¹Í•Ñ¥½¸™½È¡•¬¥¸É•Á½ÉÐ¹¡•­Ì¤¤(€€€™½ÈÍ•Ñ¥½¸¥¸Í•Ñ¥½¹Ìè(€€€€€€€Ñ…‰±”€ôQ…‰±” (€€€€€€€€€€€‰½àõ‰½à¹I=U9°(€€€€€€€€€€€‰½É‘•É}ÍÑå±”ôˆŒÑÔØÙˆ°(€€€€€€€€€€€¡•…‘•É}ÍÑå±”ô‰‰½±€ŒàáÁÀˆ°(€€€€€€€€€€€Ñ¥Ñ±”õÍ•Ñ¥½¸°(€€€€€€€€¤(€€€€€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰ÍÑ…‘¼ˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€€€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰½µÁÉ½‰…§Í¸ˆ°ÍÑå±”ô‰‰½±€áäˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€€€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰I•ÍÕ±Ñ…‘¼ˆ°ÍÑå±”ô‰½¹½É¹Á…Ñ ˆ¤(€€€€€€€™½È¡•¬¥¸€¡¥Ñ•´™½È¥Ñ•´¥¸É•Á½ÉÐ¹¡•­Ì¥˜¥Ñ•´¹Í•Ñ¥½¸€ôôÍ•Ñ¥½¸¤è(€€€€€€€€€€€±…‰•°°½±½È€ô±…‰•±Ím¡•¬¹ÍÑ…Ñ•t(€€€€€€€€€€€É•ÍÕ±Ð€ô¡•¬¹µ•ÍÍ…”(€€€€€€€€€€€¥˜¡•¬¹¡¥¹Ðè(€€€€€€€€€€€€€€€É•ÍÕ±Ð€¬ô˜‰q¹m½¹½É¹µÕÑ•‘uMÕ•É•¹¥„èí¡•¬¹¡¥¹Ñõl½tˆ(€€€€€€€€€€€Ñ…‰±”¹…‘‘}É½Ü¡˜‰mí½±½Éõuí±…‰•±õl½tˆ°¡•¬¹¹…µ”°É•ÍÕ±Ð¤(€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð¡Ñ…‰±”¤(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰½ÉÉ•Ñ…Ìˆ°ÍÑÈ¡É•Á½ÉÐ¹Á…ÍÍ•¤¤°(€€€€€€€€€€€€ ‰‘Ù•ÉÑ•¹¥…Ìˆ°ÍÑÈ¡É•Á½ÉÐ¹Ý…É¹¥¹Ì¤¤°(€€€€€€€€€€€€ ‰ÉÉ½É•Ìˆ°ÍÑÈ¡É•Á½ÉÐ¹™…¥±ÕÉ•Ì¤¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰I•ÍÕµ•¸‘•°‘¥…»ÍÍÑ¥¼ˆ°(€€€€¤(€€€¥˜É•Á½ÉÐ¹™…¥±ÕÉ•Ìè(€€€€€€€Ý…É¹¥¹œ ‰½¹½É¹••Í¥Ñ„½ÉÉ•¥½¹•Ì…¹Ñ•Ì‘”ÁÉ½‰…È•°™±Õ©¼½µÁ±•Ñ¼¸ˆ¤(€€€€€€€É…¥Í”ÑåÁ•È¹á¥Ð Ä¤(€€€¥˜ÍÑÉ¥Ð…¹É•Á½ÉÐ¹Ý…É¹¥¹Ìè(€€€€€€€Ý…É¹¥¹œ ‰°‘¥…»ÍÍÑ¥¼•ÍÑÉ¥Ñ¼•¹½¹ÑËÌ…‘Ù•ÉÑ•¹¥…Ì¸ˆ¤(€€€€€€€É…¥Í”ÑåÁ•È¹á¥Ð Ä¤(€€€¥˜É•Á½ÉÐ¹Ý…É¹¥¹Ìè(€€€€€€€ÍÕ•ÍÌ ‰½¹½É™Õ¹¥½¹„°Á•É¼½¹Ù¥•¹”É•Ù¥Í…È±…Ì…‘Ù•ÉÑ•¹¥…Ì¸ˆ¤(€€€•±Í”è(€€€€€€€ÍÕ•ÍÌ ‰½¹½É•ÍÓ„±¥ÍÑ¼Á…É„ÁÉ½‰…ÉÍ”¸ˆ¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜ÍÑ…ÑÕÌ (€€€™•Ñ è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ™•Ñ ˆ°¡•±Àô‰ÑÕ…±¥é„±„¥¹™½Éµ…§Í¸‘•°É•µ½Ñ¼¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰½µÁ…É„±½Ì…É¡¥Ù½Ì±½…±•Ì½¸ÍÕÌ½Á¥…Ì‘•°É•Á½Í¥Ñ½É¥¼¸ˆˆˆ(€€€¡•…‘¥¹œ ‰MQ<ˆ°€‰½µÁ…É…¹‘¼!=5½¸•°É•Á½Í¥Ñ½É¥¼‘”½¹½Éˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€¥Ñ•µÌ€ôÑ…É•Ñ}µ…¹…•È¹ÍÑ…ÑÕÌ ¤(€€€¥˜¹½Ð¥Ñ•µÌè(€€€€€€€Ý…É¹¥¹œ ‰9¼¡…äÑ…É•ÑÌÅÕ”½µÁÉ½‰…È¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€±…‰•±Ì€ôì(€€€€€€€€‰±•…¸ˆè€ ‹ŠrLM¥¸…µ‰¥½Ìˆ°€ˆÍ	áˆ¤°(€€€€€€€€‰µ½‘¥™¥•ˆè€ ‹Š^<5½‘¥™¥…‘¼ˆ°€ˆ	áˆ¤°(€€€€€€€€‰µ¥ÍÍ¥¹œˆè€ ‹\…±Ñ„±½…°ˆ°€ˆ	ØÄÙˆ¤°(€€€€€€€€‰Õ¹ÑÉ…­•ˆè€ ‹\…±Ñ„½Á¥„ˆ°€ˆ	ØÄÙˆ¤°(€€€ô(€€€Ñ…‰±”€ôQ…‰±”¡‰½àõ‰½à¹I=U9°‰½É‘•É}ÍÑå±”ôˆŒÑÔØÙˆ°¡•…‘•É}ÍÑå±”ô‰‰½±€ŒàáÁÀˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰Q…É•Ðˆ°ÍÑå±”ô‰‰½±€áäˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰ÍÑ…‘¼ˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰§Í¸ÍÕ•É¥‘„ˆ°ÍÑå±”ô‰½¹½É¹µÕÑ•ˆ¤(€€€¡¥¹ÑÌ€ôì‰±•…¸ˆè€‰9¥¹Õ¹„ˆ°€‰µ½‘¥™¥•ˆè€‰½¹½ÉÍå¹Œ€ñÑ…É•Ðøˆ°€‰µ¥ÍÍ¥¹œˆè€‰½¹½ÉÉ•ÍÑ½É”€ñÑ…É•Ðøˆ°€‰Õ¹ÑÉ…­•ˆè€‰½¹½ÉÍå¹Œ€ñÑ…É•Ðø‰ô(€€€™½È¥Ñ•´¥¸¥Ñ•µÌè(€€€€€€€±…‰•°°½±½È€ô±…‰•±Ím¥Ñ•´¹ÍÑ…Ñ•t(€€€€€€€Ñ…‰±”¹…‘‘}É½Ü¡¥Ñ•´¹¹…µ”°˜‰mí½±½Éõuí±…‰•±õl½tˆ°¡¥¹ÑÍm¥Ñ•´¹ÍÑ…Ñ•t¤(€€€½¹Í½±”¹ÁÉ¥¹Ð¡Ñ…‰±”¤(€€€±•…¸€ôÍÕ´¡¥Ñ•´¹ÍÑ…Ñ”€ôô€‰±•…¸ˆ™½È¥Ñ•´¥¸¥Ñ•µÌ¤(€€€ÍÕ•ÍÌ¡˜‰½µÁÉ½‰…§Í¸Ñ•Éµ¥¹…‘„èí±•…¹ô½í±•¸¡¥Ñ•µÌ¥ôÑ…É•Ð¡Ì¤Í¥¸…µ‰¥½Ì¸ˆ¤(€€€½¹™¥œ€ô½¹™¥5…¹…•È ¤¹±½… ¤(€€€¥˜½¹™¥œ¹¥Ð¹•¹…‰±•è(€€€€€€€¥Ñ}ÍÑ…ÑÕÌ€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„è¥Ñ5…¹…•È¡½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ ¤¹ÍÑ…ÑÕÌ¡™•Ñ õ™•Ñ °É•µ½Ñ”õ½¹™¥œ¹¥Ð¹É•µ½Ñ”¤°(€€€€€€€€€€€¡¥¹Ðô‰½µÁÉÕ•‰„¥Ð½¸è½¹½ÉÉ•Á¼ÍÑ…ÑÕÌˆ°(€€€€€€€€¤(€€€€€€€É•¹‘•É}¥Ñ}ÍÑ…ÑÕÌ¡¥Ñ}ÍÑ…ÑÕÌ¤(()…ÁÀ¹½µµ…¹ ‰‘¥™˜ˆ¤)‘•˜‘¥™™}Ñ…É•ÑÌ (€€€¹…µ”èÍÑÈð9½¹”€ôÑåÁ•È¹ÉÕµ•¹Ð (€€€€€€€9½¹”°(€€€€€€€¡•±Àô‰Q…É•Ð½¹É•Ñ¼ì½·µÑ•±¼Á…É„½µÁ…É…ÈÑ½‘½Ì¸ˆ°(€€€€€€€…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}Ñ…É•ÑÌ°(€€€€¤°(¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„±½Ì…µ‰¥½ÌÅÕ”Íå¹Œ…Á±¥…Ëµ„…°É•Á½Í¥Ñ½É¥¼¸ˆˆˆ(€€€¡•…‘¥¹œ ‰%I9%Lˆ°€‰Y¥ÍÑ„ÁÉ•Ù¥„‘”!=5ƒŠHÉ•Á½Í¥Ñ½É¥¼ˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€‘¥™™•É•¹•Ì€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹‘¥™˜¡¹…µ”¤°(€€€€€€€¡¥¹Ðô‰½¹ÍÕ±Ñ„±½Ì¹½µ‰É•Ì‘¥ÍÁ½¹¥‰±•Ì½¸è½¹½É±¥ÍÐˆ°(€€€€¤(€€€É•¹‘•É}‘¥™™•É•¹•Ì¡‘¥™™•É•¹•Ì°½µµ…¹ô‰½¹½ÉÍå¹Œˆ€¬€¡˜ˆí¹…µ•ôˆ¥˜¹…µ”•±Í”€ˆˆ¤¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜Íå¹Œ (€€€¹…µ”èÍÑÈð9½¹”€ôÑåÁ•È¹ÉÕµ•¹Ð (€€€€€€€9½¹”°(€€€€€€€¡•±Àô‰Q…É•Ð½¹É•Ñ¼ì½·µÑ•±¼Á…É„Í¥¹É½¹¥é…ÈÑ½‘½Ì¸ˆ°(€€€€€€€…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}Ñ…É•ÑÌ°(€€€€¤°(€€€‘Éå}ÉÕ¸è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ‘ÉäµÉÕ¸ˆ°¡•±Àô‰M¥µÕ±„±„½Á•É…§Í¸Í¥¸µ½‘¥™¥…È…É¡¥Ù½Ì¸ˆ¤°(€€€µ•ÍÍ…”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µµ•ÍÍ…”ˆ°€ˆµ´ˆ°¡•±Àô‰5•¹Í…©”‘•°½µµ¥Ð¸ˆ¤°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ°¡•±Àô‰•ÁÑ„•°µ•¹Í…©”ÁÉ•‘•Ñ•Éµ¥¹…‘¼¸ˆ¤°(€€€¹½}½µµ¥Ðè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ¹¼µ½µµ¥Ðˆ°¡•±Àô‰9¼É•„•°½µµ¥Ð…ÕÑ½·…Ñ¥¼¸ˆ¤°(€€€ÁÕÍ è‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÕÍ ¼´µ¹¼µÁÕÍ ˆ°¡•±Àô‰M½‰É•ÍÉ¥‰”…ÕÑ½}ÁÕÍ Á…É„•ÍÑ„½Á•É…§Í¸¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰ÑÕ…±¥é„Õ¹¼¼Ñ½‘½Ì±½ÌÑ…É•ÑÌ‘•Í‘”!=5…°É•Á½Í¥Ñ½É¥¼¸ˆˆˆ(€€€¥˜‘Éå}ÉÕ¸è(€€€€€€€¡•…‘¥¹œ ‰M%5U1'M8M%9I=9%i'M8ˆ°€‰Y¥ÍÑ„ÁÉ•Ù¥„‘”!=5ƒŠHÉ•Á½Í¥Ñ½É¥¼ˆ¤(€€€€€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€€€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€€€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€€€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€€€€€‘¥™™•É•¹•Ì€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹ÁÉ•Ù¥•Ý}Íå¹Œ¡¹…µ”¤°(€€€€€€€€€€€¡¥¹Ðô‰½¹ÍÕ±Ñ„±½Ì¹½µ‰É•Ì‘¥ÍÁ½¹¥‰±•Ì½¸è½¹½É±¥ÍÐˆ°(€€€€€€€€¤(€€€€€€€É•¹‘•É}‘¥™™•É•¹•Ì (€€€€€€€€€€€‘¥™™•É•¹•Ì°(€€€€€€€€€€€½µµ…¹ô‰½¹½ÉÍå¹Œˆ€¬€¡˜ˆí¹…µ•ôˆ¥˜¹…µ”•±Í”€ˆˆ¤°(€€€€€€€€¤(€€€€€€€½¹™¥œ€ô½¹™¥5…¹…•È ¤¹±½… ¤(€€€€€€€¡…¹•‘}¹…µ•Ì€ômÑ…É•Ñ}‘¥™˜¹¹…µ”™½ÈÑ…É•Ñ}‘¥™˜¥¸‘¥™™•É•¹•Ì¥˜¹½ÐÑ…É•Ñ}‘¥™˜¹±•…¹t(€€€€€€€¥˜€ (€€€€€€€€€€€¡…¹•‘}¹…µ•Ì(€€€€€€€€€€€…¹½¹™¥œ¹¥Ð¹•¹…‰±•(€€€€€€€€€€€…¹½¹™¥œ¹¥Ð¹…ÕÑ½}½µµ¥Ð(€€€€€€€€€€€…¹¹½Ð¹½}½µµ¥Ð(€€€€€€€€¤è(€€€€€€€€€€€Ý¥±±}ÁÕÍ €ô½¹™¥œ¹¥Ð¹…ÕÑ½}ÁÕÍ ¥˜ÁÕÍ ¥Ì9½¹”•±Í”ÁÕÍ (€€€€€€€€€€€‘•Ñ…¥±Ì (€€€€€€€€€€€€€€€l(€€€€€€€€€€€€€€€€€€€€ ‰½µµ¥Ðˆ°µ•ÍÍ…”½ÈÍå¹}½µµ¥Ñ}µ•ÍÍ…”¡¡…¹•‘}¹…µ•Ì¤¤°(€€€€€€€€€€€€€€€€€€€€ ‰AÕÍ ˆ°˜‰Ï´°„í½¹™¥œ¹¥Ð¹É•µ½Ñ•ôˆ¥˜Ý¥±±}ÁÕÍ •±Í”€‰¹¼ˆ¤°(€€€€€€€€€€€€€€€t°(€€€€€€€€€€€€€€€Ñ¥Ñ±”ô‰¥Ð€¡Í¥µÕ±…§Í¸¤ˆ°(€€€€€€€€€€€€¤(€€€€€€€É•ÑÕÉ¸(€€€¡•…‘¥¹œ ‰M%9I=9%i'M8ˆ°€‰½Á¥…¹‘¼…µ‰¥½Ì±½…±•Ì…°É•Á½Í¥Ñ½É¥¼ˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€Ñ…É•ÑÌ€ô•á•ÕÑ”¡±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹Íå¹Œ¡¹…µ”¤°¡¥¹Ðô‰½¹ÍÕ±Ñ„±½Ì¹½µ‰É•Ì‘¥ÍÁ½¹¥‰±•Ì½¸è½¹½É±¥ÍÐˆ¤(€€€™½ÈÑ…É•Ð¥¸Ñ…É•ÑÌè(€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð¡˜‰m½¹½É¹ÍÕ•ÍÍwŠrMl½tíÑ…É•Ð¹¹…µ•ô€m½¹½É¹µÕÑ•‘wŠ@í±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¥ôÉÕÑ„¡Ì¥l½tˆ¤(€€€¥˜Ñ…É•ÑÌè(€€€€€€€Ñ…É•Ñ}¹…µ•Ì€ômÑ…É•Ð¹¹…µ”™½ÈÑ…É•Ð¥¸Ñ…É•ÑÍt(€€€€€€€‘•™…Õ±Ñ}µ•ÍÍ…”€ôÍå¹}½µµ¥Ñ}µ•ÍÍ…”¡Ñ…É•Ñ}¹…µ•Ì¤(€€€€€€€•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„è™¥¹…±¥é•}¥Ð (€€€€€€€€€€€€€€€¥Ñ}Á…Ñ¡Ì ©Ñ…É•Ñ}¹…µ•Ì¤°(€€€€€€€€€€€€€€€‘•™…Õ±Ñ}µ•ÍÍ…”°(€€€€€€€€€€€€€€€¥Ñ}½µµ…¹‘}½ÁÑ¥½¹Ì¡µ•ÍÍ…”°å•Ì°¹½}½µµ¥Ð°ÁÕÍ ¤°(€€€€€€€€€€€€¤°(€€€€€€€€€€€¡¥¹Ðô‰°½µµ¥Ð±½…°Í”½¹Í•ÉÛÌ¸M¤•°É•µ½Ñ¼…Ù…¹ëÌ°•©•ÕÑ„½¹½ÉÉ•Á¼ÁÕ±°ä‘•ÍÁ×¥Ì½¹½ÉÉ•Á¼ÁÕÍ ¸ˆ°(€€€€€€€€¤(€€€ÍÕ•ÍÌ¡˜‰M”Í¥¹É½¹¥é…É½¸í±•¸¡Ñ…É•ÑÌ¥ôÑ…É•Ð¡Ì¤¸ˆ°¡¥¹Ðô‰Y•É¥™¥„•°É•ÍÕ±Ñ…‘¼½¸è½¹½ÉÍÑ…ÑÕÌˆ¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜É•ÍÑ½É” (€€€¹…µ”èÍÑÈð9½¹”€ôÑåÁ•È¹ÉÕµ•¹Ð (€€€€€€€9½¹”°(€€€€€€€¡•±Àô‰Q…É•ÐÅÕ”Í”É•ÍÑ…ÕÉ…Ë„¸ˆ°(€€€€€€€…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}Ñ…É•ÑÌ°(€€€€¤°(€€€…±±}Ñ…É•ÑÌè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ…±°ˆ°€ˆµ„ˆ°¡•±Àô‰I•ÍÑ…ÕÉ„Ñ½‘½Ì±½ÌÑ…É•ÑÌ‘•°µ…¹¥™¥•ÍÑ¼¸ˆ¤°(€€€™½É”è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ™½É”ˆ°€ˆµ˜ˆ°¡•±Àô‰I••µÁ±…é„±„ÉÕÑ„±½…°•á¥ÍÑ•¹Ñ”¸ˆ¤°(€€€‘Éå}ÉÕ¸è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ‘ÉäµÉÕ¸ˆ°¡•±Àô‰M¥µÕ±„±„½Á•É…§Í¸Í¥¸µ½‘¥™¥…È…É¡¥Ù½Ì¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰I•ÍÑ…ÕÉ„Õ¸Ñ…É•Ð‘•°É•Á½Í¥Ñ½É¥¼„!=5¸ˆˆˆ(€€€¥˜€¡¹…µ”¥Ì9½¹”¤€ôô€¡¹½Ð…±±}Ñ…É•ÑÌ¤è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È ‰%¹‘¥ÅÕ”Õ¸Ñ…É•Ð¼ÕÍ”€´µ…±°°Á•É¼¹¼…µ‰½Ì¸ˆ¤¤¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€µ…å‰•}½™™•É}ÍÕ•ÍÑ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€¥˜‘Éå}ÉÕ¸è(€€€€€€€¡•…‘¥¹œ ‰M%5U1'M8IMQUI'M8ˆ°€‰Y¥ÍÑ„ÁÉ•Ù¥„‘”É•Á½Í¥Ñ½É¥¼ƒŠH!=5ˆ¤(€€€€€€€‘¥™™•É•¹•Ì€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹ÁÉ•Ù¥•Ý}É•ÍÑ½É”¡9½¹”¥˜…±±}Ñ…É•ÑÌ•±Í”¹…µ”¤°(€€€€€€€€€€€¡¥¹Ðô‰½¹ÍÕ±Ñ„±½Ì¹½µ‰É•Ì‘¥ÍÁ½¹¥‰±•Ì½¸è½¹½É±¥ÍÐˆ°(€€€€€€€€¤(€€€€€€€½µµ…¹€ô€‰½¹½ÉÉ•ÍÑ½É”€´µ…±°ˆ¥˜…±±}Ñ…É•ÑÌ•±Í”˜‰½¹½ÉÉ•ÍÑ½É”í¹…µ•ôˆ(€€€€€€€¥˜™½É”è(€€€€€€€€€€€½µµ…¹€¬ô€ˆ€´µ™½É”ˆ(€€€€€€€É•¹‘•É}‘¥™™•É•¹•Ì¡‘¥™™•É•¹•Ì°½µµ…¹õ½µµ…¹¤(€€€€€€€É•ÑÕÉ¸(€€€¡•…‘¥¹œ ‰IMQUI'M8ˆ°€‰I•ÕÁ•É…¹‘¼Õ¹„½¹™¥ÕÉ…§Í¸‘•Í‘”•°É•Á½Í¥Ñ½É¥¼ˆ¤(€€€¥˜…±±}Ñ…É•ÑÌè(€€€€€€€Ñ…É•ÑÌ€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹É•ÍÑ½É•}…±°¡™½É”õ™½É”¤°(€€€€€€€€€€€¡¥¹Ðô‰UÍ„€´µ™½É”Í¤‘•Í•…ÌÉ••µÁ±…é…È½¹™¥ÕÉ…¥½¹•Ì±½…±•Ì•á¥ÍÑ•¹Ñ•Ì¸ˆ°(€€€€€€€€¤(€€€€€€€™½ÈÑ…É•Ð¥¸Ñ…É•ÑÌè(€€€€€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð¡˜‰m½¹½É¹ÍÕ•ÍÍwŠrMl½tíÑ…É•Ð¹¹…µ•ô€m½¹½É¹µÕÑ•‘wŠHí±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¥ôÉÕÑ„¡Ì¥l½tˆ¤(€€€€€€€ÍÕ•ÍÌ¡˜‰M”É•ÍÑ…ÕÉ…É½¸í±•¸¡Ñ…É•ÑÌ¥ôÑ…É•Ð¡Ì¤¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€Ñ…É•Ð€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹É•ÍÑ½É”¡¹…µ”°™½É”õ™½É”¤°(€€€€€€€¡¥¹Ðô‰M¤±„ÉÕÑ„±½…°å„•á¥ÍÑ”äÅÕ¥•É•ÌÉ••µÁ±…é…É±„°…É•„€´µ™½É”¸ˆ°(€€€€¤(€€€‘•Ñ…¥±Ì (€€€€€€€l ‰Q…É•Ðˆ°Ñ…É•Ð¹¹…µ”¤°€ ‰•ÍÑ¥¹½Ìˆ°€‰q¸ˆ¹©½¥¸¡ÍÑÈ¡Á…Ñ ¹±½…±}Á…Ñ ¤™½ÈÁ…Ñ ¥¸Ñ…É•Ð¹Á…Ñ¡Ì¤¥t°(€€€€€€€Ñ¥Ñ±”ô‰I•ÍÑ…ÕÉ…§Í¸½µÁ±•Ñ…‘„ˆ°(€€€€¤(€€€ÍÕ•ÍÌ¡˜ˆíÑ…É•Ð¹¹…µ•ôœ™Õ”É•ÍÑ…ÕÉ…‘¼½ÉÉ•Ñ…µ•¹Ñ”¸ˆ¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜‰½½ÑÍÑÉ…À (€€€É•µ½Ñ•}ÕÉ°èÍÑÈ€ôÑåÁ•È¹ÉÕµ•¹Ð ¸¸¸°¡•±Àô‰UI0‘•°É•Á½Í¥Ñ½É¥¼É•µ½Ñ¼‘”‘½Ñ™¥±•Ì¸ˆ¤°(€€€É•Á½Í¥Ñ½ÉäèA…Ñ ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÉ•Á½Í¥Ñ½Éäˆ°€ˆµÈˆ°¡•±Àô‰¥É•Ñ½É¥¼±½…°‘•°É•Á½Í¥Ñ½É¥¼¸ˆ¤°(€€€É•ÍÑ½É•}™¥±•Ìè‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸ (€€€€€€€9½¹”°(€€€€€€€€ˆ´µÉ•ÍÑ½É”¼´µ¹¼µÉ•ÍÑ½É”ˆ°(€€€€€€€¡•±Àô‰I•ÍÑ…ÕÉ„Ñ½‘½Ì±½ÌÑ…É•ÑÌ‘•ÍÁ×¥Ì‘”¥µÁ½ÉÑ…È•°µ…¹¥™¥•ÍÑ¼¸ˆ°(€€€€¤°(¤€´ø9½¹”è(€€€€ˆˆ‰I•½¹ÍÑÉÕå”½¹½É‘•Í‘”Õ¸É•Á½Í¥Ñ½É¥¼É•µ½Ñ¼•á¥ÍÑ•¹Ñ”¸ˆˆˆ(€€€¡•…‘¥¹œ ‰	==QMQI@ˆ°€‰I•ÕÁ•É…¹‘¼½¹½É‘•Í‘”Õ¸É•Á½Í¥Ñ½É¥¼É•µ½Ñ¼ˆ¤(€€€¥˜½¹½É¹¥Í}¥¹¥Ñ¥…±¥é• ¤è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È ‰½¹½Éå„•ÍÓ„¥¹¥¥…±¥é…‘¼¸ˆ¤¤¤(€€€¥˜¹½Ð¥Ñ5…¹…•È¹…Ù…¥±…‰±” ¤è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡¥±•9½Ñ½Õ¹‘ÉÉ½È ‰¥Ð¹¼•ÍÓ„¥¹ÍÑ…±…‘¼¸ˆ¤¤¤(€€€‘•ÍÑ¥¹…Ñ¥½¸€ô€¡É•Á½Í¥Ñ½Éä½È½¹½É¹‘•™…Õ±Ñ}É•Á½Í¥Ñ½Éå}‘¥È¤¹•áÁ…¹‘ÕÍ•È ¤¹É•Í½±Ù” ¤(€€€¥˜‘•ÍÑ¥¹…Ñ¥½¸¹•á¥ÍÑÌ ¤…¹…¹ä¡‘•ÍÑ¥¹…Ñ¥½¸¹¥Ñ•É‘¥È ¤¤è(€€€€€€€•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü (€€€€€€€€€€€€€€€¥±•á¥ÍÑÍÉÉ½È¡˜‰°‘¥É•Ñ½É¥¼‘”‘•ÍÑ¥¹¼¹¼•ÍÓ„Ù…µ¼èí‘•ÍÑ¥¹…Ñ¥½¹ôˆ¤(€€€€€€€€€€€€¤(€€€€€€€€¤(€€€‘•ÍÑ¥¹…Ñ¥½¸¹Á…É•¹Ð¹µ­‘¥È¡Á…É•¹ÑÌõQÉÕ”°•á¥ÍÑ}½¬õQÉÕ”¤(€€€±½¹”€ôÍÕ‰ÁÉ½•ÍÌ¹ÉÕ¸ (€€€€€€€l‰¥Ðˆ°€‰±½¹”ˆ°É•µ½Ñ•}ÕÉ°°ÍÑÈ¡‘•ÍÑ¥¹…Ñ¥½¸¥t°(€€€€€€€Ñ•áÐõQÉÕ”°(€€€€€€€…ÁÑÕÉ•}½ÕÑÁÕÐõQÉÕ”°(€€€€€€€¡•¬õ…±Í”°(€€€€¤(€€€¥˜±½¹”¹É•ÑÕÉ¹½‘”è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È¡±½¹”¹ÍÑ‘•ÉÈ¹ÍÑÉ¥À ¤½È€‰9¼™Õ”Á½Í¥‰±”±½¹…È¸ˆ¤¤¤(€€€½¹™¥}µ…¹…•È€ô½¹™¥5…¹…•È ¤(€€€½¹™¥œ€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„è½¹™¥}µ…¹…•È¹±½…‘}™É½µ}É•Á½Í¥Ñ½Éä¡‘•ÍÑ¥¹…Ñ¥½¸¤°(€€€€€€€¡¥¹Ðô‰°É•Á½Í¥Ñ½É¥¼‘•‰”½¹Ñ•¹•È•°µ…¹¥™¥•ÍÑ¼…‘µ¥¹¥ÍÑÉ…‘¼Á½È½¹½É¸ˆ°(€€€€¤(€€€½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ €ô‘•ÍÑ¥¹…Ñ¥½¸(€€€½¹™¥}µ…¹…•È¹Í…Ù”¡½¹™¥œ¤(€€€Ñ…É•ÑÌ€ô•á•ÕÑ”¡±…µ‰‘„èQ…É•Ñ5…¹…•È ¤¹¥µÁ½ÉÑ}µ…¹¥™•ÍÐ¡É•Á±…”õQÉÕ”¤¤(€€€ÍÕ•ÍÌ¡˜‰M”¥µÁ½ÉÑ…É½¸í±•¸¡Ñ…É•ÑÌ¥ôÑ…É•Ð¡Ì¤‘•Í‘”•°µ…¹¥™¥•ÍÑ¼¸ˆ¤(€€€Í¡½Õ±‘}É•ÍÑ½É”€ôÉ•ÍÑ½É•}™¥±•Ì(€€€¥˜Í¡½Õ±‘}É•ÍÑ½É”¥Ì9½¹”…¹ÍåÌ¹ÍÑ‘¥¸¹¥Í…ÑÑä ¤è(€€€€€€€Í¡½Õ±‘}É•ÍÑ½É”€ô‰½½°¡ÅÕ•ÍÑ¥½¹…Éä¹½¹™¥É´ ‹
+ýI•ÍÑ…ÕÉ…È…¡½É„Ñ½‘½Ì±½ÌÑ…É•ÑÌüˆ°‘•™…Õ±ÐõQÉÕ”¤¹…Í¬ ¤¤(€€€¥˜Í¡½Õ±‘}É•ÍÑ½É”è(€€€€€€€É•ÍÑ½É•€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èQ…É•Ñ5…¹…•È ¤¹É•ÍÑ½É•}…±° ¤°(€€€€€€€€€€€¡¥¹Ðô‰UÍ„½¹½ÉÉ•ÍÑ½É”€´µ…±°€´µ™½É”Í¤•á¥ÍÑ•¸½¹™¥ÕÉ…¥½¹•Ì±½…±•Ì¸ˆ°(€€€€€€€€¤(€€€€€€€ÍÕ•ÍÌ¡˜‰M”É•ÍÑ…ÕÉ…É½¸í±•¸¡É•ÍÑ½É•¥ôÑ…É•Ð¡Ì¤¸ˆ¤(€€€•±Í”è(€€€€€€€Ý…É¹¥¹œ ‰1½ÌÑ…É•ÑÌ™Õ•É½¸¥µÁ½ÉÑ…‘½ÌÁ•É¼Ñ½‘…Ûµ„¹¼Í”É•ÍÑ…ÕÉ…É½¸¸ˆ¤(€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð ˆ€m½¹½É¹µÕÑ•‘uÕ…¹‘¼•ÍÓ¥Ì±¥ÍÑ¼él½t½¹½ÉÉ•ÍÑ½É”€´µ…±°ˆ¤(€€€É•¹‘•É}¥Ñ}ÍÑ…ÑÕÌ¡¥Ñ5…¹…•È¡‘•ÍÑ¥¹…Ñ¥½¸¤¹ÍÑ…ÑÕÌ¡É•µ½Ñ”õ½¹™¥œ¹¥Ð¹É•µ½Ñ”¤¤(()‘•˜…Ñ¥Ù•}¥Ð ¤€´øÑÕÁ±•m¥Ñ5…¹…•È°¥Ñ½¹™¥tè(€€€½¹™¥œ€ô½¹™¥5…¹…•È ¤¹±½… ¤(€€€É•ÑÕÉ¸¥Ñ5…¹…•È¡½¹™¥œ¹É•Á½Í¥Ñ½Éå}Á…Ñ ¤°½¹™¥œ¹¥Ð(()É•Á½}…ÁÀ¹½µµ…¹ ‰ÍÑ…ÑÕÌˆ¤)‘•˜É•Á½}ÍÑ…ÑÕÌ (€€€™•Ñ è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ™•Ñ ˆ°¡•±Àô‰½¹ÍÕ±Ñ„•°É•µ½Ñ¼…¹Ñ•Ì‘”µ½ÍÑÉ…È•°•ÍÑ…‘¼¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„•°•ÍÑ…‘¼¥Ð‘•°É•Á½Í¥Ñ½É¥¼‘”½¹½É¸ˆˆˆ(€€€¡•…‘¥¹œ ‰IA=M%Q=I%<ˆ°€‰ÍÑ…‘¼‘•°¡¥ÍÑ½É¥…°ä‘•°É•µ½Ñ¼¥Ðˆ¤(€€€¥Ð°Í•ÑÑ¥¹Ì€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€É•¹‘•É}¥Ñ}ÍÑ…ÑÕÌ¡•á•ÕÑ”¡±…µ‰‘„è¥Ð¹ÍÑ…ÑÕÌ¡™•Ñ õ™•Ñ °É•µ½Ñ”õÍ•ÑÑ¥¹Ì¹É•µ½Ñ”¤¤¤(()É•Á½}…ÁÀ¹½µµ…¹ ‰±½œˆ¤)‘•˜É•Á½}±½œ (€€€±¥µ¥Ðè¥¹Ð€ôÑåÁ•È¹=ÁÑ¥½¸ ÄÀ°€ˆ´µ±¥µ¥Ðˆ°€ˆµ¸ˆ°µ¥¸ôÄ°¡•±Àô‰;éµ•É¼·…á¥µ¼‘”½µµ¥ÑÌ¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„•°¡¥ÍÑ½É¥…°É•¥•¹Ñ”‘”½¹½É¸ˆˆˆ(€€€¡•…‘¥¹œ ‰!%MQ=I%0%Pˆ°€‰½µµ¥ÑÌÉ•¥•¹Ñ•Ì‘•°É•Á½Í¥Ñ½É¥¼ˆ¤(€€€¥Ð°|€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€½µµ¥ÑÌ€ô•á•ÕÑ”¡±…µ‰‘„è¥Ð¹±½œ¡±¥µ¥Ð¤¤(€€€¥˜¹½Ð½µµ¥ÑÌè(€€€€€€€Ý…É¹¥¹œ ‰°É•Á½Í¥Ñ½É¥¼Ñ½‘…Ûµ„¹¼½¹Ñ¥•¹”½µµ¥ÑÌ¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€Ñ…‰±”€ôQ…‰±”¡‰½àõ‰½à¹I=U9°‰½É‘•É}ÍÑå±”ôˆŒÑÔØÙˆ°¡•…‘•É}ÍÑå±”ô‰‰½±€ŒàáÁÀˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰½µµ¥Ðˆ°ÍÑå±”ô‰½¹½É¹…•¹Ðˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰•¡„ˆ°ÍÑå±”ô‰½¹½É¹µÕÑ•ˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰5•¹Í…©”ˆ°ÍÑå±”ô‰½¹½É¹Á…Ñ ˆ¤(€€€™½ÈÍ¡„°‘…Ñ”°µ•ÍÍ…”¥¸½µµ¥ÑÌè(€€€€€€€Ñ…‰±”¹…‘‘}É½Ü¡Í¡„°‘…Ñ”°µ•ÍÍ…”¤(€€€½¹Í½±”¹ÁÉ¥¹Ð¡Ñ…‰±”¤(()É•Á½}…ÁÀ¹½µµ…¹ ‰‘¥™˜ˆ¤)‘•˜É•Á½}‘¥™˜ (€€€ÍÑ…•è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µÍÑ…•ˆ°¡•±Àô‰5Õ•ÍÑÉ„Í½±…µ•¹Ñ”…µ‰¥½ÌÁÉ•Á…É…‘½Ì¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„±…Ì‘¥™•É•¹¥…Ì¥Ð‘•°É•Á½Í¥Ñ½É¥¼¸ˆˆˆ(€€€¡•…‘¥¹œ ‰%I9%L%Pˆ°€‰…µ‰¥½Ì‘•¹ÑÉ¼‘•°É•Á½Í¥Ñ½É¥¼‘”½¹½Éˆ¤(€€€¥Ð°|€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€½ÕÑÁÕÐ€ô•á•ÕÑ”¡±…µ‰‘„è¥Ð¹‘¥™˜¡ÍÑ…•õÍÑ…•¤¤(€€€¥˜½ÕÑÁÕÐè(€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð¡½ÕÑÁÕÐ°µ…É­ÕÀõ…±Í”¤(€€€•±Í”è(€€€€€€€ÍÕ•ÍÌ ‰9¼¡…ä‘¥™•É•¹¥…ÌÅÕ”µ½ÍÑÉ…È¸ˆ¤(()É•Á½}…ÁÀ¹½µµ…¹ ‰½µµ¥Ðˆ¤)‘•˜É•Á½}½µµ¥Ð (€€€µ•ÍÍ…”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µµ•ÍÍ…”ˆ°€ˆµ´ˆ°¡•±Àô‰5•¹Í…©”‘•°½µµ¥Ð¸ˆ¤°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ°¡•±Àô‰UÍ„•°µ•¹Í…©”ÁÉ•‘•Ñ•Éµ¥¹…‘¼¸ˆ¤°(€€€ÁÕÍ è‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÕÍ ¼´µ¹¼µÁÕÍ ˆ°¡•±Àô‰M½‰É•ÍÉ¥‰”…ÕÑ½}ÁÕÍ ¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰É•„µ…¹Õ…±µ•¹Ñ”Õ¸½µµ¥Ð½¸Ñ½‘½Ì±½Ì…µ‰¥½ÌÁ•¹‘¥•¹Ñ•Ì¸ˆˆˆ(€€€¡•…‘¥¹œ ‰=55%P59U0ˆ°€‰½¹™¥Éµ…¹‘¼…µ‰¥½ÌÁ•¹‘¥•¹Ñ•Ì‘•°É•Á½Í¥Ñ½É¥¼ˆ¤(€€€¥Ð°Í•ÑÑ¥¹Ì€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€¥˜¹½Ð¥Ð¹¡…¹• ¤è(€€€€€€€ÍÕ•ÍÌ ‰9¼¡…ä…µ‰¥½ÌÁ•¹‘¥•¹Ñ•Ì¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€½µµ¥Ñ}µ•ÍÍ…”€ôÉ•ÅÕ•ÍÑ}½µµ¥Ñ}µ•ÍÍ…” (€€€€€€€€‰½¹½ÉèÕÁ‘…Ñ”É•Á½Í¥Ñ½Éäˆ°¥Ñ=ÁÑ¥½¹Ì¡µ•ÍÍ…”°å•Ì°QÉÕ”°ÁÕÍ ¤(€€€€¤(€€€¥˜½µµ¥Ñ}µ•ÍÍ…”¥Ì9½¹”è(€€€€€€€Ý…É¹¥¹œ ‰½µµ¥Ð…¹•±…‘¼ì±½Ì…µ‰¥½ÌÁ•Éµ…¹••¸Á•¹‘¥•¹Ñ•Ì¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€½µµ¥Ð€ô•á•ÕÑ”¡±…µ‰‘„è¥Ð¹½µµ¥Ð¡mA…Ñ  ˆ¸ˆ¥t°½µµ¥Ñ}µ•ÍÍ…”¤¤(€€€¥˜½µµ¥Ðè(€€€€€€€ÍÕ•ÍÌ¡˜‰½µµ¥ÐÉ•…‘¼èí½µµ¥Ð¹Í¡…ô€í½µµ¥Ð¹µ•ÍÍ…•ôˆ¤(€€€Í¡½Õ±‘}ÁÕÍ €ôÍ•ÑÑ¥¹Ì¹…ÕÑ½}ÁÕÍ ¥˜ÁÕÍ ¥Ì9½¹”•±Í”ÁÕÍ (€€€¥˜½µµ¥Ð…¹Í¡½Õ±‘}ÁÕÍ è(€€€€€€€•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èÁÕÍ¡}Ý¥Ñ¡}Í•É•Ñ}¡•¬¡¥Ð°Í•ÑÑ¥¹Ì¹É•µ½Ñ”°…ÍÍÕµ•}å•Ìõå•Ì¤°(€€€€€€€€€€€¡¥¹Ðô‰°½µµ¥ÐÍ”½¹Í•ÉÛÌ¸I•¥¹Ñ•¹Ñ„½¸è½¹½ÉÉ•Á¼ÁÕÍ ˆ°(€€€€€€€€¤(()É•Á½}…ÁÀ¹½µµ…¹ ‰ÁÕÍ ˆ¤)‘•˜É•Á½}ÁÕÍ  (€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ°¡•±Àô‰½¹™¥Éµ„…É¡¥Ù½ÌÍ•¹Í¥‰±•ÌÍ¥¸ÁÉ•Õ¹Ñ…È¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰¹Ûµ„±½Ì½µµ¥ÑÌ±½…±•Ì…°É•µ½Ñ¼½¹™¥ÕÉ…‘¼¸ˆˆˆ(€€€¡•…‘¥¹œ ‰AUM ˆ°€‰AÕ‰±¥…¹‘¼½µµ¥ÑÌ‘•°É•Á½Í¥Ñ½É¥¼ˆ¤(€€€¥Ð°Í•ÑÑ¥¹Ì€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„èÁÕÍ¡}Ý¥Ñ¡}Í•É•Ñ}¡•¬¡¥Ð°Í•ÑÑ¥¹Ì¹É•µ½Ñ”°…ÍÍÕµ•}å•Ìõå•Ì¤°(€€€€€€€¡¥¹Ðô‰°¡¥ÍÑ½É¥…°±½…°¹¼™Õ”µ½‘¥™¥…‘¼¸ˆ°(€€€€¤(()É•Á½}…ÁÀ¹½µµ…¹ ‰ÁÕ±°ˆ¤)‘•˜É•Á½}ÁÕ±° ¤€´ø9½¹”è(€€€€ˆˆ‰•Í…É„…µ‰¥½ÌÕÍ…¹‘¼•á±ÕÍ¥Ù…µ•¹Ñ”™…ÍÐµ™½ÉÝ…É¸ˆˆˆ(€€€¡•…‘¥¹œ ‰AU10ˆ°€‰ÑÕ…±¥é…¹‘¼•°É•Á½Í¥Ñ½É¥¼‘”™½Éµ„Í•ÕÉ„ˆ¤(€€€¥Ð°Í•ÑÑ¥¹Ì€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è¥Ð¹ÁÕ±°¡Í•ÑÑ¥¹Ì¹É•µ½Ñ”¤°(€€€€€€€¡¥¹Ðô‰½¹½É¹¼É•…±¥é…Ë„µ•É•Ì¹¤É•‰…Í•Ì…ÕÑ½·…Ñ¥½Ì¸ˆ°(€€€€¤(€€€ÍÕ•ÍÌ ‰I•Á½Í¥Ñ½É¥¼…ÑÕ…±¥é…‘¼µ•‘¥…¹Ñ”™…ÍÐµ™½ÉÝ…É¸ˆ¤(()É•Á½}…ÁÀ¹½µµ…¹ ‰¥¹¥Ðˆ¤)‘•˜É•Á½}¥¹¥Ð ¤€´ø9½¹”è(€€€€ˆˆ‰%¹¥¥…±¥é„¼É•Á…É„±„¥¹Ñ•É…§Í¸¥Ð‘•°É•Á½Í¥Ñ½É¥¼¸ˆˆˆ(€€€¡•…‘¥¹œ ‰%9%%1%iH%Pˆ°€‰AÉ•Á…É…¹‘¼•°É•Á½Í¥Ñ½É¥¼‘”½¹½Éˆ¤(€€€½¹™¥}µ…¹…•È€ô½¹™¥5…¹…•È ¤(€€€½¹™¥œ€ô•á•ÕÑ”¡½¹™¥}µ…¹…•È¹±½…°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€¥˜¹½Ð½¹™¥œ¹¥Ð¹•¹…‰±•è(€€€€€€€½¹™¥œ¹¥Ð¹•¹…‰±•€ôQÉÕ”(€€€€€€€½¹™¥}µ…¹…•È¹Í…Ù”¡½¹™¥œ¤(€€€€€€€Q…É•Ñ5…¹…•È ¤¹Íå¹Œ¡=9=I}QIP¤(€€€¥Ð°Í•ÑÑ¥¹Ì€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€É•…Ñ•€ô•á•ÕÑ”¡±…µ‰‘„è¥Ð¹¥¹¥Ñ¥…±¥é” ¤¤(€€€¥Ð¹•¹ÍÕÉ•}¥Ñ¥¹½É” ¤(€€€¹…µ”°•µ…¥°€ô¥Ð¹¥‘•¹Ñ¥Ñä ¤(€€€¥˜¹½Ð¹…µ”è(€€€€€€€¹…µ”€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰9½µ‰É”Á…É„±½Ì½µµ¥ÑÌèˆ¤(€€€¥˜¹½Ð•µ…¥°è(€€€€€€€•µ…¥°€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰½ÉÉ•¼Á…É„±½Ì½µµ¥ÑÌèˆ¤(€€€¥Ð¹Í•Ñ}¥‘•¹Ñ¥Ñä¡¹…µ”°•µ…¥°¤(€€€¥˜¥Ð¹¡…¹• ¤è(€€€€€€€µ•ÍÍ…”€ôÉ•ÅÕ•ÍÑ}½µµ¥Ñ}µ•ÍÍ…” (€€€€€€€€€€€€‰½¹½Éè¥¹¥Ñ¥…±¥é”É•Á½Í¥Ñ½Éäˆ°¥Ñ=ÁÑ¥½¹Ì¡9½¹”°…±Í”°QÉÕ”°9½¹”¤(€€€€€€€€¤(€€€€€€€¥˜µ•ÍÍ…”è(€€€€€€€€€€€½µµ¥Ð€ô•á•ÕÑ”¡±…µ‰‘„è¥Ð¹½µµ¥Ð¡mA…Ñ  ˆ¸ˆ¥t°µ•ÍÍ…”¤¤(€€€€€€€€€€€¥˜½µµ¥Ðè(€€€€€€€€€€€€€€€ÍÕ•ÍÌ¡˜‰½µµ¥ÐÉ•…‘¼èí½µµ¥Ð¹Í¡…ô€í½µµ¥Ð¹µ•ÍÍ…•ôˆ¤(€€€¥˜¹½Ð¥Ð¹¡…Í}É•µ½Ñ”¡Í•ÑÑ¥¹Ì¹É•µ½Ñ”¤…¹ÍåÌ¹ÍÑ‘¥¸¹¥Í…ÑÑä ¤è(€€€€€€€¥˜ÅÕ•ÍÑ¥½¹…Éä¹½¹™¥É´ ‹
+ýÉ•…È•°É•Á½Í¥Ñ½É¥¼É•µ½Ñ¼•¸¥Ñ!Õˆüˆ°‘•™…Õ±ÐõQÉÕ”¤¹…Í¬ ¤è(€€€€€€€€€€€É•Á½}¹…µ”€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰9½µ‰É”‘•°É•Á½Í¥Ñ½É¥¼‘”¥Ñ!Õˆèˆ°€‰‘½Ñ™¥±•Ìˆ¤(€€€€€€€€€€€Ù¥Í¥‰¥±¥Ñä€ôÅÕ•ÍÑ¥½¹…Éä¹Í•±•Ð (€€€€€€€€€€€€€€€€‰Y¥Í¥‰¥±¥‘…èˆ°¡½¥•Ìõl‰AÉ¥Ù…‘¼ˆ°€‰Cé‰±¥¼‰t°‘•™…Õ±Ðô‰AÉ¥Ù…‘¼ˆ(€€€€€€€€€€€€¤¹…Í¬ ¤(€€€€€€€€€€€•á•ÕÑ”¡±…µ‰‘„è¥Ð¹É•…Ñ•}¥Ñ¡Õ‰}É•Á½Í¥Ñ½Éä¡É•Á½}¹…µ”°ÁÉ¥Ù…Ñ”õÙ¥Í¥‰¥±¥Ñä€„ô€‰Cé‰±¥¼ˆ¤¤(€€€€€€€€€€€¥˜Í•ÑÑ¥¹Ì¹…ÕÑ½}ÁÕÍ è(€€€€€€€€€€€€€€€•á•ÕÑ” (€€€€€€€€€€€€€€€€€€€±…µ‰‘„èÁÕÍ¡}Ý¥Ñ¡}Í•É•Ñ}¡•¬¡¥Ð°Í•ÑÑ¥¹Ì¹É•µ½Ñ”¤°(€€€€€€€€€€€€€€€€€€€¡¥¹Ðô‰°½µµ¥Ð±½…°Í”½¹Í•ÉÛÌ¸I•¥¹Ñ•¹Ñ„½¸è½¹½ÉÉ•Á¼ÁÕÍ ˆ°(€€€€€€€€€€€€€€€€¤(€€€ÍÕ•ÍÌ ‰%¹Ñ•É…§Í¸¥ÐÁÉ•Á…É…‘„¸ˆ¥˜É•…Ñ••±Í”€‰1„¥¹Ñ•É…§Í¸¥Ðå„•ÍÑ…‰„¥¹¥¥…±¥é…‘„¸ˆ¤(()É•µ½Ñ•}…ÁÀ¹…±±‰…¬¡¥¹Ù½­•}Ý¥Ñ¡½ÕÑ}½µµ…¹õQÉÕ”¤)‘•˜É•Á½}É•µ½Ñ”¡ÑàèÑåÁ•È¹½¹Ñ•áÐ¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„•°É•µ½Ñ¼¥Ð½¹™¥ÕÉ…‘¼¸ˆˆˆ(€€€¥˜Ñà¹¥¹Ù½­•‘}ÍÕ‰½µµ…¹¥Ì¹½Ð9½¹”è(€€€€€€€É•ÑÕÉ¸(€€€¥Ð°Í•ÑÑ¥¹Ì€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÕÉ°€ô¥Ð¹É•µ½Ñ•}ÕÉ°¡Í•ÑÑ¥¹Ì¹É•µ½Ñ”¤(€€€‘•Ñ…¥±Ì¡l ‰9½µ‰É”ˆ°Í•ÑÑ¥¹Ì¹É•µ½Ñ”¤°€ ‰UI0ˆ°ÕÉ°½È€‰¹¼½¹™¥ÕÉ…‘¼ˆ¥t°Ñ¥Ñ±”ô‰I•µ½Ñ¼¥Ðˆ¤(()É•µ½Ñ•}…ÁÀ¹½µµ…¹ ‰Í•Ðˆ¤)‘•˜É•Á½}É•µ½Ñ•}Í•Ð¡ÕÉ°èÍÑÈ°¹…µ”èÍÑÈ€ôÑåÁ•È¹=ÁÑ¥½¸ ‰½É¥¥¸ˆ°€ˆ´µ¹…µ”ˆ¤¤€´ø9½¹”è(€€€€ˆˆ‰É•„¼É••µÁ±…é„•°É•µ½Ñ¼½¹™¥ÕÉ…‘¼¸ˆˆˆ(€€€¥Ð°|€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€•á•ÕÑ”¡±…µ‰‘„è¥Ð¹Í•Ñ}É•µ½Ñ”¡ÕÉ°°¹…µ”¤¤(€€€ÍÕ•ÍÌ¡˜‰I•µ½Ñ¼€í¹…µ•ôœ½¹™¥ÕÉ…‘¼èíÕÉ±ôˆ¤(()É•µ½Ñ•}…ÁÀ¹½µµ…¹ ‰É•µ½Ù”ˆ¤)‘•˜É•Á½}É•µ½Ñ•}É•µ½Ù”¡¹…µ”èÍÑÈ€ôÑåÁ•È¹=ÁÑ¥½¸ ‰½É¥¥¸ˆ°€ˆ´µ¹…µ”ˆ¤¤€´ø9½¹”è(€€€€ˆˆ‰±¥µ¥¹„Õ¸É•µ½Ñ¼¥Ð¸ˆˆˆ(€€€¥Ð°|€ô•á•ÕÑ”¡…Ñ¥Ù•}¥Ð°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€•á•ÕÑ”¡±…µ‰‘„è¥Ð¹É•µ½Ù•}É•µ½Ñ”¡¹…µ”¤¤(€€€ÍÕ•ÍÌ¡˜‰I•µ½Ñ¼€í¹…µ•ôœ•±¥µ¥¹…‘¼¸ˆ¤(()…ÁÀ¹½µµ…¹ ‰¥µÁ½ÉÐˆ¤)‘•˜¥µÁ½ÉÑ}Ñ…É•ÑÌ (€€€É•Á±…”è‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µÉ•Á±…”ˆ°¡•±Àô‰I•½¹ÍÑÉÕå”Õ¹„‰…Í”‘”‘…Ñ½ÌÅÕ”å„½¹Ñ¥•¹”Ñ…É•ÑÌ¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰I•½¹ÍÑÉÕå”ME1¥Ñ”ÕÍ…¹‘¼±½ÌÑ…É•ÑÌ‘•±…É…‘½Ì•¸½¹½É¹Ñ½µ°¸ˆˆˆ(€€€¡•…‘¥¹œ ‰%5A=IQH59%%MQ<ˆ°€‰I•½¹ÍÑÉÕå•¹‘¼•°ƒµ¹‘¥”±½…°‘•Í‘”½¹½É¹Ñ½µ°ˆ¤(€€€Ñ…É•ÑÌ€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èµ…¹…•È¡¡•­}µ…¹¥™•ÍÐõ…±Í”¤¹¥µÁ½ÉÑ}µ…¹¥™•ÍÐ¡É•Á±…”õÉ•Á±…”¤°(€€€€€€€¡¥¹Ðô‰UÍ„€´µÉ•Á±…”Á…É„É••µÁ±…é…È•°ƒµ¹‘¥”±½…°…ÑÕ…°¸ˆ°(€€€€¤(€€€™½ÈÑ…É•Ð¥¸Ñ…É•ÑÌè(€€€€€€€½¹Í½±”¹ÁÉ¥¹Ð (€€€€€€€€€€€˜‰m½¹½É¹ÍÕ•ÍÍwŠrMl½tíÑ…É•Ð¹¹…µ•ô€€ˆ(€€€€€€€€€€€˜‰m½¹½É¹µÕÑ•‘wŠHí±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¥ôÉÕÑ„¡Ì¥l½tˆ(€€€€€€€€¤(€€€ÍÕ•ÍÌ¡˜‰M”¥µÁ½ÉÑ…É½¸í±•¸¡Ñ…É•ÑÌ¥ôÑ…É•Ð¡Ì¤¸ˆ°¡¥¹Ðô‰I•ÍÑ…ÕÉ„ÑÕÌ…É¡¥Ù½Ì½¸è½¹½ÉÉ•ÍÑ½É”€´µ…±°ˆ¤(()…ÁÀ¹½µµ…¹ ¤)‘•˜É•µ½Ù” (€€€¹…µ”èÍÑÈ€ôÑåÁ•È¹ÉÕµ•¹Ð ¸¸¸°…ÕÑ½½µÁ±•Ñ¥½¸õ½µÁ±•Ñ•}É•µ½Ù…‰±•}Ñ…É•ÑÌ¤°(€€€­••Á}É•Á½Í¥Ñ½Éäè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ­••ÀµÉ•Á½Í¥Ñ½Éäˆ°¡•±Àô‰½¹Í•ÉÙ„±„½Á¥„‘•°É•Á½Í¥Ñ½É¥¼¸ˆ¤°(€€€µ•ÍÍ…”èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µµ•ÍÍ…”ˆ°€ˆµ´ˆ°¡•±Àô‰5•¹Í…©”‘•°½µµ¥Ð¸ˆ¤°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ°¡•±Àô‰•ÁÑ„•°µ•¹Í…©”ÁÉ•‘•Ñ•Éµ¥¹…‘¼¸ˆ¤°(€€€¹½}½µµ¥Ðè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ¹¼µ½µµ¥Ðˆ°¡•±Àô‰9¼É•„•°½µµ¥Ð…ÕÑ½·…Ñ¥¼¸ˆ¤°(€€€ÁÕÍ è‰½½°ð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÕÍ ¼´µ¹¼µÁÕÍ ˆ°¡•±Àô‰M½‰É•ÍÉ¥‰”…ÕÑ½}ÁÕÍ Á…É„•ÍÑ„½Á•É…§Í¸¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰•©„‘”•ÍÑ¥½¹…ÈÕ¸Ñ…É•ÐÍ¥¸‰½ÉÉ…ÈÍÔ…É¡¥Ù¼±½…°¸ˆˆˆ(€€€¡•…‘¥¹œ ‰1%5%9HQIPˆ°€‰EÕ¥Ñ…¹‘¼Õ¹„½¹™¥ÕÉ…§Í¸‘•°É•¥ÍÑÉ¼‘”½¹½Éˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€Ñ…É•Ð€ô•á•ÕÑ”¡±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹•Ð¡¹…µ”¤°¡¥¹Ðô‰½¹ÍÕ±Ñ„±½Ì¹½µ‰É•Ì‘¥ÍÁ½¹¥‰±•Ì½¸è½¹½É±¥ÍÐˆ¤(€€€•á•ÕÑ”¡±…µ‰‘„èÑ…É•Ñ}µ…¹…•È¹É•µ½Ù”¡¹…µ”°­••Á}É•Á½Í¥Ñ½Éäõ­••Á}É•Á½Í¥Ñ½Éä¤¤(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰Q…É•Ðˆ°¹…µ”¤°(€€€€€€€€€€€€ ‰IÕÑ…Ì±½…±•Ìˆ°˜‰í±•¸¡Ñ…É•Ð¹Á…Ñ¡Ì¥ô½¹Í•ÉÙ…‘„¡Ì¤ˆ¤°(€€€€€€€€€€€€ ‰½Á¥„ˆ°€‰½¹Í•ÉÙ…‘„ˆ¥˜­••Á}É•Á½Í¥Ñ½Éä•±Í”€‰•±¥µ¥¹…‘„ˆ¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰I•ÍÕ±Ñ…‘¼ˆ°(€€€€¤(€€€•á•ÕÑ” (€€€€€€€±…µ‰‘„è™¥¹…±¥é•}¥Ð (€€€€€€€€€€€¥Ñ}Á…Ñ¡Ì ¨  ¤¥˜­••Á}É•Á½Í¥Ñ½Éä•±Í”€¡¹…µ”°¤¤¤°(€€€€€€€€€€€˜‰½¹½ÉèÉ•µ½Ù”í¹…µ•ôˆ°(€€€€€€€€€€€¥Ñ}½µµ…¹‘}½ÁÑ¥½¹Ì¡µ•ÍÍ…”°å•Ì°¹½}½µµ¥Ð°ÁÕÍ ¤°(€€€€€€€€¤°(€€€€€€€¡¥¹Ðô‰1„•±¥µ¥¹…§Í¸Í”½¹Í•ÉÛÌ¸I•Ù¥Í„¥Ð½¸è½¹½ÉÉ•Á¼ÍÑ…ÑÕÌˆ°(€€€€¤(€€€ÍÕ•ÍÌ¡˜‰½¹½É‘•«Ì‘”…‘µ¥¹¥ÍÑÉ…È€í¹…µ•ôœ¸ˆ¤(()‘•˜ÁÉ½™¥±•}ÑÉ•”¡ÁÉ½™¥±•}µ…¹…•ÈèAÉ½™¥±•5…¹…•È°¹…µ”èÍÑÈ°€¨°É½½ÐèQÉ•”ð9½¹”€ô9½¹”¤€´øQÉ•”è(€€€ÁÉ½™¥±”€ôÁÉ½™¥±•}µ…¹…•È¹•Ð¡¹…µ”¤(€€€ÑÉ•”€ôÉ½½Ð½ÈQÉ•”¡˜‰m‰½±€áåuíÁÉ½™¥±”¹¹…µ•õl½tˆ¤(€€€¥˜ÁÉ½™¥±”¹¥¹±Õ‘•Ìè(€€€€€€€¥¹±Õ‘•Ì€ôÑÉ•”¹…‘ ‰m½¹½É¹…•¹Ñu%¹±Õå•l½tˆ¤(€€€€€€€™½È¥¹±Õ‘•¥¸ÁÉ½™¥±”¹¥¹±Õ‘•Ìè(€€€€€€€€€€€‰É…¹ €ô¥¹±Õ‘•Ì¹…‘¡˜‰m‰½±‘uí¥¹±Õ‘•‘õl½tˆ¤(€€€€€€€€€€€ÁÉ½™¥±•}ÑÉ•”¡ÁÉ½™¥±•}µ…¹…•È°¥¹±Õ‘•°É½½Ðõ‰É…¹ ¤(€€€¥˜ÁÉ½™¥±”¹Ñ…É•ÑÌè(€€€€€€€Ñ…É•ÑÌ€ôÑÉ•”¹…‘ ‰m½¹½É¹ÍÕ•ÍÍuQ…É•ÑÍl½tˆ¤(€€€€€€€™½ÈÑ…É•Ð¥¸ÁÉ½™¥±”¹Ñ…É•ÑÌè(€€€€€€€€€€€Ñ…É•ÑÌ¹…‘¡Ñ…É•Ð¤(€€€¥˜ÁÉ½™¥±”¹•á±Õ‘•Ìè(€€€€€€€•á±Õ‘•Ì€ôÑÉ•”¹…‘ ‰m½¹½É¹Ý…É¹¥¹uá±Õå•l½tˆ¤(€€€€€€€™½ÈÑ…É•Ð¥¸ÁÉ½™¥±”¹•á±Õ‘•Ìè(€€€€€€€€€€€•á±Õ‘•Ì¹…‘¡Ñ…É•Ð¤(€€€É•ÑÕÉ¸ÑÉ•”(()‘•˜¡½½Í•}ÁÉ½™¥±•}…Ñ¥Ù…Ñ¥½¸ (€€€ÁÉ½™¥±•}µ…¹…•ÈèAÉ½™¥±•5…¹…•È°€¨°½¹™¥Éµ…Ñ¥½¸èÍÑÈ€ô€‹
+ýÑ¥Ù…È•ÍÑ„½µ‰¥¹…§Í¸üˆ(¤€´øÑ¥Ù…Ñ¥½¸ð9½¹”è(€€€…Ù…¥±…‰±”€ômÁÉ½™¥±”¹¹…µ”™½ÈÁÉ½™¥±”¥¸ÁÉ½™¥±•}µ…¹…•È¹±¥ÍÐ ¥t(€€€¥˜¹½Ð…Ù…¥±…‰±”è(€€€€€€€É…¥Í”Y…±Õ•ÉÉ½È ‰9¼¡…äÁ•É™¥±•ÌìÉ•”Õ¹¼½¸è½¹½ÉÁÉ½™¥±”É•…Ñ”€ñ¹½µ‰É”ø¸ˆ¤(€€€ÁÉ¥µ…Éä€ôÅÕ•ÍÑ¥½¹…Éä¹Í•±•Ð ‰A•É™¥°ÁÉ¥¹¥Á…°èˆ°¡½¥•Ìõ…Ù…¥±…‰±”¤¹…Í¬ ¤(€€€¥˜ÁÉ¥µ…Éä¥Ì9½¹”è(€€€€€€€É…¥Í”-•å‰½…É‘%¹Ñ•ÉÉÕÁÐ(€€€½µÁ±•µ•¹ÑÌ€ôÉ•ÅÕ•ÍÑ}¡•­‰½à (€€€€€€€€‰½µÁ±•µ•¹Ñ½Ìèˆ°(€€€€€€€m¹…µ”™½È¹…µ”¥¸…Ù…¥±…‰±”¥˜¹…µ”€„ôÁÉ¥µ…Éåt°(€€€€¤(€€€½µÁ±•µ•¹ÑÌ€ôÉ•ÅÕ•ÍÑ}½É‘•È¡½µÁ±•µ•¹ÑÌ¤(€€€É•Í½±ÕÑ¥½¸€ôÁÉ½™¥±•}µ…¹…•È¹É•Í½±Ù•}…Ñ¥Ù…Ñ¥½¸¡ÁÉ¥µ…Éä°½µÁ±•µ•¹ÑÌ¤(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰AÉ¥¹¥Á…°ˆ°ÁÉ¥µ…Éä¤°(€€€€€€€€€€€€ ‰½µÁ±•µ•¹Ñ½Ì€¡•¸½É‘•¸¤ˆ°€‰q¸ˆ¹©½¥¸¡½µÁ±•µ•¹ÑÌ¤½È€‹ŠPˆ¤°(€€€€€€€€€€€€ ‰Q…É•ÑÌ•™•Ñ¥Ù½Ìˆ°€‰q¸ˆ¹©½¥¸¡É•Í½±ÕÑ¥½¸¹Ñ…É•Ñ}¹…µ•Ì¤½È€‰Ù…µ¼ˆ¤°(€€€€€€€€€€€€ ‰á±ÕÍ¥½¹•Ì…Á±¥…‘…Ìˆ°€‰q¸ˆ¹©½¥¸¡É•Í½±ÕÑ¥½¸¹…ÁÁ±¥•‘}•á±ÕÍ¥½¹Ì¤½È€‹ŠPˆ¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰Y¥ÍÑ„ÁÉ•Ù¥„ˆ°(€€€€¤(€€€¥˜É•Í½±ÕÑ¥½¸¹Ý…É¹¥¹Ìè(€€€€€€€Ý…É¹¥¹œ ‰‘Ù•ÉÑ•¹¥…Ì‘”É•Í½±Õ§Í¸éq¸´€ˆ€¬€‰q¸´€ˆ¹©½¥¸¡É•Í½±ÕÑ¥½¸¹Ý…É¹¥¹Ì¤¤(€€€¥˜¹½ÐÉ•Í½±ÕÑ¥½¸¹Ñ…É•Ñ}¹…µ•Ìè(€€€€€€€Ý…É¹¥¹œ ‰1„½µ‰¥¹…§Í¸•ÌÛ…±¥‘„°Á•É¼ÍÔÉ•ÍÕ±Ñ…‘¼•ÍÓ„Ù…µ¼¸ˆ¤(€€€¥˜¹½ÐÅÕ•ÍÑ¥½¹…Éä¹½¹™¥É´¡½¹™¥Éµ…Ñ¥½¸°‘•™…Õ±ÐõQÉÕ”¤¹…Í¬ ¤è(€€€€€€€Ý…É¹¥¹œ ‰=Á•É…§Í¸…¹•±…‘„ì¹¼Í”µ½‘¥™¥Ì±„…Ñ¥Ù…§Í¸¸ˆ¤(€€€€€€€É•ÑÕÉ¸9½¹”(€€€É•ÑÕÉ¸É•Í½±ÕÑ¥½¸¹…Ñ¥Ù…Ñ¥½¸(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰É•…Ñ”ˆ¤)‘•˜ÁÉ½™¥±•}É•…Ñ” (€€€¹…µ”èÍÑÈ°(€€€‘•ÍÉ¥ÁÑ¥½¸èÍÑÈ€ôÑåÁ•È¹=ÁÑ¥½¸ ˆˆ°€ˆ´µ‘•ÍÉ¥ÁÑ¥½¸ˆ°€ˆµˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰É•„Õ¸Á•É™¥°Ù…µ¼¸ˆˆˆ(€€€¡•…‘¥¹œ ‰9UY<AI%0ˆ°€‰É•…¹‘¼Õ¹„Í•±•§Í¸É•ÕÑ¥±¥é…‰±”‘”Ñ…É•ÑÌˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€ÁÉ½™¥±”€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹É•…Ñ”¡¹…µ”°‘•ÍÉ¥ÁÑ¥½¸õ‘•ÍÉ¥ÁÑ¥½¸¤¤(€€€•á•ÕÑ”¡±…µ‰‘„èÁ•ÉÍ¥ÍÑ}ÁÉ½™¥±•}µ…¹¥™•ÍÐ¡Ñ…É•Ñ}µ…¹…•È°˜‰½¹½ÉèÉ•…Ñ”ÁÉ½™¥±”íÁÉ½™¥±”¹¹…µ•ôˆ¤¤(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰9½µ‰É”ˆ°ÁÉ½™¥±”¹¹…µ”¤°(€€€€€€€€€€€€ ‰•ÍÉ¥Á§Í¸ˆ°ÁÉ½™¥±”¹‘•ÍÉ¥ÁÑ¥½¸½È€‹ŠPˆ¤°(€€€€€€€€€€€€ ‰Q…É•ÑÌˆ°€ˆÀˆ¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰A•É™¥°É•…‘¼ˆ°(€€€€¤(€€€ÍÕ•ÍÌ¡˜‰M”É—Ì•°Á•É™¥°Ù…µ¼€íÁÉ½™¥±”¹¹…µ•ôœ¸ˆ°¡¥¹Ðõ˜‰“µÑ…±¼½¸è½¹½ÉÁÉ½™¥±”•‘¥ÐíÁÉ½™¥±”¹¹…µ•ôˆ¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰•‘¥Ðˆ¤)‘•˜ÁÉ½™¥±•}•‘¥Ð (€€€¹…µ”èÍÑÈ°(€€€‘•ÍÉ¥ÁÑ¥½¸èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µ‘•ÍÉ¥ÁÑ¥½¸ˆ°€ˆµˆ¤°(€€€¥¹±Õ‘•Ìè±¥ÍÑmÍÑÉtð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µ¥¹±Õ‘”ˆ¤°(€€€Ñ…É•ÑÌè±¥ÍÑmÍÑÉtð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÑ…É•Ðˆ¤°(€€€•á±Õ‘•Ìè±¥ÍÑmÍÑÉtð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µ•á±Õ‘”ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰‘¥Ñ„Ñ½‘„±„½µÁ½Í¥§Í¸‘”Õ¸Á•É™¥°¸ˆˆˆ(€€€¡•…‘¥¹œ ‰%QHAI%0ˆ°€‰5½‘¥™¥…¹‘¼½µÁ½Í¥§Í¸°•á±ÕÍ¥½¹•Ìäµ•Ñ…‘…Ñ½Ìˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€ÕÉÉ•¹Ð€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹•Ð¡¹…µ”¤¤(€€€¥¹Ñ•É…Ñ¥Ù”€ô…±°¡Ù…±Õ”¥Ì9½¹”™½ÈÙ…±Õ”¥¸€¡‘•ÍÉ¥ÁÑ¥½¸°¥¹±Õ‘•Ì°Ñ…É•ÑÌ°•á±Õ‘•Ì¤¤(€€€¥˜¥¹Ñ•É…Ñ¥Ù”è(€€€€€€€‘•ÍÉ¥ÁÑ¥½¸€ôÉ•ÅÕ•ÍÑ}Ñ•áÐ ‰•ÍÉ¥Á§Í¸èˆ°ÕÉÉ•¹Ð¹‘•ÍÉ¥ÁÑ¥½¸¤(€€€€€€€…Ù…¥±…‰±•}ÁÉ½™¥±•Ì€ôm¥Ñ•´¹¹…µ”™½È¥Ñ•´¥¸ÁÉ½™¥±•}µ…¹…•È¹±¥ÍÐ ¤¥˜¥Ñ•´¹¥€„ôÕÉÉ•¹Ð¹¥‘t(€€€€€€€¥¹±Õ‘•Ì€ôÉ•ÅÕ•ÍÑ}¡•­‰½à (€€€€€€€€€€€€‰A•É™¥±•Ì¥¹±Õ¥‘½Ìèˆ°(€€€€€€€€€€€…Ù…¥±…‰±•}ÁÉ½™¥±•Ì°(€€€€€€€€€€€¡•­•õÕÉÉ•¹Ð¹¥¹±Õ‘•Ì°(€€€€€€€€¤(€€€€€€€…Ù…¥±…‰±•}Ñ…É•ÑÌ€ôl(€€€€€€€€€€€Ñ…É•Ð¹¹…µ”™½ÈÑ…É•Ð¥¸Ñ…É•Ñ}µ…¹…•È¹±¥ÍÐ ¤(€€€€€€€€€€€¥˜Ñ…É•Ð¹¹…µ”€„ô=9=I}QIP(€€€€€€€t(€€€€€€€Ñ…É•ÑÌ€ôÉ•ÅÕ•ÍÑ}¡•­‰½à (€€€€€€€€€€€€‰Q…É•ÑÌ‘¥É•Ñ½Ìèˆ°(€€€€€€€€€€€…Ù…¥±…‰±•}Ñ…É•ÑÌ°(€€€€€€€€€€€¡•­•õÕÉÉ•¹Ð¹Ñ…É•ÑÌ°(€€€€€€€€¤(€€€€€€€•á±Õ‘•Ì€ôÉ•ÅÕ•ÍÑ}¡•­‰½à (€€€€€€€€€€€€‰Q…É•ÑÌ•á±Õ¥‘½Ìèˆ°(€€€€€€€€€€€…Ù…¥±…‰±•}Ñ…É•ÑÌ°(€€€€€€€€€€€¡•­•õÕÉÉ•¹Ð¹•á±Õ‘•Ì°(€€€€€€€€¤(€€€€€€€¥˜¹½ÐÅÕ•ÍÑ¥½¹…Éä¹½¹™¥É´ ‹
+ýÕ…É‘…ÈÑ½‘½Ì±½Ì…µ‰¥½Ìüˆ°‘•™…Õ±ÐõQÉÕ”¤¹…Í¬ ¤è(€€€€€€€€€€€Ý…É¹¥¹œ ‰‘¥§Í¸…¹•±…‘„ì¹¼Í”µ½‘¥™¥Ì•°Á•É™¥°¸ˆ¤(€€€€€€€€€€€É•ÑÕÉ¸(€€€ÕÁ‘…Ñ•€ô•á•ÕÑ” (€€€€€€€±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹ÕÁ‘…Ñ” (€€€€€€€€€€€ÕÉÉ•¹Ð¹¹…µ”°(€€€€€€€€€€€‘•ÍÉ¥ÁÑ¥½¸õ‘•ÍÉ¥ÁÑ¥½¸°(€€€€€€€€€€€¥¹±Õ‘•Ìõ¥¹±Õ‘•Ì°(€€€€€€€€€€€Ñ…É•ÑÌõÑ…É•ÑÌ°(€€€€€€€€€€€•á±Õ‘•Ìõ•á±Õ‘•Ì°(€€€€€€€€¤(€€€€¤(€€€•á•ÕÑ”¡±…µ‰‘„èÁ•ÉÍ¥ÍÑ}ÁÉ½™¥±•}µ…¹¥™•ÍÐ¡Ñ…É•Ñ}µ…¹…•È°˜‰½¹½Éè•‘¥ÐÁÉ½™¥±”íÕÁ‘…Ñ•¹¹…µ•ôˆ¤¤(€€€ÍÕ•ÍÌ¡˜‰M”…ÑÕ…±¥ëÌ•°Á•É™¥°€íÕÁ‘…Ñ•¹¹…µ•ôœ¸ˆ¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰É•¹…µ”ˆ¤)‘•˜ÁÉ½™¥±•}É•¹…µ”¡¹…µ”èÍÑÈ°¹•Ý}¹…µ”èÍÑÈ¤€´ø9½¹”è(€€€€ˆˆ‰…µ‰¥„•°¹½µ‰É”Í¥¸É½µÁ•ÈÉ•™•É•¹¥…Ì¸ˆˆˆ(€€€¡•…‘¥¹œ ‰I9=5	IHAI%0ˆ°€‰½¹Í•ÉÙ…¹‘¼É•™•É•¹¥…Ìµ•‘¥…¹Ñ”UU%ˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€É•¹…µ•€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤¹É•¹…µ”¡¹…µ”°¹•Ý}¹…µ”¤¤(€€€•á•ÕÑ”¡±…µ‰‘„èÁ•ÉÍ¥ÍÑ}ÁÉ½™¥±•}µ…¹¥™•ÍÐ¡Ñ…É•Ñ}µ…¹…•È°˜‰½¹½ÉèÉ•¹…µ”ÁÉ½™¥±”í¹…µ•ôÑ¼íÉ•¹…µ•¹¹…µ•ôˆ¤¤(€€€ÍÕ•ÍÌ¡˜‰°Á•É™¥°…¡½É„Í”±±…µ„€íÉ•¹…µ•¹¹…µ•ôœ¸ˆ¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰‘•±•Ñ”ˆ¤)‘•˜ÁÉ½™¥±•}‘•±•Ñ” (€€€¹…µ”èÍÑÈ°(€€€å•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µå•Ìˆ°€ˆµäˆ°¡•±Àô‰±¥µ¥¹„Í¥¸Á•‘¥È½¹™¥Éµ…§Í¸¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰±¥µ¥¹„Õ¸Á•É™¥°ä±¥µÁ¥„ÍÕÌÉ•™•É•¹¥…Ì¸ˆˆˆ(€€€¡•…‘¥¹œ ‰1%5%9HAI%0ˆ°€‰I•Ñ¥É…¹‘¼Õ¹„½µÁ½Í¥§Í¸‘”Ñ…É•ÑÌˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€ÁÉ½™¥±”€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹•Ð¡¹…µ”¤¤(€€€¥˜¹½Ðå•Ì…¹ÍåÌ¹ÍÑ‘¥¸¹¥Í…ÑÑä ¤è(€€€€€€€¥˜¹½ÐÅÕ•ÍÑ¥½¹…Éä¹½¹™¥É´¡˜‹
+ý±¥µ¥¹…È•°Á•É™¥°€íÁÉ½™¥±”¹¹…µ•ôœüˆ°‘•™…Õ±Ðõ…±Í”¤¹…Í¬ ¤è(€€€€€€€€€€€Ý…É¹¥¹œ ‰±¥µ¥¹…§Í¸…¹•±…‘„¸ˆ¤(€€€€€€€€€€€É•ÑÕÉ¸(€€€•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹‘•±•Ñ”¡ÁÉ½™¥±”¹¹…µ”¤¤(€€€•á•ÕÑ”¡±…µ‰‘„èÁ•ÉÍ¥ÍÑ}ÁÉ½™¥±•}µ…¹¥™•ÍÐ¡Ñ…É•Ñ}µ…¹…•È°˜‰½¹½Éè‘•±•Ñ”ÁÉ½™¥±”íÁÉ½™¥±”¹¹…µ•ôˆ¤¤(€€€ÍÕ•ÍÌ¡˜‰M”•±¥µ¥»Ì•°Á•É™¥°€íÁÉ½™¥±”¹¹…µ•ôœäÍÕÌÉ•™•É•¹¥…Ì¸ˆ¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰±¥ÍÐˆ¤)‘•˜ÁÉ½™¥±•}±¥ÍÐ ¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„Á•É™¥±•Ì°½µÁ½Í¥§Í¸ä•ÍÑ…‘¼‘”…Ñ¥Ù…§Í¸¸ˆˆˆ(€€€¡•…‘¥¹œ ‰AI%1Lˆ°€‰½µÁ½Í¥¥½¹•Ì‘¥ÍÁ½¹¥‰±•ÌäÑ…É•ÑÌ•™•Ñ¥Ù½Ìˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€…Ù…¥±…‰±”€ôÁÉ½™¥±•}µ…¹…•È¹±¥ÍÐ ¤(€€€¥˜¹½Ð…Ù…¥±…‰±”è(€€€€€€€Ý…É¹¥¹œ ‰9¼¡…äÁ•É™¥±•Ì‘•™¥¹¥‘½Ì¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€…Ñ¥Ù”€ô•á•ÕÑ”¡ÁÉ½™¥±•}µ…¹…•È¹…Ñ¥Ù…Ñ¥½¸¤(€€€Ñ…‰±”€ôQ…‰±”¡‰½àõ‰½à¹M%5A1}!Yd°•áÁ…¹õQÉÕ”¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰9½µ‰É”ˆ°ÍÑå±”ô‰‰½±€ŒàáÁÀˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰•ÍÉ¥Á§Í¸ˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰½µÁ½Í¥§Í¸ˆ°ÍÑå±”ô‰½¹½É¹µÕÑ•ˆ¤(€€€Ñ…‰±”¹…‘‘}½±Õµ¸ ‰ÍÑ…‘¼ˆ°¹½}ÝÉ…ÀõQÉÕ”¤(€€€™½ÈÁÉ½™¥±”¥¸…Ù…¥±…‰±”è(€€€€€€€ÍÑ…Ñ”€ô€‹ŠPˆ(€€€€€€€¥˜…Ñ¥Ù”…¹ÁÉ½™¥±”¹¹…µ”€ôô…Ñ¥Ù”¹ÁÉ¥µ…Éäè(€€€€€€€€€€€ÍÑ…Ñ”€ô€‰m½¹½É¹ÍÕ•ÍÍuAÉ¥¹¥Á…±l½tˆ(€€€€€€€•±¥˜…Ñ¥Ù”…¹ÁÉ½™¥±”¹¹…µ”¥¸…Ñ¥Ù”¹½µÁ±•µ•¹ÑÌè(€€€€€€€€€€€Á½Í¥Ñ¥½¸€ô…Ñ¥Ù”¹½µÁ±•µ•¹ÑÌ¹¥¹‘•à¡ÁÉ½™¥±”¹¹…µ”¤€¬€Ä(€€€€€€€€€€€ÍÑ…Ñ”€ô˜‰m½¹½É¹…•¹Ñu½µÁ±•µ•¹Ñ¼íÁ½Í¥Ñ¥½¹õl½tˆ(€€€€€€€½µÁ½Í¥Ñ¥½¸€ô€ (€€€€€€€€€€€˜‰í±•¸¡ÁÉ½™¥±”¹¥¹±Õ‘•Ì¥ô¥¹±Õ¥‘½Ìƒ
+Üí±•¸¡ÁÉ½™¥±”¹Ñ…É•ÑÌ¥ôÑ…É•ÑÌƒ
+Ü€ˆ(€€€€€€€€€€€˜‰í±•¸¡ÁÉ½™¥±”¹•á±Õ‘•Ì¥ô•á±ÕÍ¥½¹•Ìˆ(€€€€€€€€¤(€€€€€€€Ñ…‰±”¹…‘‘}É½Ü¡ÁÉ½™¥±”¹¹…µ”°ÁÉ½™¥±”¹‘•ÍÉ¥ÁÑ¥½¸½È€‹ŠPˆ°½µÁ½Í¥Ñ¥½¸°ÍÑ…Ñ”¤(€€€½¹Í½±”¹ÁÉ¥¹Ð¡Ñ…‰±”¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰Í¡½Üˆ¤)‘•˜ÁÉ½™¥±•}Í¡½Ü¡¹…µ”èÍÑÈ¤€´ø9½¹”è(€€€€ˆˆ‰5Õ•ÍÑÉ„•°‘•Ñ…±±”‘”Õ¸Á•É™¥°¸ˆˆˆ(€€€¡•…‘¥¹œ ‰Q110AI%0ˆ°€‰½µÁ½Í¥§Í¸‘¥É•Ñ„äÉ•ÍÕ±Ñ…‘¼•áÁ…¹‘¥‘¼ˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€ÁÉ½™¥±”€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹•Ð¡¹…µ”¤¤(€€€‘•Ñ…¥±Ì (€€€€€€€l(€€€€€€€€€€€€ ‰UU%ˆ°ÁÉ½™¥±”¹¥¤°(€€€€€€€€€€€€ ‰9½µ‰É”ˆ°ÁÉ½™¥±”¹¹…µ”¤°(€€€€€€€€€€€€ ‰•ÍÉ¥Á§Í¸ˆ°ÁÉ½™¥±”¹‘•ÍÉ¥ÁÑ¥½¸½È€‹ŠPˆ¤°(€€€€€€€t°(€€€€€€€Ñ¥Ñ±”ô‰A•É™¥°ˆ°(€€€€¤(€€€½¹Í½±”¹ÁÉ¥¹Ð¡ÁÉ½™¥±•}ÑÉ•”¡ÁÉ½™¥±•}µ…¹…•È°ÁÉ½™¥±”¹¹…µ”¤¤(€€€É•Í½±ÕÑ¥½¸€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹É•Í½±Ù”¡ÁÉ½™¥±”¹¹…µ”¤¤(€€€‘•Ñ…¥±Ì (€€€€€€€l ‰Q…É•ÑÌ•™•Ñ¥Ù½Ìˆ°€‰q¸ˆ¹©½¥¸¡É•Í½±ÕÑ¥½¸¹Ñ…É•Ñ}¹…µ•Ì¤½È€‰Ù…µ¼ˆ¥t°(€€€€€€€Ñ¥Ñ±”ô‰I•ÍÕ±Ñ…‘¼•áÁ…¹‘¥‘¼ˆ°(€€€€¤(€€€™½Èµ•ÍÍ…”¥¸É•Í½±ÕÑ¥½¸¹Ý…É¹¥¹Ìè(€€€€€€€Ý…É¹¥¹œ¡µ•ÍÍ…”¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰…Ñ¥Ù…Ñ”ˆ¤)‘•˜ÁÉ½™¥±•}…Ñ¥Ù…Ñ” (€€€ÁÉ¥µ…ÉäèÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÉ¥µ…Éäˆ°¡•±Àô‰A•É™¥°ÁÉ¥¹¥Á…°¸ˆ¤°(€€€½µÁ±•µ•¹ÑÌè±¥ÍÑmÍÑÉtð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÝ¥Ñ ˆ°¡•±Àô‰½µÁ±•µ•¹Ñ¼ìÁÕ•‘”É•Á•Ñ¥ÉÍ”¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰Ñ¥Ù„Õ¸Á•É™¥°ÁÉ¥¹¥Á…°ä½µÁ±•µ•¹Ñ½Ì½É‘•¹…‘½Ì¸ˆˆˆ(€€€¡•…‘¥¹œ ‰Q%YHAI%1Lˆ°€‰M•±•¥½¹…¹‘¼±½ÌÑ…É•ÑÌ•™•Ñ¥Ù½Ì‘”•ÍÑ”•ÅÕ¥Á¼ˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€¥˜ÁÉ¥µ…Éä¥Ì9½¹”è(€€€€€€€¡½Í•¸€ô•á•ÕÑ”¡±…µ‰‘„è¡½½Í•}ÁÉ½™¥±•}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤¤(€€€€€€€¥˜¡½Í•¸¥Ì9½¹”è(€€€€€€€€€€€É•ÑÕÉ¸(€€€€€€€…Ñ¥Ù…Ñ¥½¸€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹…Ñ¥Ù…Ñ”¡¡½Í•¸¹ÁÉ¥µ…Éä°¡½Í•¸¹½µÁ±•µ•¹ÑÌ¤(€€€€€€€€¤(€€€•±Í”è(€€€€€€€…Ñ¥Ù…Ñ¥½¸€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹…Ñ¥Ù…Ñ”¡ÁÉ¥µ…Éä°½µÁ±•µ•¹ÑÌ¤¤(€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€É•Í½±ÕÑ¥½¸€ô•á•ÕÑ”¡ÁÉ½™¥±•}µ…¹…•È¹É•Í½±Ù•}…Ñ¥Ù”¤(€€€¥˜É•Í½±ÕÑ¥½¸…¹¹½ÐÉ•Í½±ÕÑ¥½¸¹Ñ…É•Ñ}¹…µ•Ìè(€€€€€€€Ý…É¹¥¹œ ‰1„…Ñ¥Ù…§Í¸•ÌÛ…±¥‘„°Á•É¼ÍÔÉ•ÍÕ±Ñ…‘¼•ÍÓ„Ù…µ¼¸ˆ¤(€€€ÍÕ•ÍÌ¡˜‰M”…Ñ¥ÛÌ•°Á•É™¥°ÁÉ¥¹¥Á…°€í…Ñ¥Ù…Ñ¥½¸¹ÁÉ¥µ…Éåôœ¸ˆ¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰‘•…Ñ¥Ù…Ñ”ˆ¤)‘•˜ÁÉ½™¥±•}‘•…Ñ¥Ù…Ñ” (€€€¹…µ”èÍÑÈð9½¹”€ôÑåÁ•È¹ÉÕµ•¹Ð¡9½¹”¤°(€€€…±±}ÁÉ½™¥±•Ìè‰½½°€ôÑåÁ•È¹=ÁÑ¥½¸¡…±Í”°€ˆ´µ…±°ˆ°¡•±Àô‰•Í…Ñ¥Ù„±„Í•±•§Í¸½µÁ±•Ñ„¸ˆ¤°(€€€É•Á±…•}Ý¥Ñ èÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÉ•Á±…”µÝ¥Ñ ˆ°¡•±Àô‰9Õ•Ù¼Á•É™¥°ÁÉ¥¹¥Á…°¸ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰•Í…Ñ¥Ù„Õ¸Á•É™¥°¼ÙÕ•±Ù”…°µ½‘¼±½‰…°¸ˆˆˆ(€€€¡•…‘¥¹œ ‰MQ%YHAI%1Lˆ°€‰ÑÕ…±¥é…¹‘¼±„Í•±•§Í¸±½…°ˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤¤(€€€¥˜…±±}ÁÉ½™¥±•Ìè(€€€€€€€¥˜¹…µ”¥Ì¹½Ð9½¹”è(€€€€€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È ‰9¼½µ‰¥¹”Õ¸¹½µ‰É”½¸€´µ…±°¸ˆ¤¤¤(€€€€€€€ÁÉ½™¥±•}µ…¹…•È¹‘•…Ñ¥Ù…Ñ•}…±° ¤(€€€€€€€ÍÕ•ÍÌ ‰M”‘•Í…Ñ¥Ù…É½¸Ñ½‘½Ì±½ÌÁ•É™¥±•Ìì½¹½ÉÕÍ…Ë„Ñ½‘½Ì±½ÌÑ…É•ÑÌ¸ˆ¤(€€€€€€€É•ÑÕÉ¸(€€€¥˜¹…µ”¥Ì9½¹”è(€€€€€€€•á•ÕÑ”¡±…µ‰‘„è€¡|™½È|¥¸€ ¤¤¹Ñ¡É½Ü¡Y…±Õ•ÉÉ½È ‰%¹‘¥ÅÕ”Õ¸Á•É™¥°¼ÕÍ”€´µ…±°¸ˆ¤¤¤(€€€…Ñ¥Ù”€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹‘•…Ñ¥Ù…Ñ”¡¹…µ”°É•Á±…•}Ý¥Ñ õÉ•Á±…•}Ý¥Ñ ¤¤(€€€¥˜…Ñ¥Ù”è(€€€€€€€É•¹‘•É}…Ñ¥Ù…Ñ¥½¸¡ÁÉ½™¥±•}µ…¹…•È¤(€€€ÍÕ•ÍÌ¡˜‰M”‘•Í…Ñ¥ÛÌ•°Á•É™¥°€í¹…µ•ôœ¸ˆ¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰ÍÕ•ÍÐˆ¤)‘•˜ÁÉ½™¥±•}ÍÕ•ÍÐ (€€€ÁÉ¥µ…ÉäèÍÑÈð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÁÉ¥µ…Éäˆ¤°(€€€½µÁ±•µ•¹ÑÌè±¥ÍÑmÍÑÉtð9½¹”€ôÑåÁ•È¹=ÁÑ¥½¸¡9½¹”°€ˆ´µÝ¥Ñ ˆ¤°(¤€´ø9½¹”è(€€€€ˆˆ‰Õ…É‘„•¸•°µ…¹¥™¥•ÍÑ¼Õ¹„…Ñ¥Ù…§Í¸É•½µ•¹‘…‘„¸ˆˆˆ(€€€¡•…‘¥¹œ ‰MUI%HQ%Y'M8ˆ°€‰•™¥¹¥•¹‘¼±„½µ‰¥¹…§Í¸É•½µ•¹‘…‘„Á…É„½ÑÉ½Ì•ÅÕ¥Á½Ìˆ¤(€€€Ñ…É•Ñ}µ…¹…•È€ô•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡Ñ…É•Ñ}µ…¹…•È¤(€€€¥˜ÁÉ¥µ…Éä¥Ì9½¹”è(€€€€€€€¡½Í•¸€ô•á•ÕÑ” (€€€€€€€€€€€±…µ‰‘„è¡½½Í•}ÁÉ½™¥±•}…Ñ¥Ù…Ñ¥½¸ (€€€€€€€€€€€€€€€ÁÉ½™¥±•}µ…¹…•È°½¹™¥Éµ…Ñ¥½¸ô‹
+ýÕ…É‘…È•ÍÑ„½µ‰¥¹…§Í¸½µ¼ÍÕ•É•¹¥„üˆ(€€€€€€€€€€€€¤(€€€€€€€€¤(€€€€€€€¥˜¡½Í•¸¥Ì9½¹”è(€€€€€€€€€€€É•ÑÕÉ¸(€€€€€€€…Ñ¥Ù…Ñ¥½¸€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹ÍÕ•ÍÐ¡¡½Í•¸¹ÁÉ¥µ…Éä°¡½Í•¸¹½µÁ±•µ•¹ÑÌ¤¤(€€€•±Í”è(€€€€€€€…Ñ¥Ù…Ñ¥½¸€ô•á•ÕÑ”¡±…µ‰‘„èÁÉ½™¥±•}µ…¹…•È¹ÍÕ•ÍÐ¡ÁÉ¥µ…Éä°½µÁ±•µ•¹ÑÌ¤¤(€€€•á•ÕÑ”¡±…µ‰‘„èÁ•ÉÍ¥ÍÑ}ÁÉ½™¥±•}µ…¹¥™•ÍÐ¡Ñ…É•Ñ}µ…¹…•È°€‰½¹½ÉèÕÁ‘…Ñ”ÍÕ•ÍÑ•ÁÉ½™¥±•Ìˆ¤¤(€€€ÍÕ•ÍÌ (€€€€€€€˜‰M”ÍÕ¥É§Ì€í…Ñ¥Ù…Ñ¥½¸¹ÁÉ¥µ…Éåôœˆ(€€€€€€€€¬€¡˜ˆ½¸ìœ°€œ¹©½¥¸¡…Ñ¥Ù…Ñ¥½¸¹½µÁ±•µ•¹ÑÌ¥ô¸ˆ¥˜…Ñ¥Ù…Ñ¥½¸¹½µÁ±•µ•¹ÑÌ•±Í”€ˆ¸ˆ¤(€€€€¤(()ÁÉ½™¥±•}…ÁÀ¹½µµ…¹ ‰Ù…±¥‘…Ñ”ˆ¤)‘•˜ÁÉ½™¥±•}Ù…±¥‘…Ñ” ¤€´ø9½¹”è(€€€€ˆˆ‰½µÁÉÕ•‰„É•™•É•¹¥…Ì°¥±½Ìä±„…Ñ¥Ù…§Í¸…ÑÕ…°¸ˆˆˆ(€€€¡•…‘¥¹œ ‰Y1%HAI%1Lˆ°€‰½µÁÉ½‰…¹‘¼½µÁ½Í¥§Í¸”¥¹Ñ•É¥‘…ˆ¤(€€€ÁÉ½™¥±•}µ…¹…•È€ôÁÉ½™¥±•Ì¡•á•ÕÑ”¡µ…¹…•È°¡¥¹Ðô‰©•ÕÑ„ÁÉ¥µ•É¼è½¹½É¥¹¥Ðˆ¤¤(€€€Ý…É¹¥¹Ì€ô•á•ÕÑ”¡ÁÉ½™¥±•}µ…¹…•È¹Ù…±¥‘…Ñ”¤(€€€¥˜Ý…É¹¥¹Ìè(€€€€€€€™½Èµ•ÍÍ…”¥¸Ý…É¹¥¹Ìè(€€€€€€€€€€€Ý…É¹¥¹œ¡µ•ÍÍ…”¤(€€€€€€€ÍÕ•ÍÌ ‰1½ÌÁ•É™¥±•ÌÍ½¸Û…±¥‘½Ì½¸…‘Ù•ÉÑ•¹¥…Ì¸ˆ¤(€€€•±Í”è(€€€€€€€ÍÕ•ÍÌ ‰Q½‘½Ì±½ÌÁ•É™¥±•Ìä±„…Ñ¥Ù…§Í¸Í½¸Û…±¥‘½Ì¸ˆ¤(

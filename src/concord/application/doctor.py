@@ -322,7 +322,7 @@ class Doctor:
                     self._add(
                         checks, "Perfiles", "Esquema SQLite", "failure",
                         "La base de datos todavía no contiene las tablas de perfiles.",
-                        "Ejecuta cualquier comando de Concord 2.3.0 para actualizarla."
+                        "Ejecuta cualquier comando de Concord 2.3.1 para actualizarla."
                     )
                     return
                 rows = connection.execute("SELECT id, name FROM profiles").fetchall()

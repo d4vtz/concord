@@ -9,7 +9,7 @@ from concord.application.database import Database
 from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
-from concord.cli.app import app, request_checkbox
+from concord.cli.app import app, request_checkbox, request_order
 
 
 @pytest.fixture
@@ -40,14 +40,15 @@ def profile_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_profiles_are_normalized_and_exported(profile_environment):
     targets, profiles, add_target = profile_environment
     bash = add_target("bash")
-    profile = profiles.create("LiNuX", description="Linux desktop", tags=["Desktop", "DESKTOP"])
+    profile = profiles.create("LiNuX", description="Linux desktop")
     profiles.update("linux", targets=["bash"])
 
     config = ConfigManager().load()
 
     assert profile.name == "linux"
-    assert profiles.get("LINUX").tags == ["desktop"]
-    assert config.minimum_concord_version == "2.3.0"
+    assert profiles.get("LINUX").description == "Linux desktop"
+    assert config.minimum_concord_version == "2.3.1"
+    assert "tags" not in concord.config_file.read_text()
     assert config.profiles[0].targets[0].id == bash.id
     assert next(target for target in config.targets if target.name == "bash").id == bash.id
 
@@ -244,3 +245,25 @@ def test_empty_interactive_checkbox_returns_empty_selection(monkeypatch):
     monkeypatch.setattr("concord.cli.app.questionary.checkbox", unexpected_checkbox)
 
     assert request_checkbox("Sin opciones:", []) == []
+
+
+def test_complements_can_be_ordered_interactively(monkeypatch):
+    answers = iter(["third", "first"])
+
+    class Prompt:
+        def ask(self):
+            return next(answers)
+
+    monkeypatch.setattr("concord.cli.app.questionary.select", lambda *args, **kwargs: Prompt())
+
+    assert request_order(["first", "second", "third"]) == ["third", "first", "second"]
+
+
+def test_internal_concord_target_cannot_be_assigned_to_a_profile(profile_environment):
+    _, profiles, _ = profile_environment
+    profiles.create("base")
+
+    with pytest.raises(ValueError, match="interno 'concord'"):
+        profiles.update("base", targets=["concord"])
+
+    assert profiles.get("base").targets == []
