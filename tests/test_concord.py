@@ -988,6 +988,11 @@ def test_doctor_file_comparison_uses_metadata_fast_path(tmp_path, monkeypatch):
         "concord.application.doctor.filecmp.cmp",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deep comparison")),
     )
+    monkeypatch.setattr(
+        Path,
+        "rglob",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Path.rglob")),
+    )
 
     assert Doctor()._paths_equal(left, right)
 
