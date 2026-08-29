@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 
 from concord import application as concord
 from concord.application.config import CONCORD_TARGET, Config, ConfigManager
@@ -20,8 +21,15 @@ class DoctorCheck:
 
 
 @dataclass(frozen=True)
+class DoctorTiming:
+    name: str
+    seconds: float
+
+
+@dataclass(frozen=True)
 class DoctorReport:
     checks: list[DoctorCheck]
+    timings: list[DoctorTiming]
 
     @property
     def failures(self) -> int:
@@ -39,6 +47,10 @@ class DoctorReport:
     def healthy(self) -> bool:
         return self.failures == 0
 
+    @property
+    def elapsed(self) -> float:
+        return sum(timing.seconds for timing in self.timings)
+
 
 class Doctor:
     def __init__(self, config_manager: ConfigManager | None = None) -> None:
@@ -46,14 +58,26 @@ class Doctor:
 
     def run(self, *, fetch: bool = False) -> DoctorReport:
         checks: list[DoctorCheck] = []
-        config = self._configuration_checks(checks)
+        timings: list[DoctorTiming] = []
+        config = self._timed(
+            timings,
+            "Configuración",
+            lambda: self._configuration_checks(checks),
+        )
         if config is None:
-            return DoctorReport(checks)
-        self._database_checks(config, checks)
-        self._profile_checks(config, checks)
-        self._target_checks(config, checks)
-        self._git_checks(config, checks, fetch=fetch)
-        return DoctorReport(checks)
+            return DoctorReport(checks, timings)
+        self._timed(timings, "SQLite", lambda: self._database_checks(config, checks))
+        self._timed(timings, "Perfiles", lambda: self._profile_checks(config, checks))
+        self._timed(timings, "Targets", lambda: self._target_checks(config, checks))
+        self._timed(timings, "Git", lambda: self._git_checks(config, checks, fetch=fetch))
+        return DoctorReport(checks, timings)
+
+    def _timed(self, timings: list[DoctorTiming], name: str, operation):
+        started = perf_counter()
+        try:
+            return operation()
+        finally:
+            timings.append(DoctorTiming(name, perf_counter() - started))
 
     def _add(
         self,

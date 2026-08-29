@@ -758,6 +758,11 @@ def render_git_status(git_status) -> None:
 def doctor(
     fetch: bool = typer.Option(False, "--fetch", help="Comprueba también el estado remoto."),
     strict: bool = typer.Option(False, "--strict", help="Trata las advertencias como errores."),
+    timings: bool = typer.Option(
+        False,
+        "--timings",
+        help="Muestra el tiempo empleado por cada bloque del diagnóstico.",
+    ),
 ) -> None:
     """Diagnostica la instalación de Concord sin modificarla."""
     heading("DIAGNÓSTICO", "Comprobando que Concord está listo para trabajar")
@@ -793,6 +798,14 @@ def doctor(
         ],
         title="Resumen del diagnóstico",
     )
+    if timings:
+        details(
+            [
+                *((timing.name, f"{timing.seconds:.3f} s") for timing in report.timings),
+                ("Total", f"{report.elapsed:.3f} s"),
+            ],
+            title="Tiempos",
+        )
     if report.failures:
         warning("Concord necesita correcciones antes de probar el flujo completo.")
         raise typer.Exit(1)

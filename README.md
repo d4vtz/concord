@@ -409,6 +409,15 @@ informativas, salvo que se utilice el modo estricto:
 concord doctor --strict
 ```
 
+Para medir qué bloques consumen más tiempo sin alterar el diagnóstico:
+
+```bash
+concord doctor --timings
+```
+
+La salida desglosa Configuración, SQLite, Perfiles, Targets y Git, además del
+tiempo total. La medición usa un reloj monotónico y no modifica archivos.
+
 ## Implementaciones pendientes
 
 ### Cifrado de archivos sensibles

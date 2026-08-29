@@ -966,6 +966,8 @@ def test_doctor_reports_uninitialized_installation_without_creating_files(tmp_pa
 
     assert report.failures == 1
     assert report.checks[0].name == "Configuración"
+    assert [timing.name for timing in report.timings] == ["Configuración"]
+    assert report.elapsed >= 0
     assert not (home / ".config/concord").exists()
     assert not (home / ".local/share/concord").exists()
 
@@ -1044,11 +1046,17 @@ def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch
 
     result = CliRunner().invoke(app, ["doctor"])
     strict = CliRunner().invoke(app, ["doctor", "--strict"])
+    timed = CliRunner().invoke(app, ["doctor", "--timings"])
 
     assert result.exit_code == 0
     assert "Resumen del diagnóstico" in result.output
+    assert "Tiempos" not in result.output
     assert "Concord funciona" in result.output
     assert strict.exit_code == 1
+    assert timed.exit_code == 0
+    assert "Tiempos" in timed.output
+    assert "Targets" in timed.output
+    assert "Total" in timed.output
 
 
 def test_pkgbuild_matches_project_metadata():
