@@ -6,6 +6,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from concord import application as concord
+from concord.application.comparison import paths_equal
 from concord.application.config import (CONCORD_TARGET, ConfigManager,
                                         TargetConfig, TargetPathConfig)
 from concord.application.database import Database
@@ -493,7 +494,7 @@ class TargetManager:
             return "missing"
         if not os.path.lexists(copy):
             return "untracked"
-        return "clean" if self._path_diff(target, path).clean else "modified"
+        return "clean" if paths_equal(path.local_path, copy) else "modified"
 
     def status(self) -> list[TargetStatus]:
         priority = {"clean": 0, "modified": 1, "untracked": 2, "missing": 3}

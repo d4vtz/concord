@@ -273,6 +273,10 @@ eliminarse.
 rutas. El estado general usa esta prioridad: falta local, falta copia,
 modificado y limpio.
 
+Para responder rápidamente, `status` compara primero estructura, tamaño y
+`mtime_ns`, y lee únicamente archivos candidatos a haber cambiado. `diff`
+mantiene la comparación profunda necesaria para enumerar cambios concretos.
+
 `sync` y `restore` validan todas las rutas antes de escribir. Al operar sobre
 todos los targets, un fallo impide modificar cualquiera. `restore` sin
 `--force` aborta si existe al menos uno de los destinos; con `--force` reemplaza

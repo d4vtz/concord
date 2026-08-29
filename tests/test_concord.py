@@ -190,6 +190,23 @@ def test_status_counts_changed_paths_and_prioritizes_missing(manager):
     assert (status.changed_paths, status.total_paths) == (2, 2)
 
 
+def test_status_does_not_build_a_deep_diff_for_clean_targets(manager, monkeypatch):
+    instance, home, _ = manager
+    source = home / ".config/example"
+    source.mkdir(parents=True)
+    (source / "settings.conf").write_text("unchanged")
+    instance.add(source, "example")
+    monkeypatch.setattr(
+        instance,
+        "_path_diff",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deep diff")),
+    )
+
+    status = next(item for item in instance.status() if item.name == "example")
+
+    assert status.state == "clean"
+
+
 def test_list_groups_relative_paths_and_status_hides_path_counts(manager, monkeypatch):
     instance, home, _ = manager
     first = home / ".zshenv"
@@ -986,7 +1003,7 @@ def test_doctor_file_comparison_uses_metadata_fast_path(tmp_path, monkeypatch):
     os.utime(left_file, ns=(timestamp, timestamp))
     os.utime(right_file, ns=(timestamp, timestamp))
     monkeypatch.setattr(
-        "concord.application.doctor.filecmp.cmp",
+        "concord.application.comparison.filecmp.cmp",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("deep comparison")),
     )
     monkeypatch.setattr(
