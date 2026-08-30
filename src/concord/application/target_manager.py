@@ -377,6 +377,7 @@ class TargetManager:
         for target, path, source in pairs:
             if not os.path.lexists(source):
                 raise FileNotFoundError(f"No existe la copia de '{path.local_path}' en '{target.name}'.")
+        for _, path, _ in pairs:
             if os.path.lexists(path.local_path) and not force:
                 raise FileExistsError(f"'{path.local_path}' ya existe; use --force para reemplazar todo el target.")
         staged = []
@@ -434,6 +435,16 @@ class TargetManager:
     def restore_all(self, *, force: bool = False) -> list[Target]:
         targets = [target for target in self.selected() if target.name != CONCORD_TARGET]
         return self._restore_targets(targets, force=force)
+
+    def restore_conflicts(self) -> list[Path]:
+        """Devuelve las rutas seleccionadas que ya existen en HOME."""
+        targets = [target for target in self.selected() if target.name != CONCORD_TARGET]
+        return [
+            path.local_path
+            for target in targets
+            for path in target.paths
+            if os.path.lexists(path.local_path)
+        ]
 
     def remove(self, name: str, *, keep_repository: bool = False) -> None:
         if name == CONCORD_TARGET:

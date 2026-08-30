@@ -351,6 +351,79 @@ def test_repository_bootstraps_a_new_home(tmp_path, monkeypatch):
     assert imported.updated_at == original.updated_at
 
 
+def test_restore_conflicts_reports_existing_selected_paths(manager):
+    instance, home, _ = manager
+    first = home / ".bashrc"
+    second = home / ".config/nvim"
+    first.write_text("alias ll='ls -la'\n")
+    second.mkdir(parents=True)
+    instance.add(first, "bash")
+    instance.add(second, "nvim")
+    first.unlink()
+
+    assert instance.restore_conflicts() == [second]
+
+
+def test_bootstrap_force_replaces_existing_local_files(tmp_path, monkeypatch):
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    source_home.mkdir()
+    destination_home.mkdir()
+    source_repository = tmp_path / "source-repository"
+
+    configure_environment(source_home, monkeypatch)
+    Initializer().initialize(
+        source_repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    source = source_home / ".bashrc"
+    source.write_text("from repository\n")
+    TargetManager().add(source, "bash")
+    GitManager(source_repository).commit([Path(".")], "bash: add target")
+
+    configure_environment(destination_home, monkeypatch)
+    local = destination_home / ".bashrc"
+    local.write_text("local configuration\n")
+    result = CliRunner().invoke(
+        app,
+        ["bootstrap", str(source_repository), "--restore", "--force"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert local.read_text() == "from repository\n"
+    assert "Se restauraron 1 target(s)" in result.output
+
+
+def test_bootstrap_noninteractive_conflicts_require_force(tmp_path, monkeypatch):
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    source_home.mkdir()
+    destination_home.mkdir()
+    source_repository = tmp_path / "source-repository"
+
+    configure_environment(source_home, monkeypatch)
+    Initializer().initialize(
+        source_repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    source = source_home / ".bashrc"
+    source.write_text("from repository\n")
+    TargetManager().add(source, "bash")
+    GitManager(source_repository).commit([Path(".")], "bash: add target")
+
+    configure_environment(destination_home, monkeypatch)
+    local = destination_home / ".bashrc"
+    local.write_text("local configuration\n")
+    result = CliRunner().invoke(
+        app,
+        ["bootstrap", str(source_repository), "--restore"],
+    )
+
+    assert result.exit_code == 1
+    assert local.read_text() == "local configuration\n"
+    assert "--restore --force" in result.output
+
+
 def test_sync_updates_last_modification_without_changing_creation(manager):
     instance, home, _ = manager
     source = home / ".bashrc"

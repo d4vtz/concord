@@ -619,6 +619,20 @@ concord bootstrap https://github.com/usuario/dotfiles.git --restore
 concord bootstrap https://github.com/usuario/dotfiles.git --no-restore
 ```
 
+Si existen configuraciones locales, `bootstrap` muestra las rutas afectadas y
+pregunta si deben reemplazarse con las copias del repositorio. Rechazar la
+confirmación conserva HOME sin cambios y deja Concord importado para restaurar
+más tarde. En ejecuciones no interactivas, el reemplazo debe autorizarse de
+forma explícita:
+
+```bash
+concord bootstrap https://github.com/usuario/dotfiles.git --restore --force
+```
+
+`--force` solo resuelve conflictos en HOME. Si falta la copia de un target en
+el repositorio, debe sincronizarse desde el equipo original o eliminarse del
+manifiesto.
+
 ## Reiniciar Concord
 
 Para eliminar la configuración, SQLite, respaldos y repositorio local de

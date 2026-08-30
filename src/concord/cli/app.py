@@ -1006,9 +1006,21 @@ def bootstrap(
         "--restore/--no-restore",
         help="Restaura todos los targets después de importar el manifiesto.",
     ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        "-f",
+        help="Reemplaza rutas locales existentes al restaurar.",
+    ),
 ) -> None:
     """Reconstruye Concord desde un repositorio remoto existente."""
     heading("BOOTSTRAP", "Recuperando Concord desde un repositorio remoto")
+    if force and restore_files is False:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("--force no puede combinarse con --no-restore.")
+            )
+        )
     if concord.is_initialized():
         execute(lambda: (_ for _ in ()).throw(ValueError("Concord ya está inicializado.")))
     if not GitManager.available():
@@ -1036,15 +1048,49 @@ def bootstrap(
     )
     config.repository_path = destination
     config_manager.save(config)
-    targets = execute(lambda: TargetManager().import_manifest(replace=True))
+    target_manager = TargetManager()
+    targets = execute(lambda: target_manager.import_manifest(replace=True))
     success(f"Se importaron {len(targets)} target(s) desde el manifiesto.")
     should_restore = restore_files
     if should_restore is None and sys.stdin.isatty():
         should_restore = bool(questionary.confirm("¿Restaurar ahora todos los targets?", default=True).ask())
     if should_restore:
+        restore_force = force
+        conflicts = target_manager.restore_conflicts()
+        if conflicts and not restore_force:
+            details(
+                [
+                    ("Rutas detectadas", str(len(conflicts))),
+                    ("Se reemplazarán", "\n".join(format_home_path(path) for path in conflicts)),
+                ],
+                title="Configuraciones locales existentes",
+            )
+            if not sys.stdin.isatty():
+                execute(
+                    lambda: (_ for _ in ()).throw(
+                        FileExistsError(
+                            "Existen rutas locales que requieren confirmación; "
+                            "vuelva a ejecutar bootstrap con --restore --force para reemplazarlas."
+                        )
+                    )
+                )
+            restore_force = bool(
+                questionary.confirm(
+                    "¿Reemplazar estas rutas con las copias del repositorio?",
+                    default=False,
+                ).ask()
+            )
+            if not restore_force:
+                warning("Restauración cancelada; no se modificaron las rutas locales.")
+                console.print("  [concord.muted]Cuando estés listo:[/] concord restore --all --force")
+                render_git_status(GitManager(destination).status(remote=config.git.remote))
+                return
         restored = execute(
-            lambda: TargetManager().restore_all(),
-            hint="Usa concord restore --all --force si existen configuraciones locales.",
+            lambda: target_manager.restore_all(force=restore_force),
+            hint=(
+                "Si falta una copia en el repositorio, sincroniza ese target desde el equipo original "
+                "o elimínalo del manifiesto."
+            ),
         )
         success(f"Se restauraron {len(restored)} target(s).")
     else:
