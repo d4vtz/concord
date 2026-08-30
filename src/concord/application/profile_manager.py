@@ -4,8 +4,10 @@ import re
 import uuid
 from dataclasses import dataclass, field, replace
 
-from concord.application.config import (CONCORD_TARGET, CONCORD_VERSION, Config, ConfigManager,
-                                        ManifestReference, ProfileConfig,
+from concord.application.config import (CONCORD_TARGET,
+                                        PROFILE_MINIMUM_VERSION, Config,
+                                        ConfigManager, ManifestReference,
+                                        ProfileConfig,
                                         SuggestedActivationConfig)
 from concord.application.database import Database
 
@@ -611,7 +613,9 @@ class ProfileManager:
                 )
             suggestion = self._suggestion_from_connection(connection)
             config.suggested_activation = suggestion
-            config.minimum_concord_version = CONCORD_VERSION if config.profiles else None
+            config.minimum_concord_version = (
+                PROFILE_MINIMUM_VERSION if config.profiles else None
+            )
         finally:
             if owns_connection:
                 connection.close()

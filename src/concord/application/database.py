@@ -57,6 +57,18 @@ class Database:
                 )
                 """)
             connection.execute("""
+                CREATE TABLE IF NOT EXISTS dependencies (
+                    target_id TEXT NOT NULL,
+                    package TEXT NOT NULL,
+                    manager TEXT NOT NULL CHECK (manager IN ('pacman', 'aur')),
+                    optional INTEGER NOT NULL DEFAULT 0 CHECK (optional IN (0, 1)),
+                    position INTEGER NOT NULL,
+                    PRIMARY KEY (target_id, package),
+                    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE,
+                    UNIQUE (target_id, manager, position)
+                )
+                """)
+            connection.execute("""
                 CREATE TABLE IF NOT EXISTS profiles (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL UNIQUE,

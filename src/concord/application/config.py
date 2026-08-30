@@ -11,7 +11,8 @@ from questionary import ValidationError, Validator
 from concord import application as concord
 
 MANIFEST_VERSION = 2
-CONCORD_VERSION = "2.3.1"
+CONCORD_VERSION = "2.5.0"
+PROFILE_MINIMUM_VERSION = "2.3.1"
 CONCORD_TARGET = "concord"
 
 
@@ -22,12 +23,20 @@ class TargetPathConfig:
 
 
 @dataclass(frozen=True)
+class DependencyConfig:
+    package: str
+    manager: str
+    optional: bool = False
+
+
+@dataclass(frozen=True)
 class TargetConfig:
     name: str
     paths: list[TargetPathConfig]
     id: str | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+    dependencies: list[DependencyConfig] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -134,6 +143,20 @@ class ConfigManager:
                         if target.updated_at
                         else {}
                     ),
+                    **(
+                        {
+                            "dependencies": [
+                                {
+                                    "package": dependency.package,
+                                    "manager": dependency.manager,
+                                    "optional": dependency.optional,
+                                }
+                                for dependency in target.dependencies
+                            ]
+                        }
+                        if target.dependencies
+                        else {}
+                    ),
                 }
                 for target in config.targets
             ],
@@ -212,6 +235,14 @@ class ConfigManager:
                     id=item.get("id"),
                     created_at=(datetime.fromisoformat(item["created_at"]) if item.get("created_at") else None),
                     updated_at=(datetime.fromisoformat(item["updated_at"]) if item.get("updated_at") else None),
+                    dependencies=[
+                        DependencyConfig(
+                            package=dependency["package"],
+                            manager=dependency["manager"],
+                            optional=bool(dependency.get("optional", False)),
+                        )
+                        for dependency in item.get("dependencies", [])
+                    ],
                 )
             )
         profiles = []

@@ -16,6 +16,11 @@ from rich.tree import Tree
 
 from concord import application as concord
 from concord.application.config import CONCORD_TARGET, ConfigManager, GitConfig
+from concord.application.dependencies import (AUR_HELPERS, MANAGERS,
+                                              DependencyInstallError,
+                                              DependencyManager,
+                                              DependencyStatus,
+                                              ResolvedDependency)
 from concord.application.doctor import Doctor
 from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
@@ -35,23 +40,33 @@ app = typer.Typer(
 repo_app = typer.Typer(no_args_is_help=True, help="Administra el repositorio Git de Concord.")
 remote_app = typer.Typer(no_args_is_help=False, help="Consulta o configura el remoto Git.")
 profile_app = typer.Typer(no_args_is_help=True, help="Crea, compone y activa perfiles de targets.")
+deps_app = typer.Typer(no_args_is_help=True, help="Administra paquetes requeridos por targets.")
+profile_deps_app = typer.Typer(
+    no_args_is_help=True, help="Consulta e instala paquetes agregados de un perfil."
+)
 app.add_typer(repo_app, name="repo")
 app.add_typer(profile_app, name="profile")
+app.add_typer(deps_app, name="deps")
 repo_app.add_typer(remote_app, name="remote")
+profile_app.add_typer(profile_deps_app, name="deps")
 
 
 def manager(*, check_manifest: bool = True) -> TargetManager:
     if not concord.is_initialized():
         raise ValueError("Concord todavía no está inicializado.")
     target_manager = TargetManager()
-    if check_manifest and target_manager.profile_manifest_changed:
+    if check_manifest and (
+        target_manager.profile_manifest_changed
+        or target_manager.dependency_manifest_changed
+    ):
         if not sys.stdin.isatty():
             raise ValueError(
-                "El manifiesto contiene cambios externos en los perfiles. "
+                "El manifiesto contiene cambios externos en perfiles o dependencias. "
                 "Revísalos y ejecuta concord import --replace."
             )
         if not questionary.confirm(
-            "El manifiesto contiene perfiles diferentes. ¿Reemplazar los perfiles locales?",
+            "El manifiesto contiene perfiles o dependencias diferentes. "
+            "¿Reconstruir el índice local?",
             default=False,
         ).ask():
             raise ValueError(
@@ -85,6 +100,11 @@ def manager(*, check_manifest: bool = True) -> TargetManager:
 def profiles(target_manager: TargetManager | None = None) -> ProfileManager:
     target_manager = target_manager or manager()
     return ProfileManager(target_manager.database, target_manager.config_manager)
+
+
+def dependencies(target_manager: TargetManager | None = None) -> DependencyManager:
+    target_manager = target_manager or manager()
+    return DependencyManager(target_manager.database, target_manager.config_manager)
 
 
 def render_activation(profile_manager: ProfileManager) -> None:
@@ -199,6 +219,468 @@ def request_order(choices: list[str]) -> list[str]:
         ordered.append(selected)
         remaining.remove(selected)
     return [*ordered, *remaining]
+
+
+def request_select(message: str, choices: list[str]) -> str:
+    if not choices:
+        raise ValueError("No hay opciones disponibles.")
+    answer = questionary.select(message, choices=choices).ask()
+    if answer is None:
+        raise KeyboardInterrupt
+    return answer
+
+
+def choose_dependency_target(target_manager: TargetManager) -> str:
+    available = [
+        target.name for target in target_manager.list() if target.name != CONCORD_TARGET
+    ]
+    if not available:
+        raise ValueError("No hay targets disponibles para declarar dependencias.")
+    if not sys.stdin.isatty():
+        raise ValueError("Indique el target en modo no interactivo.")
+    return request_select("Target:", available)
+
+
+def choose_dependency_profile(profile_manager: ProfileManager) -> str:
+    available = [profile.name for profile in profile_manager.list()]
+    if not available:
+        raise ValueError("No hay perfiles disponibles.")
+    if not sys.stdin.isatty():
+        raise ValueError("Indique el perfil en modo no interactivo.")
+    return request_select("Perfil:", available)
+
+
+def resolve_aur_helper(
+    dependency_manager: DependencyManager, *, persist: bool = True
+) -> str:
+    configured = dependency_manager.configured_aur_helper()
+    available = dependency_manager.available_aur_helpers()
+    if configured in available:
+        return configured
+    if not available:
+        raise FileNotFoundError(
+            "No se encontró paru ni yay. Instale uno de estos helpers AUR y repita la operación."
+        )
+    if not sys.stdin.isatty():
+        if configured:
+            raise FileNotFoundError(
+                f"El helper configurado '{configured}' no está disponible. "
+                "Ejecute concord deps helper en una terminal."
+            )
+        if len(available) == 1:
+            if persist:
+                dependency_manager.set_aur_helper(available[0])
+            return available[0]
+        raise ValueError("Configure el helper AUR con concord deps helper paru|yay.")
+    selected = available[0] if len(available) == 1 else request_select(
+        "Helper AUR:", available
+    )
+    if configured and persist and not questionary.confirm(
+        f"'{configured}' no está disponible. ¿Cambiar la preferencia local a '{selected}'?",
+        default=True,
+    ).ask():
+        raise ValueError("No se cambió el helper AUR configurado.")
+    if persist:
+        dependency_manager.set_aur_helper(selected)
+    return selected
+
+
+def render_dependencies(
+    dependencies_to_render: list[ResolvedDependency],
+    *,
+    statuses: list[DependencyStatus] | None = None,
+    title: str = "Dependencias",
+) -> None:
+    status_by_package = {
+        status.dependency.package: status.installed for status in statuses or []
+    }
+    table = Table(box=box.ROUNDED, border_style="#4C566A", title=title)
+    table.add_column("Gestor", style="concord.accent", no_wrap=True)
+    table.add_column("Tipo", no_wrap=True)
+    table.add_column("Paquete", style="concord.path")
+    table.add_column("Targets", style="concord.muted")
+    if statuses is not None:
+        table.add_column("Estado", no_wrap=True)
+    for dependency in dependencies_to_render:
+        row = [
+            dependency.manager,
+            "Opcional" if dependency.optional else "Obligatoria",
+            dependency.package,
+            ", ".join(dependency.targets),
+        ]
+        if statuses is not None:
+            row.append(
+                "[concord.success]Instalado[/]"
+                if status_by_package[dependency.package]
+                else (
+                    "[concord.warning]Faltante opcional[/]"
+                    if dependency.optional
+                    else "[concord.error]Faltante[/]"
+                )
+            )
+        table.add_row(*row)
+    console.print(table)
+
+
+def dependency_scope(
+    target_manager: TargetManager,
+    *,
+    target: str | None = None,
+    profile: str | None = None,
+) -> tuple[str, list[ResolvedDependency], DependencyManager]:
+    dependency_manager = dependencies(target_manager)
+    if profile is not None:
+        name = profile or choose_dependency_profile(profiles(target_manager))
+        return name, dependency_manager.for_profile(name), dependency_manager
+    name = target or choose_dependency_target(target_manager)
+    return name, dependency_manager.for_target(name), dependency_manager
+
+
+def dependency_list_command(*, target: str | None = None, profile: str | None = None) -> None:
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    name, declared, _ = execute(
+        lambda: dependency_scope(target_manager, target=target, profile=profile)
+    )
+    if not declared:
+        warning(f"'{name}' no declara dependencias de paquetes.")
+        return
+    render_dependencies(declared, title=f"Dependencias de {name}")
+    details(
+        [
+            ("Obligatorias", str(sum(not item.optional for item in declared))),
+            ("Opcionales", str(sum(item.optional for item in declared))),
+        ],
+        title="Resumen",
+    )
+
+
+def dependency_check_command(*, target: str | None = None, profile: str | None = None) -> None:
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    name, declared, dependency_manager = execute(
+        lambda: dependency_scope(target_manager, target=target, profile=profile)
+    )
+    if not declared:
+        success(f"'{name}' no declara dependencias de paquetes.")
+        return
+    statuses = execute(lambda: dependency_manager.status(declared))
+    render_dependencies(declared, statuses=statuses, title=f"Comprobación de {name}")
+    missing_required = [
+        status for status in statuses
+        if not status.installed and not status.dependency.optional
+    ]
+    missing_optional = [
+        status for status in statuses
+        if not status.installed and status.dependency.optional
+    ]
+    details(
+        [
+            ("Instaladas", str(sum(status.installed for status in statuses))),
+            ("Faltantes obligatorias", str(len(missing_required))),
+            ("Faltantes opcionales", str(len(missing_optional))),
+        ],
+        title="Resumen",
+    )
+    if missing_required:
+        raise typer.Exit(1)
+    success("Todas las dependencias obligatorias están instaladas.")
+
+
+def dependency_install_command(
+    *,
+    target: str | None = None,
+    profile: str | None = None,
+    include_optional: bool = False,
+    dry_run: bool = False,
+    yes: bool = False,
+) -> None:
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    name, declared, dependency_manager = execute(
+        lambda: dependency_scope(target_manager, target=target, profile=profile)
+    )
+    if not declared:
+        success(f"'{name}' no declara dependencias de paquetes.")
+        return
+    statuses = execute(lambda: dependency_manager.status(declared))
+    missing_required = [
+        status.dependency for status in statuses
+        if not status.installed and not status.dependency.optional
+    ]
+    missing_optional = [
+        status.dependency for status in statuses
+        if not status.installed and status.dependency.optional
+    ]
+    selected_optional: list[ResolvedDependency] = []
+    if include_optional:
+        selected_optional = missing_optional
+    elif missing_optional and sys.stdin.isatty() and not yes:
+        selected_names = request_checkbox(
+            "Dependencias opcionales que deseas instalar:",
+            [dependency.package for dependency in missing_optional],
+        )
+        selected_optional = [
+            dependency for dependency in missing_optional
+            if dependency.package in selected_names
+        ]
+    selected = [*missing_required, *selected_optional]
+    if not selected:
+        success("No hay dependencias seleccionadas pendientes de instalación.")
+        return
+    aur_helper = None
+    if any(dependency.manager == "aur" for dependency in selected):
+        aur_helper = execute(
+            lambda: resolve_aur_helper(dependency_manager, persist=not dry_run)
+        )
+    commands = execute(
+        lambda: dependency_manager.install_commands(
+            selected, aur_helper=aur_helper
+        )
+    )
+    render_dependencies(selected, title=f"Plan de instalación para {name}")
+    for backend, command, batch in commands:
+        details(
+            [
+                ("Backend", backend),
+                ("Paquetes", ", ".join(item.package for item in batch)),
+                ("Comando", shlex.join(command)),
+            ],
+            title="Ejecución prevista",
+        )
+    if dry_run:
+        warning("Simulación completada; no se instaló ningún paquete.")
+        return
+    if not yes:
+        if not sys.stdin.isatty():
+            execute(lambda: (_ for _ in ()).throw(
+                ValueError("La instalación no interactiva requiere --yes.")
+            ))
+        if not questionary.confirm("¿Instalar estos paquetes?", default=False).ask():
+            warning("Instalación cancelada; no se modificó el sistema.")
+            return
+    try:
+        result = dependency_manager.install(selected)
+    except DependencyInstallError as error:
+        details(
+            [
+                ("Instalados", ", ".join(item.package for item in error.installed) or "ninguno"),
+                ("Pendientes", ", ".join(item.package for item in error.pending) or "ninguno"),
+            ],
+            title="Instalación parcial",
+        )
+        execute(lambda: (_ for _ in ()).throw(error))
+        return
+    success(f"Se instalaron {len(result.installed)} dependencias.")
+
+
+@deps_app.command("add")
+def deps_add(
+    target: str | None = typer.Argument(None, autocompletion=complete_targets),
+    packages: list[str] | None = typer.Argument(None),
+    package_manager: str | None = typer.Option(None, "--manager", "-m"),
+    optional: bool | None = typer.Option(None, "--optional/--required"),
+    skip_validation: bool = typer.Option(
+        False, "--skip-validation", help="Guarda los nombres sin consultar su origen."
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Confirma reclasificaciones."),
+) -> None:
+    """Declara paquetes necesarios para un target."""
+    heading("AGREGAR DEPENDENCIAS", "Asociando paquetes a una configuración")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    dependency_manager = dependencies(target_manager)
+    if target is None:
+        target = execute(lambda: choose_dependency_target(target_manager))
+    if package_manager is None:
+        if not sys.stdin.isatty():
+            execute(lambda: (_ for _ in ()).throw(
+                ValueError("Indique --manager pacman|aur en modo no interactivo.")
+            ))
+        package_manager = request_select("Origen de los paquetes:", list(MANAGERS))
+    if optional is None:
+        if not sys.stdin.isatty():
+            execute(lambda: (_ for _ in ()).throw(
+                ValueError("Indique --required o --optional en modo no interactivo.")
+            ))
+        category = request_select("Categoría:", ["Obligatorias", "Opcionales"])
+        optional = category == "Opcionales"
+    selected_packages = list(packages or [])
+    if not selected_packages:
+        if not sys.stdin.isatty():
+            execute(lambda: (_ for _ in ()).throw(
+                ValueError("Indique al menos un paquete en modo no interactivo.")
+            ))
+        selected_packages = shlex.split(request_text("Paquetes separados por espacios:"))
+    normalized_manager = package_manager.strip().lower()
+    if normalized_manager == "aur" and not skip_validation:
+        execute(lambda: resolve_aur_helper(dependency_manager))
+    reclassifications = []
+    for package in selected_packages:
+        current = execute(lambda package=package: dependency_manager.find(target, package))
+        if current and current.manager == normalized_manager and current.optional != optional:
+            reclassifications.append(current.package)
+    reclassify = False
+    if reclassifications:
+        if yes:
+            reclassify = True
+        elif not sys.stdin.isatty():
+            execute(lambda: (_ for _ in ()).throw(
+                ValueError("La reclasificación requiere --yes en modo no interactivo.")
+            ))
+        else:
+            destination = "opcionales" if optional else "obligatorias"
+            reclassify = bool(questionary.confirm(
+                f"¿Mover {', '.join(reclassifications)} a dependencias {destination}?",
+                default=False,
+            ).ask())
+            if not reclassify:
+                warning("No se modificaron las dependencias.")
+                return
+    added = execute(
+        lambda: dependency_manager.add(
+            target,
+            normalized_manager,
+            selected_packages,
+            optional=bool(optional),
+            validate=not skip_validation,
+            reclassify=reclassify,
+        )
+    )
+    execute(
+        lambda: persist_profile_manifest(
+            target_manager, f"concord: update dependencies for {target}"
+        )
+    )
+    success(
+        f"Se registraron {len(added)} dependencias para '{target}'.",
+        hint=f"Compruébalas con: concord deps check {target}",
+    )
+
+
+@deps_app.command("remove")
+def deps_remove(
+    target: str | None = typer.Argument(None, autocompletion=complete_targets),
+    packages: list[str] | None = typer.Argument(None),
+) -> None:
+    """Retira declaraciones sin desinstalar paquetes."""
+    heading("RETIRAR DEPENDENCIAS", "Actualizando el manifiesto sin tocar el sistema")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    dependency_manager = dependencies(target_manager)
+    if target is None:
+        target = execute(lambda: choose_dependency_target(target_manager))
+    selected_packages = list(packages or [])
+    if not selected_packages:
+        declared = execute(lambda: dependency_manager.for_target(target))
+        if not declared:
+            warning(f"'{target}' no declara dependencias.")
+            return
+        if not sys.stdin.isatty():
+            execute(lambda: (_ for _ in ()).throw(
+                ValueError("Indique los paquetes que desea retirar.")
+            ))
+        selected_packages = request_checkbox(
+            "Dependencias que deseas retirar:",
+            [dependency.package for dependency in declared],
+        )
+        if not selected_packages:
+            warning("No se seleccionaron dependencias.")
+            return
+    removed = execute(lambda: dependency_manager.remove(target, selected_packages))
+    execute(
+        lambda: persist_profile_manifest(
+            target_manager, f"concord: update dependencies for {target}"
+        )
+    )
+    success(
+        f"Se retiraron {len(removed)} declaraciones; no se desinstaló ningún paquete."
+    )
+
+
+@deps_app.command("list")
+def deps_list(
+    target: str | None = typer.Argument(None, autocompletion=complete_targets),
+) -> None:
+    """Lista las dependencias declaradas por un target."""
+    heading("DEPENDENCIAS", "Paquetes declarados por target")
+    dependency_list_command(target=target)
+
+
+@deps_app.command("check")
+def deps_check(
+    target: str | None = typer.Argument(None, autocompletion=complete_targets),
+) -> None:
+    """Comprueba qué dependencias de un target están instaladas."""
+    heading("COMPROBAR DEPENDENCIAS", "Consultando el sistema sin modificarlo")
+    dependency_check_command(target=target)
+
+
+@deps_app.command("install")
+def deps_install(
+    target: str | None = typer.Argument(None, autocompletion=complete_targets),
+    include_optional: bool = typer.Option(False, "--include-optional"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Instala únicamente los paquetes faltantes de un target."""
+    heading("INSTALAR DEPENDENCIAS", "Preparando un plan seguro por backend")
+    dependency_install_command(
+        target=target,
+        include_optional=include_optional,
+        dry_run=dry_run,
+        yes=yes,
+    )
+
+
+@deps_app.command("helper")
+def deps_helper(
+    helper: str | None = typer.Argument(None),
+) -> None:
+    """Consulta o selecciona el helper AUR local."""
+    heading("HELPER AUR", "Configuración local de paru o yay")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    dependency_manager = dependencies(target_manager)
+    if helper is None:
+        helper = execute(lambda: resolve_aur_helper(dependency_manager))
+    else:
+        execute(lambda: dependency_manager.set_aur_helper(helper))
+    success(f"El helper AUR preferido en esta máquina es '{helper}'.")
+
+
+@profile_deps_app.command("list")
+def profile_deps_list(name: str | None = typer.Argument(None)) -> None:
+    """Lista las dependencias agregadas de un perfil."""
+    heading("DEPENDENCIAS DEL PERFIL", "Expandiendo composición y exclusiones")
+    if name is None:
+        target_manager = execute(manager, hint="Ejecuta primero: concord init")
+        name = execute(lambda: choose_dependency_profile(profiles(target_manager)))
+    dependency_list_command(profile=name)
+
+
+@profile_deps_app.command("check")
+def profile_deps_check(name: str | None = typer.Argument(None)) -> None:
+    """Comprueba las dependencias agregadas de un perfil."""
+    heading("COMPROBAR PERFIL", "Consultando paquetes de todos sus targets efectivos")
+    if name is None:
+        target_manager = execute(manager, hint="Ejecuta primero: concord init")
+        name = execute(lambda: choose_dependency_profile(profiles(target_manager)))
+    dependency_check_command(profile=name)
+
+
+@profile_deps_app.command("install")
+def profile_deps_install(
+    name: str | None = typer.Argument(None),
+    include_optional: bool = typer.Option(False, "--include-optional"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+    yes: bool = typer.Option(False, "--yes", "-y"),
+) -> None:
+    """Instala las dependencias agregadas de un perfil."""
+    heading("INSTALAR PERFIL", "Preparando paquetes de sus targets efectivos")
+    if name is None:
+        target_manager = execute(manager, hint="Ejecuta primero: concord init")
+        name = execute(lambda: choose_dependency_profile(profiles(target_manager)))
+    dependency_install_command(
+        profile=name,
+        include_optional=include_optional,
+        dry_run=dry_run,
+        yes=yes,
+    )
 
 
 def request_commit_message(default: str, options: GitOptions) -> str | None:

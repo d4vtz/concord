@@ -8,9 +8,11 @@ from pathlib import Path
 
 from concord import application as concord
 from concord.application.comparison import paths_equal
-from concord.application.config import (CONCORD_TARGET, ConfigManager,
+from concord.application.config import (CONCORD_TARGET, CONCORD_VERSION,
+                                        ConfigManager, DependencyConfig,
                                         TargetConfig, TargetPathConfig)
 from concord.application.database import Database
+from concord.application.dependencies import DependencyManager
 from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target import Target, TargetPath, TargetType
@@ -64,6 +66,7 @@ class TargetManager:
         self.database.initialize()
         self.manifest_backup: Path | None = None
         self.profile_manifest_changed = False
+        self.dependency_manifest_changed = False
         if concord.config_file.exists():
             config, self.manifest_backup = self.config_manager.migrate()
             self._repair_index(config)
@@ -71,6 +74,9 @@ class TargetManager:
                 self._persist_manifest()
             current = self.config_manager.load()
             self.profile_manifest_changed = not ProfileManager(
+                self.database, self.config_manager
+            ).matches_config(current)
+            self.dependency_manifest_changed = not DependencyManager(
                 self.database, self.config_manager
             ).matches_config(current)
 
@@ -168,12 +174,24 @@ class TargetManager:
             )
 
     def _manifest_target(self, target: Target) -> TargetConfig:
+        with self.database.connect() as connection:
+            dependencies = [
+                DependencyConfig(package, manager, bool(optional))
+                for package, manager, optional in connection.execute(
+                    """
+                    SELECT package, manager, optional FROM dependencies
+                    WHERE target_id = ? ORDER BY manager, optional, position
+                    """,
+                    (target.id,),
+                )
+            ]
         return TargetConfig(
             id=target.id,
             name=target.name,
             paths=[TargetPathConfig(path.relative_path, path.type.value) for path in target.paths],
             created_at=target.created_at,
             updated_at=target.updated_at,
+            dependencies=dependencies,
         )
 
     def _persist_manifest(self) -> None:
@@ -187,6 +205,8 @@ class TargetManager:
             self._update_timestamp(concord_target)
         config.targets = [self._manifest_target(target) for target in self.list()]
         ProfileManager(self.database, self.config_manager).apply_to_config(config)
+        if any(target.dependencies for target in config.targets):
+            config.minimum_concord_version = CONCORD_VERSION
         config.targets.sort(key=lambda item: (item.name != CONCORD_TARGET, item.name))
         self.config_manager.save(config)
         if concord_target is not None:
@@ -472,6 +492,7 @@ class TargetManager:
             raise ValueError("El manifiesto no contiene targets para importar.")
         targets = []
         all_paths: list[Path] = []
+        dependency_managers: dict[str, str] = {}
         for item in config.targets:
             paths = []
             for path_item in item.paths:
@@ -497,6 +518,13 @@ class TargetManager:
                     target_id=item.id,
                 )
             )
+            for dependency in item.dependencies:
+                existing_manager = dependency_managers.get(dependency.package)
+                if existing_manager and existing_manager != dependency.manager:
+                    raise ValueError(
+                        f"'{dependency.package}' está declarado para pacman y AUR."
+                    )
+                dependency_managers[dependency.package] = dependency.manager
         with self.database.connect() as connection:
             existing = connection.execute("SELECT COUNT(*) FROM targets").fetchone()[0]
             if existing and not replace:
@@ -504,6 +532,30 @@ class TargetManager:
             connection.execute("DELETE FROM targets")
             for target in targets:
                 self._insert_target(connection, target)
+            for item, target in zip(config.targets, targets, strict=True):
+                positions = {"pacman": 0, "aur": 0}
+                seen: dict[str, str] = {}
+                for dependency in item.dependencies:
+                    if dependency.manager not in positions:
+                        raise ValueError(
+                            f"Gestor no compatible en '{target.name}': {dependency.manager}."
+                        )
+                    if dependency.package in seen:
+                        raise ValueError(
+                            f"Dependencia duplicada en '{target.name}': {dependency.package}."
+                        )
+                    seen[dependency.package] = dependency.manager
+                    connection.execute(
+                        "INSERT INTO dependencies VALUES (?, ?, ?, ?, ?)",
+                        (
+                            target.id,
+                            dependency.package,
+                            dependency.manager,
+                            int(dependency.optional),
+                            positions[dependency.manager],
+                        ),
+                    )
+                    positions[dependency.manager] += 1
             ProfileManager(self.database, self.config_manager).import_config(
                 config, connection=connection
             )

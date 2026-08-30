@@ -162,6 +162,74 @@ La activación efectiva se guarda únicamente en el equipo local. El manifiesto
 puede llevar una combinación sugerida; Concord pregunta antes de adoptarla y,
 si se rechaza, no vuelve a ofrecerla hasta que cambie.
 
+## Dependencias de paquetes
+
+Cada target puede declarar paquetes oficiales de Arch (`pacman`) y paquetes de
+AUR. La ejecución sin argumentos abre el flujo guiado para elegir target,
+origen, categoría y nombres:
+
+```bash
+concord deps add
+```
+
+También puede declararse todo desde la línea de comandos:
+
+```bash
+concord deps add nvim neovim ripgrep fd \
+  --manager pacman --required
+concord deps add nvim lua-language-server \
+  --manager aur --optional
+```
+
+Concord valida que cada paquete exista antes de guardarlo. Para preparar el
+manifiesto sin red puede utilizarse `--skip-validation`. Un mismo nombre no
+puede pertenecer simultáneamente a `pacman` y AUR.
+
+Comandos por target:
+
+```bash
+concord deps list nvim
+concord deps check nvim
+concord deps install nvim --dry-run
+concord deps install nvim
+concord deps install nvim --include-optional
+concord deps remove nvim
+```
+
+Los perfiles expanden sus inclusiones y exclusiones, reúnen las dependencias de
+sus targets y eliminan duplicados. Si un paquete es opcional en un target y
+obligatorio en otro, prevalece como obligatorio:
+
+```bash
+concord profile deps list base
+concord profile deps check base
+concord profile deps install base --dry-run
+concord profile deps install base
+```
+
+`check` termina con código distinto de cero únicamente cuando falta una
+dependencia obligatoria. Las opcionales ausentes se muestran como advertencias.
+`install` omite los paquetes ya satisfechos, permite elegir opcionales en una
+terminal y requiere `--include-optional` para incluirlas todas de forma
+explícita.
+
+La preferencia entre `paru` y `yay` es local para cada máquina:
+
+```bash
+concord deps helper
+concord deps helper paru
+```
+
+Si no está disponible ningún helper, Concord se detiene con instrucciones y no
+intenta construirlo automáticamente. Antes de instalar muestra todos los lotes
+y pide una única confirmación. En modo no interactivo exige `--yes`. Un fallo
+posterior no desinstala paquetes ya agregados: informa lo completado y lo que
+queda pendiente.
+
+`deps remove` elimina solo la declaración del manifiesto; nunca desinstala
+paquetes del sistema. La integración con `bootstrap`, `restore` y `doctor` queda
+reservada para una entrega posterior.
+
 ## Editar configuraciones
 
 `concord edit <target>` abre la ruta local original. Los directorios se abren
@@ -220,12 +288,17 @@ paths = [
     { relative_path = ".config/zsh", type = "directory" },
     { relative_path = ".zshenv", type = "file" },
 ]
+dependencies = [
+    { package = "zsh", manager = "pacman", optional = false },
+    { package = "fzf", manager = "pacman", optional = true },
+]
 ```
 
 Los perfiles se guardan mediante UUID estables y nombres legibles. SQLite es la
 fuente de trabajo para administrarlos y cada cambio exporta inmediatamente su
 representación portable al manifiesto. Cuando el manifiesto contiene perfiles,
-declara `minimum_concord_version = "2.3.1"`.
+declara `minimum_concord_version = "2.3.1"`; al contener dependencias declara la
+versión mínima que introdujo ese modelo.
 
 Concord se registra automáticamente como el primer target. Después de agregar
 o eliminar una configuración, actualiza el manifiesto y sincroniza su propia
@@ -550,69 +623,6 @@ Más adelante podrá añadirse un perfil activo por máquina, pero la primera
 versión no sincronizará automáticamente el nombre del equipo ni decidirá qué
 perfil restaurar sin confirmación.
 
-### Dependencias de paquetes por target
-
-Permitir que cada target declare los paquetes necesarios para que su
-configuración funcione. En una instalación nueva, Concord podrá reunir las
-dependencias de uno o varios targets —o de un perfil completo—, comprobar cuáles
-faltan e instalarlas mediante el gestor correspondiente.
-
-Ejemplo propuesto para Arch Linux:
-
-```bash
-concord deps add nvim --manager pacman neovim ripgrep fd
-concord deps add nvim --manager aur lua-language-server
-concord deps add zsh --manager pacman zsh fzf
-
-concord deps list nvim
-concord deps check nvim
-concord deps install nvim --dry-run
-concord profile deps install base
-```
-
-Comandos previstos:
-
-```bash
-concord deps list <target>
-concord deps add <target> --manager <manager> <package>...
-concord deps remove <target> --manager <manager> <package>...
-concord deps check <target>
-concord deps install <target>
-concord profile deps list <profile>
-concord profile deps check <profile>
-concord profile deps install <profile>
-```
-
-Comportamiento esperado:
-
-- Guardar en el manifiesto los nombres de paquetes agrupados por gestor; SQLite
-  seguirá siendo un índice local reconstruible.
-- Comenzar con `pacman` para paquetes oficiales de Arch y un backend AUR
-  configurable, inicialmente `paru` o `yay`, sin asumir que ambos existen.
-- Diseñar una interfaz de backends que permita añadir posteriormente gestores
-  como `apt`, `dnf`, `brew`, `flatpak` o `pipx` sin cambiar el modelo de los
-  targets.
-- Separar dependencias obligatorias y opcionales, de modo que la instalación de
-  estas últimas requiera una opción explícita como `--include-optional`.
-- Al operar sobre un perfil, expandir sus perfiles incluidos, reunir las
-  dependencias de todos los targets y eliminar duplicados antes de consultar el
-  sistema.
-- Instalar únicamente paquetes faltantes y mostrar cuáles ya están presentes,
-  cuáles se omitirán y qué backend se utilizará.
-- Requerir confirmación antes de instalar y admitir `--dry-run`, `--yes` y modo
-  no interactivo seguro. `restore` y `bootstrap` podrán ofrecer ejecutar la
-  instalación, pero nunca hacerlo silenciosamente.
-- Ejecutar cada gestor mediante argumentos estructurados, sin construir comandos
-  con `shell=True` ni aceptar nombres de paquetes que puedan convertirse en
-  opciones arbitrarias.
-- No ejecutar todo Concord con privilegios elevados. Solo el gestor de paquetes
-  podrá solicitar `sudo` cuando sea necesario; los helpers de AUR se ejecutarán
-  como usuario normal.
-- Hacer que `doctor` compruebe backends disponibles y dependencias faltantes sin
-  instalar nada.
-- Permitir que una dependencia tenga un nombre distinto según el sistema en una
-  versión posterior, conservando inicialmente una implementación clara y
-  centrada en Arch Linux.
 
 Las dependencias de Python que forman parte interna de Concord seguirán
 gestionándose mediante el paquete de la aplicación; esta función se reservará
