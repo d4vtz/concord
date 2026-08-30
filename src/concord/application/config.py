@@ -11,8 +11,9 @@ from questionary import ValidationError, Validator
 from concord import application as concord
 
 MANIFEST_VERSION = 2
-CONCORD_VERSION = "2.5.0"
+CONCORD_VERSION = "2.6.0"
 PROFILE_MINIMUM_VERSION = "2.3.1"
+DEPENDENCY_MINIMUM_VERSION = "2.5.0"
 CONCORD_TARGET = "concord"
 
 

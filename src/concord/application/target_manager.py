@@ -8,7 +8,8 @@ from pathlib import Path
 
 from concord import application as concord
 from concord.application.comparison import paths_equal
-from concord.application.config import (CONCORD_TARGET, CONCORD_VERSION,
+from concord.application.config import (CONCORD_TARGET,
+                                        DEPENDENCY_MINIMUM_VERSION,
                                         ConfigManager, DependencyConfig,
                                         TargetConfig, TargetPathConfig)
 from concord.application.database import Database
@@ -206,7 +207,7 @@ class TargetManager:
         config.targets = [self._manifest_target(target) for target in self.list()]
         ProfileManager(self.database, self.config_manager).apply_to_config(config)
         if any(target.dependencies for target in config.targets):
-            config.minimum_concord_version = CONCORD_VERSION
+            config.minimum_concord_version = DEPENDENCY_MINIMUM_VERSION
         config.targets.sort(key=lambda item: (item.name != CONCORD_TARGET, item.name))
         self.config_manager.save(config)
         if concord_target is not None:

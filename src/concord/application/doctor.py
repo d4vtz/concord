@@ -1,4 +1,5 @@
 import os
+import shutil
 import sqlite3
 import subprocess
 from dataclasses import dataclass
@@ -68,6 +69,11 @@ class Doctor:
             return DoctorReport(checks, timings)
         self._timed(timings, "SQLite", lambda: self._database_checks(config, checks))
         self._timed(timings, "Perfiles", lambda: self._profile_checks(config, checks))
+        self._timed(
+            timings,
+            "Dependencias",
+            lambda: self._dependency_checks(config, checks),
+        )
         self._timed(timings, "Targets", lambda: self._target_checks(config, checks))
         self._timed(timings, "Git", lambda: self._git_checks(config, checks, fetch=fetch))
         return DoctorReport(checks, timings)
@@ -227,6 +233,12 @@ class Doctor:
             uri = f"file:{concord.database_file}?mode=ro"
             with sqlite3.connect(uri, uri=True) as connection:
                 integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
+                tables = {
+                    row[0]
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
                 rows = connection.execute("SELECT name FROM targets").fetchall()
                 path_rows = connection.execute(
                     """
@@ -235,6 +247,18 @@ class Doctor:
                     JOIN target_paths ON target_paths.target_id = targets.id
                     """
                 ).fetchall()
+                dependency_rows = (
+                    connection.execute(
+                        """
+                        SELECT targets.name, dependencies.package,
+                               dependencies.manager, dependencies.optional
+                        FROM dependencies
+                        JOIN targets ON targets.id = dependencies.target_id
+                        """
+                    ).fetchall()
+                    if "dependencies" in tables
+                    else None
+                )
         except sqlite3.Error as error:
             self._add(
                 checks,
@@ -264,7 +288,24 @@ class Doctor:
             for target in config.targets
             for path in target.paths
         }
-        if database_names == manifest_names and database_paths == manifest_paths:
+        manifest_dependencies = {
+            (target.name, dependency.package, dependency.manager, dependency.optional)
+            for target in config.targets
+            for dependency in target.dependencies
+        }
+        database_dependencies = (
+            {
+                (name, package, manager, bool(optional))
+                for name, package, manager, optional in dependency_rows
+            }
+            if dependency_rows is not None
+            else None
+        )
+        if (
+            database_names == manifest_names
+            and database_paths == manifest_paths
+            and database_dependencies == manifest_dependencies
+        ):
             self._add(
                 checks,
                 "Concord",
@@ -278,9 +319,192 @@ class Doctor:
                 "Concord",
                 "Índice local",
                 "failure",
-                "SQLite y concord.toml contienen targets diferentes.",
+                "SQLite y concord.toml contienen targets o dependencias diferentes.",
                 "Ejecuta: concord import --replace",
             )
+
+    def _dependency_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
+        grouped: dict[str, dict[str, object]] = {}
+        conflicts: list[str] = []
+        invalid: list[str] = []
+        for target in config.targets:
+            for dependency in target.dependencies:
+                if dependency.manager not in {"pacman", "aur"}:
+                    invalid.append(f"{target.name}:{dependency.package}")
+                    continue
+                current = grouped.get(dependency.package)
+                if current and current["manager"] != dependency.manager:
+                    conflicts.append(dependency.package)
+                    continue
+                if current is None:
+                    current = {
+                        "manager": dependency.manager,
+                        "optional": dependency.optional,
+                    }
+                    grouped[dependency.package] = current
+                current["optional"] = bool(current["optional"]) and dependency.optional
+        if invalid or conflicts:
+            problems = []
+            if invalid:
+                problems.append(f"gestor no válido en {', '.join(invalid)}")
+            if conflicts:
+                problems.append(
+                    f"declaradas para pacman y AUR: {', '.join(sorted(set(conflicts)))}"
+                )
+            self._add(
+                checks,
+                "Dependencias",
+                "Declaraciones",
+                "failure",
+                "; ".join(problems) + ".",
+                "Corrige las dependencias con concord deps remove y concord deps add.",
+            )
+            return
+        if not grouped:
+            self._add(
+                checks,
+                "Dependencias",
+                "Declaraciones",
+                "pass",
+                "No hay dependencias de paquetes declaradas.",
+            )
+            return
+        self._add(
+            checks,
+            "Dependencias",
+            "Declaraciones",
+            "pass",
+            f"{len(grouped)} paquete(s) únicos declarados.",
+        )
+        pacman = shutil.which("pacman")
+        if pacman is None:
+            self._add(
+                checks,
+                "Dependencias",
+                "Pacman",
+                "failure",
+                "No se encontró pacman.",
+                "Esta versión del gestor de dependencias requiere Arch Linux.",
+            )
+            return
+        self._add(
+            checks,
+            "Dependencias",
+            "Pacman",
+            "pass",
+            pacman,
+        )
+        aur_declared = any(item["manager"] == "aur" for item in grouped.values())
+        if aur_declared:
+            available = [helper for helper in ("paru", "yay") if shutil.which(helper)]
+            configured = None
+            if concord.database_file.is_file():
+                try:
+                    uri = f"file:{concord.database_file}?mode=ro"
+                    with sqlite3.connect(uri, uri=True) as connection:
+                        row = connection.execute(
+                            "SELECT value FROM local_settings WHERE key = 'aur_helper'"
+                        ).fetchone()
+                    configured = row[0] if row else None
+                except sqlite3.Error:
+                    configured = None
+            if configured in available:
+                self._add(
+                    checks,
+                    "Dependencias",
+                    "Helper AUR",
+                    "pass",
+                    f"{configured} está disponible.",
+                )
+            elif available:
+                self._add(
+                    checks,
+                    "Dependencias",
+                    "Helper AUR",
+                    "warning",
+                    f"Disponible sin seleccionar: {', '.join(available)}.",
+                    "Configúralo con: concord deps helper",
+                )
+            else:
+                self._add(
+                    checks,
+                    "Dependencias",
+                    "Helper AUR",
+                    "warning",
+                    "No se encontró paru ni yay.",
+                    "Instala un helper AUR antes de instalar esos paquetes.",
+                )
+        packages = sorted(grouped)
+        try:
+            result = subprocess.run(
+                [pacman, "-T", *packages],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        except OSError as error:
+            self._add(
+                checks,
+                "Dependencias",
+                "Paquetes instalados",
+                "failure",
+                str(error),
+                "Comprueba que pacman pueda ejecutarse.",
+            )
+            return
+        if result.returncode not in {0, 127}:
+            self._add(
+                checks,
+                "Dependencias",
+                "Paquetes instalados",
+                "failure",
+                result.stderr.strip() or "pacman no pudo comprobar los paquetes.",
+                "Ejecuta manualmente: pacman -T <paquetes>",
+            )
+            return
+        missing = {
+            package
+            for package in result.stdout.splitlines()
+            if package in grouped
+        }
+        missing_required = sorted(
+            package
+            for package in missing
+            if not bool(grouped[package]["optional"])
+        )
+        missing_optional = sorted(
+            package
+            for package in missing
+            if bool(grouped[package]["optional"])
+        )
+        if missing_required:
+            self._add(
+                checks,
+                "Dependencias",
+                "Obligatorias",
+                "warning",
+                f"Faltan: {', '.join(missing_required)}.",
+                "Instálalas con concord deps install o concord profile deps install.",
+            )
+        else:
+            self._add(
+                checks,
+                "Dependencias",
+                "Obligatorias",
+                "pass",
+                "Todas están instaladas.",
+            )
+        self._add(
+            checks,
+            "Dependencias",
+            "Opcionales",
+            "pass",
+            (
+                f"{len(missing_optional)} no instalada(s), permitido."
+                if missing_optional
+                else "Todas las declaradas están instaladas."
+            ),
+        )
 
     def _target_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
         missing_local: list[str] = []

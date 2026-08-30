@@ -389,14 +389,24 @@ def dependency_install_command(
     *,
     target: str | None = None,
     profile: str | None = None,
+    target_manager: TargetManager | None = None,
+    target_names: list[str] | None = None,
+    scope_name: str | None = None,
     include_optional: bool = False,
     dry_run: bool = False,
     yes: bool = False,
 ) -> None:
-    target_manager = execute(manager, hint="Ejecuta primero: concord init")
-    name, declared, dependency_manager = execute(
-        lambda: dependency_scope(target_manager, target=target, profile=profile)
+    target_manager = target_manager or execute(
+        manager, hint="Ejecuta primero: concord init"
     )
+    if target_names is None:
+        name, declared, dependency_manager = execute(
+            lambda: dependency_scope(target_manager, target=target, profile=profile)
+        )
+    else:
+        dependency_manager = dependencies(target_manager)
+        name = scope_name or "targets seleccionados"
+        declared = execute(lambda: dependency_manager.for_targets(target_names))
     if not declared:
         success(f"'{name}' no declara dependencias de paquetes.")
         return
@@ -469,6 +479,66 @@ def dependency_install_command(
         execute(lambda: (_ for _ in ()).throw(error))
         return
     success(f"Se instalaron {len(result.installed)} dependencias.")
+
+
+def offer_dependency_installation(
+    target_manager: TargetManager,
+    target_names: list[str],
+    *,
+    scope_name: str,
+    requested: bool | None,
+    include_optional: bool,
+    dry_run: bool,
+    yes: bool,
+) -> None:
+    if requested is False:
+        return
+    dependency_manager = dependencies(target_manager)
+    declared = execute(lambda: dependency_manager.for_targets(target_names))
+    if not declared:
+        return
+    if requested is None and not sys.stdin.isatty():
+        warning(
+            "La instalación de dependencias se omitió en modo no interactivo."
+        )
+        console.print(
+            "  [concord.muted]Para incluirla, usa --install-deps --yes.[/]"
+        )
+        return
+    statuses = execute(lambda: dependency_manager.status(declared))
+    missing_required = sum(
+        not status.installed and not status.dependency.optional
+        for status in statuses
+    )
+    missing_optional = sum(
+        not status.installed and status.dependency.optional
+        for status in statuses
+    )
+    if not missing_required and not missing_optional:
+        success(f"Las dependencias de {scope_name} ya están instaladas.")
+        return
+    if requested is None:
+        details(
+            [
+                ("Ámbito", scope_name),
+                ("Faltantes obligatorias", str(missing_required)),
+                ("Faltantes opcionales", str(missing_optional)),
+            ],
+            title="Dependencias antes de restaurar",
+        )
+        if not questionary.confirm(
+            "¿Preparar ahora la instalación de dependencias?", default=True
+        ).ask():
+            warning("Se continuará sin instalar dependencias.")
+            return
+    dependency_install_command(
+        target_manager=target_manager,
+        target_names=target_names,
+        scope_name=scope_name,
+        include_optional=include_optional,
+        dry_run=dry_run,
+        yes=yes,
+    )
 
 
 @deps_app.command("add")
@@ -1496,6 +1566,22 @@ def restore(
     all_targets: bool = typer.Option(False, "--all", "-a", help="Restaura todos los targets del manifiesto."),
     force: bool = typer.Option(False, "--force", "-f", help="Reemplaza la ruta local existente."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Simula la operación sin modificar archivos."),
+    install_deps: bool | None = typer.Option(
+        None,
+        "--install-deps/--no-install-deps",
+        help="Ofrece o solicita instalar paquetes antes de restaurar.",
+    ),
+    include_optional: bool = typer.Option(
+        False,
+        "--include-optional",
+        help="Incluye todas las dependencias opcionales seleccionadas.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Confirma la instalación no interactiva de dependencias.",
+    ),
 ) -> None:
     """Restaura un target del repositorio a HOME."""
     if (name is None) == (not all_targets):
@@ -1504,6 +1590,20 @@ def restore(
     profile_manager = profiles(target_manager)
     maybe_offer_suggestion(profile_manager)
     render_activation(profile_manager)
+    dependency_targets = (
+        [target.name for target in target_manager.selected() if target.name != CONCORD_TARGET]
+        if all_targets
+        else [execute(lambda: target_manager.get(name)).name]
+    )
+    offer_dependency_installation(
+        target_manager,
+        dependency_targets,
+        scope_name="los targets activos" if all_targets else f"'{name}'",
+        requested=install_deps,
+        include_optional=include_optional,
+        dry_run=dry_run,
+        yes=yes,
+    )
     if dry_run:
         heading("SIMULACIÓN DE RESTAURACIÓN", "Vista previa de repositorio → HOME")
         differences = execute(
@@ -1551,6 +1651,22 @@ def bootstrap(
         "-f",
         help="Reemplaza rutas locales existentes al restaurar.",
     ),
+    install_deps: bool | None = typer.Option(
+        None,
+        "--install-deps/--no-install-deps",
+        help="Ofrece o solicita instalar las dependencias importadas.",
+    ),
+    include_optional: bool = typer.Option(
+        False,
+        "--include-optional",
+        help="Incluye todas las dependencias opcionales.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help="Confirma la instalación no interactiva de dependencias.",
+    ),
 ) -> None:
     """Reconstruye Concord desde un repositorio remoto existente."""
     heading("BOOTSTRAP", "Recuperando Concord desde un repositorio remoto")
@@ -1590,9 +1706,27 @@ def bootstrap(
     target_manager = TargetManager()
     targets = execute(lambda: target_manager.import_manifest(replace=True))
     success(f"Se importaron {len(targets)} target(s) desde el manifiesto.")
+    profile_manager = profiles(target_manager)
+    maybe_offer_suggestion(profile_manager)
+    render_activation(profile_manager)
     should_restore = restore_files
     if should_restore is None and sys.stdin.isatty():
         should_restore = bool(questionary.confirm("¿Restaurar ahora todos los targets?", default=True).ask())
+    if should_restore or install_deps is True:
+        dependency_targets = [
+            target.name
+            for target in target_manager.selected()
+            if target.name != CONCORD_TARGET
+        ]
+        offer_dependency_installation(
+            target_manager,
+            dependency_targets,
+            scope_name="los targets activos importados",
+            requested=install_deps,
+            include_optional=include_optional,
+            dry_run=False,
+            yes=yes,
+        )
     if should_restore:
         restore_force = force
         conflicts = target_manager.restore_conflicts()

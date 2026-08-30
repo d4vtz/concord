@@ -5,7 +5,8 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Callable
 
-from concord.application.config import (CONCORD_TARGET, CONCORD_VERSION,
+from concord.application.config import (CONCORD_TARGET,
+                                        DEPENDENCY_MINIMUM_VERSION,
                                         PROFILE_MINIMUM_VERSION, Config,
                                         ConfigManager, DependencyConfig)
 from concord.application.database import Database
@@ -214,7 +215,7 @@ class DependencyManager:
             for target in config.targets
         ]
         if any(target.dependencies for target in config.targets):
-            config.minimum_concord_version = CONCORD_VERSION
+            config.minimum_concord_version = DEPENDENCY_MINIMUM_VERSION
         else:
             config.minimum_concord_version = (
                 PROFILE_MINIMUM_VERSION if config.profiles else None

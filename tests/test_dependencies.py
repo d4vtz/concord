@@ -5,28 +5,39 @@ import pytest
 from typer.testing import CliRunner
 
 from concord import application as concord
-from concord.application.config import Config, ConfigManager
+from concord.application.config import CONCORD_TARGET, Config, ConfigManager
 from concord.application.database import Database
 from concord.application.dependencies import (DependencyInstallError,
                                               DependencyManager)
+from concord.application.doctor import Doctor
+from concord.application.git import GitManager
+from concord.application.initializer import Initializer
 from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
 from concord.cli.app import app
 
 
-@pytest.fixture
-def dependency_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    home = tmp_path / "home"
-    home.mkdir()
+def configure_concord_environment(
+    home: Path, repository: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     config_dir = home / ".config/concord"
     data_dir = home / ".local/share/concord"
-    repository = tmp_path / "repository"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setattr(concord, "config_dir", config_dir)
     monkeypatch.setattr(concord, "config_file", config_dir / "concord.toml")
     monkeypatch.setattr(concord, "database_file", data_dir / "concord.db")
     monkeypatch.setattr(concord, "default_repository_dir", repository)
+
+
+@pytest.fixture
+def dependency_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    repository = tmp_path / "repository"
+    configure_concord_environment(home, repository, monkeypatch)
+    config_dir = home / ".config/concord"
+    data_dir = home / ".local/share/concord"
     ConfigManager().save(Config(repository_path=repository))
     database = Database(data_dir / "concord.db")
     targets = TargetManager(database, RepositoryManager(repository))
@@ -346,3 +357,213 @@ def test_aur_dry_run_does_not_persist_detected_helper(
     assert result.exit_code == 0, result.output
     assert "paru -S --needed -- visual-studio-code-bin" in result.output
     assert dependencies.configured_aur_helper() is None
+
+
+def test_restore_can_install_dependencies_before_touching_home(
+    dependency_environment, monkeypatch
+):
+    targets, dependencies, _ = dependency_environment
+    dependencies.add("nvim", "pacman", ["neovim"], validate=False)
+    local = targets.get("nvim").local_path
+    local.unlink()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["pacman", "-T"]:
+            return completed(command, 127, "neovim\n")
+        if command[:3] == ["sudo", "pacman", "-S"]:
+            return completed(command)
+        raise AssertionError(f"Comando inesperado: {command}")
+
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    monkeypatch.setattr("concord.application.dependencies.os.geteuid", lambda: 1000)
+    monkeypatch.setattr("concord.application.dependencies.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "concord.application.dependencies.shutil.which",
+        lambda executable: f"/usr/bin/{executable}"
+        if executable in {"pacman", "sudo"}
+        else None,
+    )
+
+    result = CliRunner().invoke(
+        app, ["restore", "nvim", "--install-deps", "--yes"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert local.read_text() == "nvim"
+    assert any(command[:3] == ["sudo", "pacman", "-S"] for command in calls)
+
+
+def test_dependency_install_failure_prevents_restore(
+    dependency_environment, monkeypatch
+):
+    targets, dependencies, _ = dependency_environment
+    dependencies.add("nvim", "pacman", ["neovim"], validate=False)
+    local = targets.get("nvim").local_path
+    local.unlink()
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["pacman", "-T"]:
+            return completed(command, 127, "neovim\n")
+        return completed(command, 1)
+
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    monkeypatch.setattr("concord.application.dependencies.os.geteuid", lambda: 0)
+    monkeypatch.setattr("concord.application.dependencies.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "concord.application.dependencies.shutil.which",
+        lambda executable: f"/usr/bin/{executable}"
+        if executable in {"git", "pacman"}
+        else None,
+    )
+
+    result = CliRunner().invoke(
+        app, ["restore", "nvim", "--install-deps", "--yes"]
+    )
+
+    assert result.exit_code == 1
+    assert not local.exists()
+    assert "Pendientes" in result.output
+
+
+def test_restore_dependency_dry_run_is_read_only(
+    dependency_environment, monkeypatch
+):
+    targets, dependencies, _ = dependency_environment
+    dependencies.add("nvim", "pacman", ["neovim"], validate=False)
+    local = targets.get("nvim").local_path
+    local.unlink()
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    monkeypatch.setattr("concord.application.dependencies.os.geteuid", lambda: 0)
+    monkeypatch.setattr(
+        "concord.application.dependencies.subprocess.run",
+        lambda command, **kwargs: completed(command, 127, "neovim\n"),
+    )
+    monkeypatch.setattr(
+        "concord.application.dependencies.shutil.which",
+        lambda executable: f"/usr/bin/{executable}" if executable == "pacman" else None,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["restore", "nvim", "--install-deps", "--dry-run"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Plan de instalación" in result.output
+    assert "Simulación completada" in result.output
+    assert not local.exists()
+
+
+def test_restore_and_bootstrap_expose_dependency_options():
+    runner = CliRunner()
+
+    restore_help = runner.invoke(app, ["restore", "--help"]).output
+    bootstrap_help = runner.invoke(app, ["bootstrap", "--help"]).output
+
+    for output in (restore_help, bootstrap_help):
+        assert "--install-deps" in output
+        assert "--include-optional" in output
+        assert "--yes" in output
+
+
+def test_doctor_reports_required_and_optional_dependencies(
+    dependency_environment, monkeypatch
+):
+    _, dependencies, _ = dependency_environment
+    dependencies.add("nvim", "pacman", ["neovim"], validate=False)
+    dependencies.add(
+        "nvim", "pacman", ["ripgrep"], optional=True, validate=False
+    )
+    monkeypatch.setattr(
+        "concord.application.doctor.shutil.which",
+        lambda executable: "/usr/bin/pacman" if executable == "pacman" else None,
+    )
+    monkeypatch.setattr(
+        "concord.application.doctor.subprocess.run",
+        lambda command, **kwargs: completed(command, 127, "neovim\nripgrep\n"),
+    )
+
+    report = Doctor().run()
+
+    required = next(
+        check
+        for check in report.checks
+        if check.section == "Dependencias" and check.name == "Obligatorias"
+    )
+    optional = next(
+        check
+        for check in report.checks
+        if check.section == "Dependencias" and check.name == "Opcionales"
+    )
+    assert required.state == "warning" and "neovim" in required.message
+    assert optional.state == "pass" and "1 no instalada" in optional.message
+    assert "Dependencias" in [timing.name for timing in report.timings]
+
+
+def test_bootstrap_can_install_imported_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    source_home.mkdir()
+    destination_home.mkdir()
+    source_repository = tmp_path / "source-repository"
+    destination_repository = tmp_path / "destination-repository"
+
+    configure_concord_environment(source_home, source_repository, monkeypatch)
+    Initializer().initialize(
+        source_repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    source = source_home / ".bashrc"
+    source.write_text("alias ll='ls -la'\n")
+    TargetManager().add(source, "bash")
+    DependencyManager().add("bash", "pacman", ["bash"], validate=False)
+    TargetManager().sync(CONCORD_TARGET)
+    GitManager(source_repository).commit([Path(".")], "bash: add dependencies")
+
+    configure_concord_environment(
+        destination_home, destination_repository, monkeypatch
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["pacman", "-T"]:
+            return completed(command, 127, "bash\n")
+        if command[:3] == ["pacman", "-S", "--needed"]:
+            return completed(command)
+        raise AssertionError(f"Comando inesperado: {command}")
+
+    def dependency_factory(target_manager=None):
+        assert target_manager is not None
+        return DependencyManager(
+            target_manager.database,
+            target_manager.config_manager,
+            runner=fake_run,
+            which=lambda executable: (
+                f"/usr/bin/{executable}" if executable == "pacman" else None
+            ),
+        )
+
+    monkeypatch.setattr("concord.application.dependencies.os.geteuid", lambda: 0)
+    monkeypatch.setattr("concord.cli.app.dependencies", dependency_factory)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bootstrap",
+            str(source_repository),
+            "--repository",
+            str(destination_repository),
+            "--no-restore",
+            "--install-deps",
+            "--yes",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert any(command[:3] == ["pacman", "-S", "--needed"] for command in calls)
+    assert not (destination_home / ".bashrc").exists()

@@ -227,8 +227,26 @@ posterior no desinstala paquetes ya agregados: informa lo completado y lo que
 queda pendiente.
 
 `deps remove` elimina solo la declaración del manifiesto; nunca desinstala
-paquetes del sistema. La integración con `bootstrap`, `restore` y `doctor` queda
-reservada para una entrega posterior.
+paquetes del sistema.
+
+Antes de restaurar, Concord puede comprobar e instalar las dependencias del
+target o de todos los targets activos:
+
+```bash
+concord restore nvim --install-deps
+concord restore --all --install-deps
+concord restore --all --install-deps --include-optional
+```
+
+En una terminal, si se omite `--install-deps`, Concord ofrece preparar la
+instalación cuando encuentra paquetes faltantes. En automatización se omite por
+defecto y debe autorizarse con `--install-deps --yes`. Si la instalación falla,
+la restauración se detiene antes de modificar HOME. `--dry-run` muestra también
+el plan de paquetes sin instalarlos.
+
+`concord doctor` comprueba las declaraciones, `pacman`, el helper AUR y los
+paquetes obligatorios. Las dependencias opcionales ausentes son informativas y
+no convierten el diagnóstico en error.
 
 ## Editar configuraciones
 
@@ -642,6 +660,16 @@ ofrece restaurar todos los targets. También puede controlarse explícitamente:
 ```bash
 concord bootstrap https://github.com/usuario/dotfiles.git --restore
 concord bootstrap https://github.com/usuario/dotfiles.git --no-restore
+concord bootstrap https://github.com/usuario/dotfiles.git --install-deps
+```
+
+Después de importar el manifiesto y resolver los perfiles activos, `bootstrap`
+ofrece instalar sus paquetes antes de restaurar archivos. En modo no
+interactivo debe indicarse explícitamente:
+
+```bash
+concord bootstrap https://github.com/usuario/dotfiles.git \
+  --restore --install-deps --yes
 ```
 
 Si existen configuraciones locales, `bootstrap` muestra las rutas afectadas y
