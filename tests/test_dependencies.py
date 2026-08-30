@@ -221,6 +221,7 @@ def test_only_pacman_uses_sudo_for_installation(dependency_environment, monkeypa
 def test_cli_add_list_check_and_dry_run(dependency_environment, monkeypatch):
     targets, _, _ = dependency_environment
     monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    monkeypatch.setattr("concord.application.dependencies.os.geteuid", lambda: 1000)
 
     def fake_run(command, **kwargs):
         if command[:2] == ["pacman", "-T"]:
@@ -230,7 +231,9 @@ def test_cli_add_list_check_and_dry_run(dependency_environment, monkeypatch):
     monkeypatch.setattr("concord.application.dependencies.subprocess.run", fake_run)
     monkeypatch.setattr(
         "concord.application.dependencies.shutil.which",
-        lambda executable: f"/usr/bin/{executable}" if executable == "pacman" else None,
+        lambda executable: f"/usr/bin/{executable}"
+        if executable in {"pacman", "sudo"}
+        else None,
     )
     runner = CliRunner()
 
