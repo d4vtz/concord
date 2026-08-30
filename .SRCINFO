@@ -1,7 +1,7 @@
 pkgbase = concord
 	pkgdesc = Gestor explícito y seguro de dotfiles con integración Git
-	pkgver = 2.3.1
-	pkgrel = 8
+	pkgver = 2.4.0
+	pkgrel = 1
 	url = https://github.com/d4vtz/concord
 	arch = any
 	license = MIT

@@ -285,8 +285,9 @@ revertir cambios si falla el reemplazo.
 
 ## Revisar cambios antes de sincronizar
 
-`concord diff [target]` compara `$HOME` con el repositorio desde la perspectiva
-de `sync`. Informa qué rutas serían agregadas, modificadas o eliminadas:
+`concord diff` compara `$HOME` con el repositorio desde la perspectiva de
+`sync`. Sin argumentos presenta un resumen de las rutas que serían agregadas,
+modificadas o eliminadas:
 
 ```text
 ● Modificado  .config/nvim/init.lua
@@ -297,6 +298,20 @@ de `sync`. Informa qué rutas serían agregadas, modificadas o eliminadas:
 Sin argumento compara todos los targets. El comando es de solo lectura: no
 copia archivos ni cambia `updated_at`. También compara el destino de los enlaces
 simbólicos y detecta directorios vacíos.
+
+Al indicar un target, muestra el contenido como un diff unificado: las líneas
+`-` pertenecen al repositorio y las líneas `+` a HOME.
+
+```bash
+concord diff zsh
+concord diff zsh --path ~/.zshenv
+concord diff nvim --path ~/.config/nvim/init.lua --context 5
+```
+
+`--path` acepta una ruta registrada o cualquier archivo contenido en ella.
+`--context` controla las líneas adyacentes mostradas y usa `3` por defecto.
+Los archivos binarios, enlaces simbólicos, directorios vacíos y cambios de tipo
+se resumen explícitamente sin intentar imprimir contenido ilegible.
 
 ## Simular operaciones
 

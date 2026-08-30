@@ -587,6 +587,114 @@ def test_diff_detects_changed_symbolic_link(manager):
     assert entry.relative_path == Path(".config/example/current")
 
 
+def test_content_diff_renders_unified_text_from_repository_to_home(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("first\nold value\nlast\n")
+    instance.add(source, "bash")
+    source.write_text("first\nnew value\nlast\n")
+    before_timestamp = instance.get("bash").updated_at
+
+    difference = instance.content_diff("bash", context=1)[0]
+
+    assert difference.kind == "text"
+    assert difference.state == "modified"
+    assert "--- repositorio/bash/.bashrc" in difference.content
+    assert "+++ HOME/~/.bashrc" in difference.content
+    assert "-old value" in difference.content
+    assert "+new value" in difference.content
+    assert instance.get("bash").updated_at == before_timestamp
+
+
+def test_content_diff_describes_binary_and_symbolic_link_changes(manager):
+    instance, home, _ = manager
+    directory = home / ".config/example"
+    directory.mkdir(parents=True)
+    binary = directory / "cache.bin"
+    binary.write_bytes(b"before\0data")
+    link = directory / "current"
+    link.symlink_to("first")
+    instance.add(directory, "example")
+    binary.write_bytes(b"after\0binary-data")
+    link.unlink()
+    link.symlink_to("second")
+
+    differences = {item.relative_path.name: item for item in instance.content_diff("example")}
+
+    assert differences["cache.bin"].kind == "binary"
+    assert "bytes" in differences["cache.bin"].detail
+    assert differences["current"].kind == "symlink"
+    assert "enlace → first" in differences["current"].detail
+    assert "enlace → second" in differences["current"].detail
+
+
+def test_content_diff_renders_added_deleted_and_type_changes(manager):
+    instance, home, _ = manager
+    directory = home / ".config/example"
+    directory.mkdir(parents=True)
+    deleted = directory / "deleted.txt"
+    changed_type = directory / "current"
+    deleted.write_text("stored only\n")
+    changed_type.write_text("regular file\n")
+    instance.add(directory, "example")
+    deleted.unlink()
+    added = directory / "added.txt"
+    added.write_text("local only\n")
+    changed_type.unlink()
+    changed_type.symlink_to("destination")
+
+    differences = {item.relative_path.name: item for item in instance.content_diff("example")}
+
+    assert differences["added.txt"].state == "added"
+    assert "--- /dev/null" in differences["added.txt"].content
+    assert "+local only" in differences["added.txt"].content
+    assert differences["deleted.txt"].state == "deleted"
+    assert "+++ /dev/null" in differences["deleted.txt"].content
+    assert "-stored only" in differences["deleted.txt"].content
+    assert differences["current"].kind == "type"
+    assert "Repositorio: file" in differences["current"].detail
+    assert "HOME: enlace → destination" in differences["current"].detail
+
+
+def test_content_diff_path_filters_nested_files(manager):
+    instance, home, _ = manager
+    directory = home / ".config/nvim"
+    directory.mkdir(parents=True)
+    first = directory / "init.lua"
+    second = directory / "plugins.lua"
+    first.write_text("one\n")
+    second.write_text("one\n")
+    instance.add(directory, "nvim")
+    first.write_text("two\n")
+    second.write_text("two\n")
+
+    differences = instance.content_diff("nvim", path=first)
+
+    assert [item.relative_path for item in differences] == [Path(".config/nvim/init.lua")]
+    with pytest.raises(ValueError, match="no pertenece"):
+        instance.content_diff("nvim", path=home / ".bashrc")
+
+
+def test_diff_cli_shows_content_only_for_explicit_target(manager):
+    instance, home, _ = manager
+    source = home / ".bashrc"
+    source.write_text("old\n")
+    instance.add(source, "bash")
+    source.write_text("new\n")
+    runner = CliRunner()
+
+    summary = runner.invoke(app, ["diff"])
+    content = runner.invoke(app, ["diff", "bash"])
+
+    assert summary.exit_code == 0, summary.output
+    assert "Modificado" in summary.output
+    assert "-old" not in summary.output
+    assert content.exit_code == 0, content.output
+    assert "-old" in content.output
+    assert "+new" in content.output
+    assert "solo lectura" in content.output
+
+
 def test_sync_preview_is_read_only(manager):
     instance, home, repository = manager
     source = home / ".bashrc"

@@ -10,6 +10,7 @@ from pathlib import Path
 import questionary
 import typer
 from rich import box
+from rich.syntax import Syntax
 from rich.table import Table
 from rich.tree import Tree
 
@@ -351,6 +352,35 @@ def render_differences(differences, *, command: str) -> None:
     )
     warning("Esta es una simulación; no se modificó ningún archivo ni metadato.")
     console.print(f"  [concord.muted]Para aplicar los cambios:[/] {command}")
+
+
+def render_content_differences(name: str, differences, *, path: Path | None = None) -> None:
+    if not differences:
+        scope = f" en '{path}'" if path is not None else ""
+        success(f"'{name}' no tiene cambios locales{scope}.")
+        return
+    labels = {
+        "added": ("+ Agregado", "#A3BE8C"),
+        "modified": ("● Modificado", "#EBCB8B"),
+        "deleted": ("− Eliminado", "#BF616A"),
+    }
+    for difference in differences:
+        label, color = labels[difference.state]
+        console.print(
+            f"\n[{color}]{label}[/]  [bold concord.path]{format_home_path(Path.home() / difference.relative_path)}[/]"
+        )
+        if difference.kind == "text" and difference.content:
+            console.print(Syntax(difference.content.rstrip("\n"), "diff", theme="nord", word_wrap=False))
+        elif difference.detail:
+            console.print(difference.detail, style="concord.muted", markup=False)
+    details(
+        [
+            ("Target", name),
+            ("Archivos con cambios", str(len(differences))),
+        ],
+        title="Resumen",
+    )
+    warning("Comparación de solo lectura; no se modificó ningún archivo ni metadato.")
 
 
 @app.command()
@@ -866,18 +896,45 @@ def diff_targets(
         help="Target concreto; omítelo para comparar todos.",
         autocompletion=complete_targets,
     ),
+    path: Path | None = typer.Option(
+        None,
+        "--path",
+        "-p",
+        help="Limita la comparación a una ruta del target.",
+        autocompletion=complete_target_paths,
+    ),
+    context: int = typer.Option(
+        3,
+        "--context",
+        "-C",
+        min=0,
+        help="Líneas de contexto del diff unificado.",
+    ),
 ) -> None:
-    """Muestra los cambios que sync aplicaría al repositorio."""
+    """Compara HOME con el repositorio sin modificar archivos."""
     heading("DIFERENCIAS", "Vista previa de HOME → repositorio")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
     maybe_offer_suggestion(profile_manager)
     render_activation(profile_manager)
+    if path is not None and name is None:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("--path requiere indicar primero un target.")
+            )
+        )
+    if name is not None:
+        differences = execute(
+            lambda: target_manager.content_diff(name, path=path, context=context),
+            hint="La ruta debe pertenecer al target seleccionado.",
+        )
+        render_content_differences(name, differences, path=path)
+        return
     differences = execute(
-        lambda: target_manager.diff(name),
+        lambda: target_manager.diff(),
         hint="Consulta los nombres disponibles con: concord list",
     )
-    render_differences(differences, command="concord sync" + (f" {name}" if name else ""))
+    render_differences(differences, command="concord sync")
 
 
 @app.command()

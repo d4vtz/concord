@@ -1,3 +1,4 @@
+import difflib
 import filecmp
 import os
 import shutil
@@ -37,6 +38,15 @@ class TargetDiff:
     @property
     def clean(self) -> bool:
         return not self.entries
+
+
+@dataclass(frozen=True)
+class ContentDiff:
+    state: str
+    relative_path: Path
+    kind: str
+    content: str | None = None
+    detail: str | None = None
 
 
 class TargetManager:
@@ -521,6 +531,102 @@ class TargetManager:
     def diff(self, name: str | None = None) -> list[TargetDiff]:
         targets = [self.get(name)] if name else self.selected()
         return [self._target_diff(target) for target in targets]
+
+    def content_diff(
+        self,
+        name: str,
+        *,
+        path: Path | None = None,
+        context: int = 3,
+    ) -> list[ContentDiff]:
+        if context < 0:
+            raise ValueError("El contexto no puede ser negativo.")
+        target = self.get(name)
+        selected = self._selected_diff_path(target, path) if path is not None else None
+        entries = self._target_diff(target).entries
+        if selected is not None:
+            entries = [
+                entry
+                for entry in entries
+                if entry.relative_path == selected
+                or entry.relative_path.is_relative_to(selected)
+            ]
+        return [self._content_diff_entry(target, entry, context=context) for entry in entries]
+
+    def _selected_diff_path(self, target: Target, requested: Path) -> Path:
+        expanded = requested.expanduser()
+        candidate = expanded if expanded.is_absolute() else Path.home() / expanded
+        candidate = Path(os.path.abspath(candidate))
+        roots = [path.local_path for path in target.paths]
+        if not any(candidate == root or candidate.is_relative_to(root) for root in roots):
+            raise ValueError(f"La ruta '{requested}' no pertenece al target '{target.name}'.")
+        return candidate.relative_to(Path.home().resolve())
+
+    def _content_diff_entry(
+        self,
+        target: Target,
+        entry: DiffEntry,
+        *,
+        context: int,
+    ) -> ContentDiff:
+        local = Path.home().resolve() / entry.relative_path
+        stored = self.repository.target_path(target.name) / entry.relative_path
+        local_exists = os.path.lexists(local)
+        stored_exists = os.path.lexists(stored)
+        local_kind = self._content_kind(local) if local_exists else "missing"
+        stored_kind = self._content_kind(stored) if stored_exists else "missing"
+        if "symlink" in {local_kind, stored_kind}:
+            stored_description = (
+                f"enlace → {os.readlink(stored)}" if stored_kind == "symlink" else stored_kind
+            )
+            local_description = (
+                f"enlace → {os.readlink(local)}" if local_kind == "symlink" else local_kind
+            )
+            detail = f"Repositorio: {stored_description}\nHOME: {local_description}"
+            kind = "symlink" if {local_kind, stored_kind} <= {"symlink", "missing"} else "type"
+            return ContentDiff(entry.state, entry.relative_path, kind, detail=detail)
+        if local_kind == "directory" or stored_kind == "directory":
+            if local_kind != stored_kind and "missing" not in {local_kind, stored_kind}:
+                detail = f"Repositorio: {stored_kind}\nHOME: {local_kind}"
+                return ContentDiff(entry.state, entry.relative_path, "type", detail=detail)
+            action = "agregado en HOME" if entry.state == "added" else "eliminado de HOME"
+            return ContentDiff(entry.state, entry.relative_path, "directory", detail=f"Directorio vacío {action}.")
+        old_text = self._read_text(stored) if stored_exists else ""
+        new_text = self._read_text(local) if local_exists else ""
+        if old_text is None or new_text is None:
+            old_size = stored.stat().st_size if stored_exists else 0
+            new_size = local.stat().st_size if local_exists else 0
+            detail = f"Repositorio: {old_size} bytes\nHOME: {new_size} bytes"
+            return ContentDiff(entry.state, entry.relative_path, "binary", detail=detail)
+        relative = entry.relative_path.as_posix()
+        content = "".join(
+            difflib.unified_diff(
+                old_text.splitlines(keepends=True),
+                new_text.splitlines(keepends=True),
+                fromfile=f"repositorio/{target.name}/{relative}" if stored_exists else "/dev/null",
+                tofile=f"HOME/~/{relative}" if local_exists else "/dev/null",
+                n=context,
+            )
+        )
+        return ContentDiff(entry.state, entry.relative_path, "text", content=content)
+
+    @staticmethod
+    def _content_kind(path: Path) -> str:
+        if path.is_symlink():
+            return "symlink"
+        if path.is_dir():
+            return "directory"
+        return "file"
+
+    @staticmethod
+    def _read_text(path: Path) -> str | None:
+        data = path.read_bytes()
+        if b"\0" in data:
+            return None
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
 
     def preview_sync(self, name: str | None = None) -> list[TargetDiff]:
         return self.diff(name)
