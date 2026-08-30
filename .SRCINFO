@@ -17,7 +17,7 @@ pkgbase = concord
 	depends = python-tomli-w
 	depends = python-typer
 	optdepends = github-cli: crear y autenticar repositorios remotos en GitHub
-	source = concord::git+https://github.com/d4vtz/concord.git#commit=4bc59e1942cedd1225911ca2bc62cfb2af1b6780
+	source = concord::git+https://github.com/d4vtz/concord.git#commit=064a4184233ef9db68936c2da89529cbbc570295
 	b2sums = SKIP
 
 pkgname = concord
