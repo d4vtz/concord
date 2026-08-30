@@ -1,8 +1,8 @@
 # Maintainer: David Torrez Reyes <davidtorrezreyes@gmail.com>
 
 pkgname=concord
-pkgver=2.6.0
-pkgrel=2
+pkgver=2.7.0
+pkgrel=1
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
 url='https://github.com/d4vtz/concord'

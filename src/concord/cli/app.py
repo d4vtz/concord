@@ -3,6 +3,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -267,14 +268,11 @@ def resolve_aur_helper(
                 f"El helper configurado '{configured}' no está disponible. "
                 "Ejecute concord deps helper en una terminal."
             )
-        if len(available) == 1:
-            if persist:
-                dependency_manager.set_aur_helper(available[0])
-            return available[0]
-        raise ValueError("Configure el helper AUR con concord deps helper paru|yay.")
-    selected = available[0] if len(available) == 1 else request_select(
-        "Helper AUR:", available
-    )
+        raise ValueError(
+            "No hay un helper AUR preferido. Configúrelo en una terminal con "
+            "concord deps helper paru|yay."
+        )
+    selected = request_select("Helper AUR:", available)
     if configured and persist and not questionary.confirm(
         f"'{configured}' no está disponible. ¿Cambiar la preferencia local a '{selected}'?",
         default=True,
@@ -283,6 +281,93 @@ def resolve_aur_helper(
     if persist:
         dependency_manager.set_aur_helper(selected)
     return selected
+
+
+def install_aur_helper_command(dependency_manager: DependencyManager) -> str:
+    if not sys.stdin.isatty():
+        raise ValueError(
+            "La instalación del helper AUR está prohibida en modo no interactivo. "
+            "Ejecute concord deps helper install desde una terminal."
+        )
+    available = dependency_manager.available_aur_helpers()
+    if available:
+        selected = resolve_aur_helper(dependency_manager)
+        success(f"El helper AUR '{selected}' ya está disponible.")
+        return selected
+    selected = request_select("Helper AUR que se preparará:", list(AUR_HELPERS))
+    source = execute(lambda: dependency_manager.aur_helper_source(selected))
+    missing = execute(dependency_manager.missing_aur_helper_prerequisites)
+    details(
+        [
+            ("Helper", source.helper),
+            ("Paquete", source.package),
+            ("Origen", source.url),
+            ("Prerrequisitos", ", ".join(missing) or "instalados"),
+        ],
+        title="Preparación del helper AUR",
+    )
+    if missing:
+        if not questionary.confirm(
+            f"¿Instalar primero {', '.join(missing)} con pacman?", default=False
+        ).ask():
+            raise ValueError("No se instalaron los prerrequisitos del helper AUR.")
+        execute(lambda: dependency_manager.install_aur_helper_prerequisites(missing))
+    with tempfile.TemporaryDirectory(prefix="concord-aur-helper-") as temporary:
+        source_dir = Path(temporary) / source.package
+        execute(lambda: dependency_manager.clone_aur_helper(selected, source_dir))
+        pkgbuild = execute(lambda: (source_dir / "PKGBUILD").read_text())
+        console.print(
+            Syntax(
+                pkgbuild,
+                "bash",
+                theme="nord",
+                line_numbers=True,
+                word_wrap=False,
+            )
+        )
+        details(
+            [
+                ("Origen verificado", source.url),
+                ("Directorio temporal", str(source_dir)),
+                ("Comando", "makepkg -si"),
+            ],
+            title="Construcción prevista",
+        )
+        if not questionary.confirm(
+            f"¿Construir e instalar {source.package}?", default=False
+        ).ask():
+            raise ValueError("Instalación del helper AUR cancelada.")
+        execute(
+            lambda: dependency_manager.install_cloned_aur_helper(
+                selected, source_dir
+            )
+        )
+    success(f"'{source.helper}' quedó instalado y guardado como preferencia local.")
+    return source.helper
+
+
+def resolve_or_prepare_aur_helper(
+    dependency_manager: DependencyManager, *, dry_run: bool
+) -> str | None:
+    available = dependency_manager.available_aur_helpers()
+    if not available:
+        if dry_run:
+            warning(
+                "No se encontró paru ni yay; las dependencias AUR requieren preparar "
+                "un helper con: concord deps helper install"
+            )
+            return None
+        return execute(lambda: install_aur_helper_command(dependency_manager))
+    if (
+        dry_run
+        and not sys.stdin.isatty()
+        and dependency_manager.configured_aur_helper() is None
+        and len(available) == 1
+    ):
+        return available[0]
+    return execute(
+        lambda: resolve_aur_helper(dependency_manager, persist=not dry_run)
+    )
 
 
 def render_dependencies(
@@ -437,9 +522,11 @@ def dependency_install_command(
         return
     aur_helper = None
     if any(dependency.manager == "aur" for dependency in selected):
-        aur_helper = execute(
-            lambda: resolve_aur_helper(dependency_manager, persist=not dry_run)
+        aur_helper = resolve_or_prepare_aur_helper(
+            dependency_manager, dry_run=dry_run
         )
+        if aur_helper is None:
+            return
     commands = execute(
         lambda: dependency_manager.install_commands(
             selected, aur_helper=aur_helper
@@ -700,12 +787,17 @@ def deps_install(
 
 @deps_app.command("helper")
 def deps_helper(
-    helper: str | None = typer.Argument(None),
+    helper: str | None = typer.Argument(
+        None, help="'paru', 'yay' o 'install'."
+    ),
 ) -> None:
-    """Consulta o selecciona el helper AUR local."""
+    """Consulta, selecciona o instala el helper AUR local."""
     heading("HELPER AUR", "Configuración local de paru o yay")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     dependency_manager = dependencies(target_manager)
+    if helper == "install":
+        execute(lambda: install_aur_helper_command(dependency_manager))
+        return
     if helper is None:
         helper = execute(lambda: resolve_aur_helper(dependency_manager))
     else:

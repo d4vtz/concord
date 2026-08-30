@@ -2,6 +2,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import typer
 from typer.testing import CliRunner
 
 from concord import application as concord
@@ -357,6 +358,215 @@ def test_aur_dry_run_does_not_persist_detected_helper(
     assert result.exit_code == 0, result.output
     assert "paru -S --needed -- visual-studio-code-bin" in result.output
     assert dependencies.configured_aur_helper() is None
+
+
+def test_aur_helper_sources_are_fixed_to_official_https_repositories(
+    dependency_environment,
+):
+    _, dependencies, _ = dependency_environment
+
+    paru = dependencies.aur_helper_source("paru")
+    yay = dependencies.aur_helper_source("yay")
+
+    assert (paru.package, paru.url) == (
+        "paru-bin",
+        "https://aur.archlinux.org/paru-bin.git",
+    )
+    assert (yay.package, yay.url) == (
+        "yay-bin",
+        "https://aur.archlinux.org/yay-bin.git",
+    )
+
+
+def test_aur_helper_install_is_forbidden_without_terminal(
+    dependency_environment, monkeypatch
+):
+    targets, _, _ = dependency_environment
+    calls = []
+
+    def dependency_factory(target_manager=None):
+        return DependencyManager(
+            targets.database,
+            runner=lambda command, **kwargs: calls.append(command),
+            which=lambda executable: (
+                "/usr/bin/pacman" if executable == "pacman" else None
+            ),
+        )
+
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    monkeypatch.setattr("concord.cli.app.dependencies", dependency_factory)
+
+    result = CliRunner().invoke(app, ["deps", "helper", "install"])
+
+    assert result.exit_code == 1
+    assert "prohibida en modo no interactivo" in result.output
+    assert calls == []
+
+
+def test_aur_dry_run_only_reports_missing_helper(
+    dependency_environment, monkeypatch
+):
+    targets, dependencies, _ = dependency_environment
+    dependencies.add("nvim", "aur", ["some-aur-package"], validate=False)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["pacman", "-T"]:
+            return completed(command, 127, "some-aur-package\n")
+        raise AssertionError(f"No debía ejecutarse: {command}")
+
+    def dependency_factory(target_manager=None):
+        return DependencyManager(
+            targets.database,
+            runner=fake_run,
+            which=lambda executable: (
+                "/usr/bin/pacman" if executable == "pacman" else None
+            ),
+        )
+
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    monkeypatch.setattr("concord.cli.app.dependencies", dependency_factory)
+
+    result = CliRunner().invoke(
+        app, ["deps", "install", "nvim", "--dry-run"]
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "concord deps helper install" in result.output
+    assert calls == [["pacman", "-T", "some-aur-package"]]
+
+
+def test_interactive_aur_helper_bootstrap_installs_and_cleans_temporary_directory(
+    dependency_environment, monkeypatch, capsys
+):
+    targets, _, _ = dependency_environment
+    available = {"pacman", "sudo"}
+    calls = []
+    build_directories = []
+
+    class Terminal:
+        @staticmethod
+        def isatty():
+            return True
+
+    class Confirmation:
+        @staticmethod
+        def ask():
+            return True
+
+    def which(executable):
+        return f"/usr/bin/{executable}" if executable in available else None
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command[:2] == ["pacman", "-T"]:
+            return completed(command, 127, "base-devel\ngit\n")
+        if command[:3] == ["sudo", "pacman", "-S"]:
+            available.update({"git", "makepkg"})
+            return completed(command)
+        if command[:3] == ["git", "clone", "--depth"]:
+            destination = Path(command[-1])
+            destination.mkdir(parents=True)
+            (destination / "PKGBUILD").write_text(
+                "pkgname=paru-bin\npkgver=1\n"
+            )
+            return completed(command)
+        if len(command) >= 3 and command[:2] == ["git", "-C"]:
+            return completed(
+                command, stdout="https://aur.archlinux.org/paru-bin.git\n"
+            )
+        if command == ["makepkg", "-si"]:
+            build_directories.append(Path(kwargs["cwd"]))
+            available.add("paru")
+            return completed(command)
+        raise AssertionError(f"Comando inesperado: {command}")
+
+    dependency_manager = DependencyManager(
+        targets.database,
+        runner=fake_run,
+        which=which,
+    )
+    monkeypatch.setattr("concord.cli.app.sys.stdin", Terminal())
+    monkeypatch.setattr("concord.cli.app.request_select", lambda *args: "paru")
+    monkeypatch.setattr(
+        "concord.cli.app.questionary.confirm", lambda *args, **kwargs: Confirmation()
+    )
+    monkeypatch.setattr("concord.application.dependencies.os.geteuid", lambda: 1000)
+
+    from concord.cli.app import install_aur_helper_command
+
+    selected = install_aur_helper_command(dependency_manager)
+
+    assert selected == "paru"
+    assert dependency_manager.configured_aur_helper() == "paru"
+    assert build_directories and not build_directories[0].exists()
+    makepkg_call = next(item for item in calls if item[0] == ["makepkg", "-si"])
+    assert "capture_output" not in makepkg_call[1]
+    assert "--noconfirm" not in makepkg_call[0]
+    assert "pkgname=paru-bin" in capsys.readouterr().out
+
+
+def test_failed_aur_helper_bootstrap_also_cleans_temporary_directory(
+    dependency_environment, monkeypatch
+):
+    targets, _, _ = dependency_environment
+    build_directories = []
+
+    class Terminal:
+        @staticmethod
+        def isatty():
+            return True
+
+    class Confirmation:
+        @staticmethod
+        def ask():
+            return True
+
+    def fake_run(command, **kwargs):
+        if command[:2] == ["pacman", "-T"]:
+            return completed(command)
+        if command[:3] == ["git", "clone", "--depth"]:
+            destination = Path(command[-1])
+            destination.mkdir(parents=True)
+            (destination / "PKGBUILD").write_text("pkgname=yay-bin\n")
+            return completed(command)
+        if len(command) >= 3 and command[:2] == ["git", "-C"]:
+            return completed(
+                command, stdout="https://aur.archlinux.org/yay-bin.git\n"
+            )
+        raise AssertionError(f"Comando inesperado: {command}")
+
+    dependency_manager = DependencyManager(
+        targets.database,
+        runner=fake_run,
+        which=lambda executable: (
+            f"/usr/bin/{executable}"
+            if executable in {"pacman", "git", "makepkg"}
+            else None
+        ),
+    )
+
+    def fail_install(helper, source_dir):
+        build_directories.append(source_dir)
+        raise ValueError("fallo simulado de makepkg")
+
+    monkeypatch.setattr("concord.cli.app.sys.stdin", Terminal())
+    monkeypatch.setattr("concord.cli.app.request_select", lambda *args: "yay")
+    monkeypatch.setattr(
+        "concord.cli.app.questionary.confirm", lambda *args, **kwargs: Confirmation()
+    )
+    monkeypatch.setattr(
+        dependency_manager, "install_cloned_aur_helper", fail_install
+    )
+
+    from concord.cli.app import install_aur_helper_command
+
+    with pytest.raises(typer.Exit):
+        install_aur_helper_command(dependency_manager)
+
+    assert build_directories and not build_directories[0].exists()
+    assert dependency_manager.configured_aur_helper() is None
 
 
 def test_restore_can_install_dependencies_before_touching_home(

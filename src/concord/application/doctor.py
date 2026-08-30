@@ -432,7 +432,7 @@ class Doctor:
                     "Helper AUR",
                     "warning",
                     "No se encontró paru ni yay.",
-                    "Instala un helper AUR antes de instalar esos paquetes.",
+                    "Prepáralo con: concord deps helper install",
                 )
         packages = sorted(grouped)
         try:

@@ -3,6 +3,7 @@ import re
 import shutil
 import subprocess
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from concord.application.config import (CONCORD_TARGET,
@@ -15,6 +16,12 @@ from concord.application.profile_manager import ProfileManager
 PACKAGE_PATTERN = re.compile(r"^[A-Za-z0-9@._+:-]+$")
 MANAGERS = ("pacman", "aur")
 AUR_HELPERS = ("paru", "yay")
+AUR_HELPER_PACKAGES = {"paru": "paru-bin", "yay": "yay-bin"}
+AUR_HELPER_URLS = {
+    "paru": "https://aur.archlinux.org/paru-bin.git",
+    "yay": "https://aur.archlinux.org/yay-bin.git",
+}
+AUR_HELPER_PREREQUISITES = ("base-devel", "git")
 
 
 @dataclass(frozen=True)
@@ -44,6 +51,13 @@ class DependencyStatus:
 class InstallResult:
     installed: tuple[ResolvedDependency, ...]
     pending: tuple[ResolvedDependency, ...]
+
+
+@dataclass(frozen=True)
+class AurHelperSource:
+    helper: str
+    package: str
+    url: str
 
 
 class DependencyInstallError(ValueError):
@@ -128,6 +142,92 @@ class DependencyManager:
                 (normalized,),
             )
 
+    def aur_helper_source(self, helper: str) -> AurHelperSource:
+        normalized = helper.strip().lower()
+        if normalized not in AUR_HELPERS:
+            raise ValueError("El helper AUR debe ser 'paru' o 'yay'.")
+        return AurHelperSource(
+            normalized,
+            AUR_HELPER_PACKAGES[normalized],
+            AUR_HELPER_URLS[normalized],
+        )
+
+    def missing_aur_helper_prerequisites(self) -> list[str]:
+        if self.which("pacman") is None:
+            raise FileNotFoundError(
+                "No se encontró pacman; la preparación del helper requiere Arch Linux."
+            )
+        result = self._run_query(
+            ["pacman", "-T", *AUR_HELPER_PREREQUISITES]
+        )
+        if result.returncode not in {0, 127}:
+            detail = result.stderr.strip() if result.stderr else "consulta fallida"
+            raise ValueError(f"No se pudieron comprobar los prerrequisitos: {detail}.")
+        missing = set(result.stdout.splitlines())
+        return [
+            package for package in AUR_HELPER_PREREQUISITES if package in missing
+        ]
+
+    def install_aur_helper_prerequisites(self, packages: list[str]) -> None:
+        normalized = [self._normalize_package(package) for package in packages]
+        if not normalized:
+            return
+        command = self._backend_command("pacman", "install", normalized)
+        result = self.runner(command, text=True, check=False)
+        if result.returncode != 0:
+            raise ValueError(
+                "La instalación de prerrequisitos con pacman falló "
+                f"con código {result.returncode}."
+            )
+
+    def clone_aur_helper(self, helper: str, destination: Path) -> AurHelperSource:
+        source = self.aur_helper_source(helper)
+        if self.which("git") is None:
+            raise FileNotFoundError("No se encontró git después de instalar los prerrequisitos.")
+        clone = self.runner(
+            ["git", "clone", "--depth", "1", "--", source.url, str(destination)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if clone.returncode != 0:
+            detail = clone.stderr.strip() if clone.stderr else "clonación fallida"
+            raise ValueError(f"No fue posible clonar {source.url}: {detail}.")
+        remote = self._run_query(
+            ["git", "-C", str(destination), "remote", "get-url", "origin"]
+        )
+        if remote.returncode != 0 or remote.stdout.strip() != source.url:
+            raise ValueError("El repositorio clonado no conserva el origen AUR esperado.")
+        pkgbuild = destination / "PKGBUILD"
+        if not pkgbuild.is_file():
+            raise FileNotFoundError("El repositorio AUR no contiene PKGBUILD.")
+        return source
+
+    def install_cloned_aur_helper(self, helper: str, source_dir: Path) -> None:
+        source = self.aur_helper_source(helper)
+        if os.geteuid() == 0:
+            raise ValueError("makepkg no debe ejecutarse como root.")
+        if self.which("makepkg") is None:
+            raise FileNotFoundError(
+                "No se encontró makepkg después de instalar base-devel."
+            )
+        result = self.runner(
+            ["makepkg", "-si"],
+            cwd=source_dir,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise ValueError(
+                f"La instalación de '{source.package}' falló con código "
+                f"{result.returncode}."
+            )
+        if self.which(source.helper) is None:
+            raise FileNotFoundError(
+                f"'{source.package}' terminó sin dejar disponible '{source.helper}'."
+            )
+        self.set_aur_helper(source.helper)
+
     def aur_helper(self) -> str:
         configured = self.configured_aur_helper()
         if configured and self.which(configured) is not None:
@@ -137,7 +237,8 @@ class DependencyManager:
             return available[0]
         if not available:
             raise FileNotFoundError(
-                "No se encontró paru ni yay. Instale un helper AUR y vuelva a intentarlo."
+                "No se encontró paru ni yay. Prepárelo con "
+                "concord deps helper install."
             )
         if configured:
             raise FileNotFoundError(

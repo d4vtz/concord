@@ -218,11 +218,25 @@ La preferencia entre `paru` y `yay` es local para cada máquina:
 ```bash
 concord deps helper
 concord deps helper paru
+concord deps helper install
 ```
 
-Si no está disponible ningún helper, Concord se detiene con instrucciones y no
-intenta construirlo automáticamente. Antes de instalar muestra todos los lotes
-y pide una única confirmación. En modo no interactivo exige `--yes`. Un fallo
+Cuando una instalación contiene paquetes AUR y no existe ningún helper, Concord
+ofrece preparar `paru-bin` o `yay-bin`. Instala primero los prerrequisitos
+faltantes con `pacman`, clona exclusivamente el repositorio HTTPS oficial de
+AUR en un directorio temporal, muestra el PKGBUILD completo y exige confirmarlo
+antes de ejecutar `makepkg -si`. Conserva los prompts nativos de `makepkg`,
+`pacman` y `sudo`, limpia siempre el clon temporal y guarda la elección solo en
+SQLite local después de verificar el ejecutable.
+
+La preparación del helper está disponible desde `bootstrap`, `deps install`,
+`profile deps install`, `restore --install-deps` y el comando independiente
+`deps helper install`. Está prohibida en modo no interactivo, incluso con
+`--yes`. Un `--dry-run` sin helper se limita a informar qué comando debe
+ejecutarse desde una terminal.
+
+Antes de instalar las dependencias normales, Concord muestra todos los lotes y
+pide una única confirmación. En modo no interactivo exige `--yes`. Un fallo
 posterior no desinstala paquetes ya agregados: informa lo completado y lo que
 queda pendiente.
 
@@ -671,6 +685,11 @@ interactivo debe indicarse explícitamente:
 concord bootstrap https://github.com/usuario/dotfiles.git \
   --restore --install-deps --yes
 ```
+
+La forma no interactiva solo funciona si ya existe un helper AUR preferido. Si
+falta, la preparación de `paru-bin` o `yay-bin` debe completarse previamente en
+una terminal con `concord deps helper install`; Concord nunca ejecuta un
+PKGBUILD sin revisión interactiva.
 
 Si existen configuraciones locales, `bootstrap` muestra las rutas afectadas y
 pregunta si deben reemplazarse con las copias del repositorio. Rechazar la
