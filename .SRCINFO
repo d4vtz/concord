@@ -20,7 +20,7 @@ pkgbase = concord
 	optdepends = age: cifrar y restaurar secretos
 	optdepends = libsecret: guardar la contraseña maestra mediante Secret Service
 	optdepends = git-filter-repo: limpiar secretos presentes en el historial Git
-	source = concord::git+https://github.com/d4vtz/concord.git#commit=064a4184233ef9db68936c2da89529cbbc570295
+	source = concord::git+https://github.com/d4vtz/concord.git#commit=11fae54aa7185bea1a0d4b27c4a81c701d6bbfe2
 	b2sums = SKIP
 
 pkgname = concord

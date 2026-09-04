@@ -28,7 +28,7 @@ optdepends=(
     'git-filter-repo: limpiar secretos presentes en el historial Git'
     'github-cli: crear y autenticar repositorios remotos en GitHub'
 )
-_commit='064a4184233ef9db68936c2da89529cbbc570295'
+_commit='11fae54aa7185bea1a0d4b27c4a81c701d6bbfe2'
 source=("${pkgname}::git+${url}.git#commit=${_commit}")
 b2sums=('SKIP')
 
