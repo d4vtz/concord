@@ -515,8 +515,14 @@ class Doctor:
             for path in target.paths:
                 local = Path.home() / path.relative_path
                 stored = config.repository_path / target.name / path.relative_path
+                path_secrets = [
+                    item
+                    for item in config.secrets
+                    if item.target.id == (target.id or "")
+                    and item.target_path_id == (path.id or "")
+                ]
                 secret = next(
-                    (item for item in config.secrets if item.target.id == (target.id or "") and item.target_path_id == (path.id or "") and item.relative_file == Path(".")),
+                    (item for item in path_secrets if item.relative_file == Path(".")),
                     None,
                 )
                 if secret and secret.kind == "file":
@@ -530,7 +536,14 @@ class Doctor:
                     missing_local.append(label)
                 if not stored_exists:
                     missing_copy.append(label)
-                if local_exists and stored_exists and not self._paths_equal(local, stored):
+                # Doctor no pide contraseñas. La estructura cifrada se valida en
+                # _secret_checks; comparar plaintext con .age siempre sería falso.
+                if (
+                    not path_secrets
+                    and local_exists
+                    and stored_exists
+                    and not self._paths_equal(local, stored)
+                ):
                     modified.append(label)
         if missing_copy:
             self._add(

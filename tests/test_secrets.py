@@ -5,6 +5,7 @@ import pytest
 from concord import application as concord
 from concord.application.config import Config, ConfigManager
 from concord.application.database import Database
+from concord.application.doctor import Doctor
 from concord.application.repository import RepositoryManager
 from concord.application.secret_manager import (PARTIAL_SUFFIX, Age,
                                                 SecretManager)
@@ -165,3 +166,22 @@ def test_force_push_refreshes_lease_before_publishing(tmp_path, monkeypatch):
         ["git", "push", "origin", "--force-with-lease", "--all"],
         ["git", "push", "origin", "--force", "--tags"],
     ]
+
+
+def test_doctor_does_not_compare_plaintext_with_age_ciphertext(secret_environment):
+    targets, secrets, home, _, _ = secret_environment
+    private = home / ".ssh/id_ed25519"
+    public = home / ".ssh/id_ed25519.pub"
+    private.parent.mkdir(parents=True, exist_ok=True)
+    private.write_text("private")
+    public.write_text("public")
+    target = targets.add(public, "ssh")
+    targets.add_path("ssh", private)
+    secrets.protect(private, targets.list())
+    targets.sync(target.name)
+
+    checks = Doctor().run().checks
+    synchronization = next(
+        check for check in checks if check.name == "Sincronización"
+    )
+    assert synchronization.state == "pass"
