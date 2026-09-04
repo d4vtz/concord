@@ -9,6 +9,7 @@ from concord.application.repository import RepositoryManager
 from concord.application.secret_manager import (PARTIAL_SUFFIX, Age,
                                                 SecretManager)
 from concord.application.target_manager import TargetManager
+from concord.cli.app import _offer_force_push_after_rewrite
 
 
 @pytest.fixture
@@ -140,3 +141,27 @@ def test_external_recovery_restores_identity(secret_environment):
     secrets._identity = None
     secrets.recover_from_backup(backup, "recovery")
     assert secrets.unlocked
+
+
+def test_force_push_refreshes_lease_before_publishing(tmp_path, monkeypatch):
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("questionary.confirm", lambda *args, **kwargs: type("Q", (), {"ask": lambda self: True})())
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda arguments, **kwargs: calls.append(arguments) or Result(),
+    )
+
+    _offer_force_push_after_rewrite(tmp_path, "origin")
+
+    assert calls == [
+        ["git", "fetch", "origin", "--prune"],
+        ["git", "push", "origin", "--force-with-lease", "--all"],
+        ["git", "push", "origin", "--force", "--tags"],
+    ]

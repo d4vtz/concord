@@ -179,13 +179,39 @@ def _offer_force_push_after_rewrite(repository_path: Path, remote: str) -> None:
     ).ask():
         warning("El historial remoto no se modificó; revisa y publícalo manualmente.")
         return
-    for ref_kind in ("--all", "--tags"):
-        result = subprocess.run(
-            ["git", "push", remote, "--force-with-lease", ref_kind],
-            cwd=repository_path, text=True, capture_output=True, check=False,
+    fetched = subprocess.run(
+        ["git", "fetch", remote, "--prune"],
+        cwd=repository_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if fetched.returncode:
+        raise ValueError(
+            fetched.stderr.strip()
+            or "No fue posible actualizar la referencia usada por --force-with-lease."
         )
-        if result.returncode:
-            raise ValueError(result.stderr.strip() or "No fue posible publicar el historial reescrito.")
+    branches = subprocess.run(
+        ["git", "push", remote, "--force-with-lease", "--all"],
+        cwd=repository_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if branches.returncode:
+        raise ValueError(
+            branches.stderr.strip()
+            or "No fue posible publicar las ramas con --force-with-lease."
+        )
+    tags = subprocess.run(
+        ["git", "push", remote, "--force", "--tags"],
+        cwd=repository_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    if tags.returncode:
+        raise ValueError(tags.stderr.strip() or "Las ramas se publicaron, pero fallaron las etiquetas.")
 
 
 def manager(*, check_manifest: bool = True) -> TargetManager:
