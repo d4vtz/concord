@@ -1,7 +1,7 @@
 pkgbase = concord
 	pkgdesc = Gestor explícito y seguro de dotfiles con integración Git
 	pkgver = 2.8.0
-	pkgrel = 1
+	pkgrel = 2
 	url = https://github.com/d4vtz/concord
 	arch = any
 	license = MIT
@@ -20,7 +20,7 @@ pkgbase = concord
 	optdepends = age: cifrar y restaurar secretos
 	optdepends = libsecret: guardar la contraseña maestra mediante Secret Service
 	optdepends = git-filter-repo: limpiar secretos presentes en el historial Git
-	source = concord::git+https://github.com/d4vtz/concord.git#commit=11fae54aa7185bea1a0d4b27c4a81c701d6bbfe2
+	source = concord::git+https://github.com/d4vtz/concord.git#commit=4ea2d32d40e83243db8cec68e6d7b4684530b67a
 	b2sums = SKIP
 
 pkgname = concord
