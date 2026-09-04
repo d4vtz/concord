@@ -2,7 +2,7 @@
 
 pkgname=concord
 pkgver=2.8.0
-pkgrel=2
+pkgrel=3
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
 url='https://github.com/d4vtz/concord'
@@ -28,7 +28,7 @@ optdepends=(
     'git-filter-repo: limpiar secretos presentes en el historial Git'
     'github-cli: crear y autenticar repositorios remotos en GitHub'
 )
-_commit='4ea2d32d40e83243db8cec68e6d7b4684530b67a'
+_commit='7327644f8d29cf9f51b453fb33f5c7f5861d6bcb'
 source=("${pkgname}::git+${url}.git#commit=${_commit}")
 b2sums=('SKIP')
 
