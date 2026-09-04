@@ -2806,3 +2806,23 @@ def secret_recover(
     target_manager._persist_manifest()
     execute(lambda: finalize_git(git_paths(CONCORD_TARGET), "concord: restore recovery wrapper", GitOptions(None, False, True, None)))
     success("La identidad fue recuperada y la envoltura portable se actualizó.")
+
+
+@secret_app.command("publish-history")
+def secret_publish_history() -> None:
+    """Reintenta publicar un historial ya reescrito de forma segura."""
+    heading("PUBLICAR HISTORIAL", "Actualizando el lease antes del push forzado")
+    config = ConfigManager().load()
+    git = GitManager(config.repository_path)
+    if not git.initialized or not git.has_remote(config.git.remote):
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("El repositorio o su remoto no están configurados.")
+            )
+        )
+    execute(
+        lambda: _offer_force_push_after_rewrite(
+            config.repository_path, config.git.remote
+        )
+    )
+    success("El historial reescrito se publicó correctamente.")
