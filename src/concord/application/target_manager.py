@@ -16,6 +16,7 @@ from concord.application.database import Database
 from concord.application.dependencies import DependencyManager
 from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
+from concord.application.secret_manager import SecretManager
 from concord.application.target import Target, TargetPath, TargetType
 
 
@@ -60,11 +61,13 @@ class TargetManager:
         database: Database | None = None,
         repository: RepositoryManager | None = None,
         config_manager: ConfigManager | None = None,
+        secret_manager: SecretManager | None = None,
     ) -> None:
         self.database = database or Database()
         self.repository = repository or RepositoryManager()
         self.config_manager = config_manager or ConfigManager()
         self.database.initialize()
+        self.secret_manager = secret_manager or SecretManager(self.database, self.config_manager)
         self.manifest_backup: Path | None = None
         self.profile_manifest_changed = False
         self.dependency_manifest_changed = False
@@ -103,6 +106,8 @@ class TargetManager:
             shutil.rmtree(temporary)
         for path in target.paths:
             self._copy(path.local_path, temporary / path.relative_path)
+        if self.secret_manager.for_target(target.id):
+            self.secret_manager.protect_stage(target, temporary)
         return temporary
 
     def _stage_existing_copy(self, target: Target) -> Path:
@@ -189,7 +194,7 @@ class TargetManager:
         return TargetConfig(
             id=target.id,
             name=target.name,
-            paths=[TargetPathConfig(path.relative_path, path.type.value) for path in target.paths],
+            paths=[TargetPathConfig(path.relative_path, path.type.value, path.id) for path in target.paths],
             created_at=target.created_at,
             updated_at=target.updated_at,
             dependencies=dependencies,
@@ -208,6 +213,7 @@ class TargetManager:
         ProfileManager(self.database, self.config_manager).apply_to_config(config)
         if any(target.dependencies for target in config.targets):
             config.minimum_concord_version = DEPENDENCY_MINIMUM_VERSION
+        self.secret_manager.apply_to_config(config)
         config.targets.sort(key=lambda item: (item.name != CONCORD_TARGET, item.name))
         self.config_manager.save(config)
         if concord_target is not None:
@@ -406,7 +412,9 @@ class TargetManager:
     def _restore_targets(self, targets: list[Target], *, force: bool) -> list[Target]:
         pairs = [(target, path, self._destination(target, path)) for target in targets for path in target.paths]
         for target, path, source in pairs:
-            if not os.path.lexists(source):
+            secrets = [item for item in self.secret_manager.for_target(target.id) if item.target_path_id == path.id]
+            whole_file = path.type.value == "file" and any(item.kind == "file" for item in secrets)
+            if not os.path.lexists(source) and not (whole_file and source.with_name(source.name + ".age").is_file()):
                 raise FileNotFoundError(f"No existe la copia de '{path.local_path}' en '{target.name}'.")
         for _, path, _ in pairs:
             if os.path.lexists(path.local_path) and not force:
@@ -417,7 +425,10 @@ class TargetManager:
                 temporary = path.local_path.with_name(f".{path.local_path.name}.concord.tmp")
                 if os.path.lexists(temporary):
                     self._remove_local(temporary)
-                self._copy(source, temporary)
+                if self.secret_manager.for_target(target.id):
+                    self.secret_manager.stage_restore_path(target, path, source, temporary)
+                else:
+                    self._copy(source, temporary)
                 staged.append((path.local_path, temporary))
         except Exception:
             for _, temporary in staged:
@@ -463,8 +474,10 @@ class TargetManager:
     def restore(self, name: str, *, force: bool = False) -> Target:
         return self._restore_targets([self.get(name)], force=force)[0]
 
-    def restore_all(self, *, force: bool = False) -> list[Target]:
+    def restore_all(self, *, force: bool = False, include_secrets: bool = True) -> list[Target]:
         targets = [target for target in self.selected() if target.name != CONCORD_TARGET]
+        if not include_secrets:
+            targets = [target for target in targets if not self.secret_manager.for_target(target.id)]
         return self._restore_targets(targets, force=force)
 
     def restore_conflicts(self) -> list[Path]:
@@ -509,7 +522,7 @@ class TargetManager:
                 ):
                     raise ValueError(f"Ruta solapada en el manifiesto: {relative}")
                 all_paths.append(absolute)
-                paths.append(TargetPath(absolute, target_type=TargetType(path_item.type)))
+                paths.append(TargetPath(absolute, path_id=path_item.id, target_type=TargetType(path_item.type)))
             targets.append(
                 Target(
                     name=item.name,
@@ -560,6 +573,7 @@ class TargetManager:
             ProfileManager(self.database, self.config_manager).import_config(
                 config, connection=connection
             )
+            self.secret_manager.import_config(config, connection=connection)
         return targets
 
     def _path_state(self, target: Target, path: TargetPath) -> str:
@@ -689,6 +703,11 @@ class TargetManager:
         return [self._target_diff(target, reverse=True) for target in targets]
 
     def _path_diff(self, target: Target, path: TargetPath, *, reverse: bool = False) -> TargetDiff:
+        if self.secret_manager.for_target(target.id) and self.secret_manager.unlocked:
+            stored = self._destination(target, path)
+            if self.secret_manager.path_clean(target, path, stored):
+                return TargetDiff(target.name, [])
+            return TargetDiff(target.name, [DiffEntry("modified", path.relative_path)])
         local = self._snapshot(path.local_path)
         stored = self._snapshot(self._destination(target, path))
         entries = []

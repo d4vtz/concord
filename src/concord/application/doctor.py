@@ -69,6 +69,7 @@ class Doctor:
             return DoctorReport(checks, timings)
         self._timed(timings, "SQLite", lambda: self._database_checks(config, checks))
         self._timed(timings, "Perfiles", lambda: self._profile_checks(config, checks))
+        self._timed(timings, "Secretos", lambda: self._secret_checks(config, checks))
         self._timed(
             timings,
             "Dependencias",
@@ -514,6 +515,14 @@ class Doctor:
             for path in target.paths:
                 local = Path.home() / path.relative_path
                 stored = config.repository_path / target.name / path.relative_path
+                secret = next(
+                    (item for item in config.secrets if item.target.id == (target.id or "") and item.target_path_id == (path.id or "") and item.relative_file == Path(".")),
+                    None,
+                )
+                if secret and secret.kind == "file":
+                    stored = stored.with_name(stored.name + ".age")
+                elif secret and secret.kind == "excluded":
+                    continue
                 label = f"{target.name}:{path.relative_path}"
                 local_exists = os.path.lexists(local)
                 stored_exists = os.path.lexists(stored)
@@ -554,6 +563,42 @@ class Doctor:
                 checks, "Targets", "Sincronización", "pass",
                 "HOME y el repositorio coinciden."
             )
+
+    def _secret_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
+        if not config.secret_group:
+            self._add(checks, "Secretos", "Configuración", "pass", "No hay secretos configurados.")
+            return
+        if shutil.which("age") and shutil.which("age-keygen"):
+            self._add(checks, "Secretos", "age", "pass", "Ejecutables disponibles.")
+        else:
+            self._add(checks, "Secretos", "age", "failure", "Falta age o age-keygen.", "Instala el paquete age.")
+        malformed = []
+        missing = []
+        targets = {item.id: item for item in config.targets}
+        for secret in config.secrets:
+            target = targets.get(secret.target.id)
+            path = next((item for item in target.paths if item.id == secret.target_path_id), None) if target else None
+            if target is None or path is None:
+                malformed.append(secret.target.name)
+                continue
+            base = config.repository_path / target.name / path.relative_path
+            stored = base if secret.relative_file == Path(".") else base / secret.relative_file
+            candidates = []
+            if secret.kind == "file":
+                candidates = [stored.with_name(stored.name + ".age")]
+            elif secret.kind == "partial":
+                candidates = [stored, stored.with_name(stored.name + ".concord-secrets.age")]
+            for candidate in candidates:
+                if not candidate.is_file():
+                    missing.append(f"{target.name}:{secret.relative_file}")
+                elif candidate.suffix == ".age" and not candidate.read_bytes()[:64].startswith(b"age-encryption.org/v1"):
+                    malformed.append(f"{target.name}:{secret.relative_file}")
+        if malformed:
+            self._add(checks, "Secretos", "Estructura", "warning", f"Datos cifrados no válidos: {', '.join(malformed)}.", "Regenera con concord sync tras confirmar.")
+        elif missing:
+            self._add(checks, "Secretos", "Estructura", "warning", f"Faltan copias cifradas: {', '.join(missing)}.", "Regenera con concord sync tras confirmar.")
+        else:
+            self._add(checks, "Secretos", "Estructura", "pass", f"{len(config.secrets)} archivo(s) protegido(s) presentes.")
 
     def _profile_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
         if not concord.database_file.is_file():

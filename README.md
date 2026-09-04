@@ -332,6 +332,63 @@ representación portable al manifiesto. Cuando el manifiesto contiene perfiles,
 declara `minimum_concord_version = "2.3.1"`; al contener dependencias declara la
 versión mínima que introdujo ese modelo.
 
+## Secretos
+
+Concord 2.4 cifra archivos y valores sensibles con el ejecutable oficial
+[`age`](https://age-encryption.org/). El archivo local permanece descifrado para que
+la aplicación que lo utiliza funcione normalmente; el repositorio recibe únicamente
+la representación cifrada.
+
+Configura una contraseña maestra, una contraseña independiente de recuperación y
+una copia externa de recuperación:
+
+```bash
+concord secret init
+```
+
+Si Secret Service está disponible, Concord puede guardar la contraseña maestra en
+KWallet, GNOME Keyring o KeePassXC. Sin ese servicio la solicitará una vez por
+comando, con un máximo de tres intentos.
+
+Protege un archivo completo ya registrado en un target:
+
+```bash
+concord secret protect ~/.config/aplicacion/credentials.json
+```
+
+En el repositorio solo quedará `credentials.json.age`. Para proteger un valor
+individual que ya aparece en un archivo de texto:
+
+```bash
+concord secret set ~/.config/aplicacion/config.toml token
+```
+
+Concord pedirá el valor sin mostrarlo. La copia del repositorio conservará una
+plantilla con `{{ concord_secret: token }}` y un archivo
+`config.toml.concord-secrets.age`. Todas las apariciones del valor se sustituyen.
+
+Administración:
+
+```bash
+concord secret list
+concord secret list --all
+concord secret rekey
+concord secret rekey --recovery
+concord secret recover /ruta/a/recovery.age
+concord secret unprotect ~/.config/aplicacion/credentials.json
+```
+
+`unprotect` conserva el archivo local y retira su representación del repositorio;
+no publica el contenido descifrado. Los secretos respetan los perfiles activos.
+`sync --dry-run` y `restore --dry-run` muestran únicamente cuántos secretos serían
+afectados, nunca sus valores.
+
+Si el archivo ya existe en commits anteriores, Concord ofrece eliminar su ruta de
+todas las ramas y etiquetas mediante `git-filter-repo`. La protección se cancela si
+se rechaza la limpieza, porque cifrar solo el commit actual dejaría el secreto en el
+historial. El push forzado requiere una segunda confirmación y usa
+`--force-with-lease`; no se crea un respaldo después de esa confirmación.
+
 Concord se registra automáticamente como el primer target. Después de agregar
 o eliminar una configuración, actualiza el manifiesto y sincroniza su propia
 copia en `repository/concord/.config/concord/concord.toml`. La base SQLite es un

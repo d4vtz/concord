@@ -142,6 +142,44 @@ class Database:
                     value TEXT NOT NULL
                 )
                 """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS secret_groups (
+                    id TEXT PRIMARY KEY,
+                    recipient TEXT NOT NULL,
+                    master_wrapper TEXT NOT NULL,
+                    recovery_wrapper TEXT NOT NULL,
+                    recovery_backup_path TEXT
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS repository_secret_group (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    group_id TEXT NOT NULL,
+                    FOREIGN KEY (group_id) REFERENCES secret_groups(id)
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS secrets (
+                    id TEXT PRIMARY KEY,
+                    target_id TEXT NOT NULL,
+                    target_path_id TEXT NOT NULL,
+                    relative_file TEXT NOT NULL,
+                    kind TEXT NOT NULL CHECK (kind IN ('file', 'partial', 'excluded')),
+                    mode INTEGER NOT NULL,
+                    UNIQUE (target_path_id, relative_file),
+                    FOREIGN KEY (target_id) REFERENCES targets(id) ON DELETE CASCADE,
+                    FOREIGN KEY (target_path_id) REFERENCES target_paths(id) ON DELETE CASCADE
+                )
+                """)
+            connection.execute("""
+                CREATE TABLE IF NOT EXISTS secret_values (
+                    secret_id TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    value_ciphertext TEXT NOT NULL,
+                    PRIMARY KEY (secret_id, name),
+                    FOREIGN KEY (secret_id) REFERENCES secrets(id) ON DELETE CASCADE
+                )
+                """)
 
     def _migrate_v1(self, connection: sqlite3.Connection) -> None:
         columns = {

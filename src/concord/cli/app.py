@@ -27,6 +27,7 @@ from concord.application.git import GitCommit, GitManager
 from concord.application.initializer import Initializer
 from concord.application.profile_manager import Activation, ProfileManager
 from concord.application.reset import ResetManager
+from concord.application.secret_manager import Age, SecretManager
 from concord.application.target_manager import TargetManager
 from concord.cli.completion import (complete_editables,
                                     complete_removable_targets,
@@ -48,8 +49,143 @@ profile_deps_app = typer.Typer(
 app.add_typer(repo_app, name="repo")
 app.add_typer(profile_app, name="profile")
 app.add_typer(deps_app, name="deps")
+secret_app = typer.Typer(no_args_is_help=True, help="Cifra y restaura secretos administrados.")
+app.add_typer(secret_app, name="secret")
 repo_app.add_typer(remote_app, name="remote")
 profile_app.add_typer(profile_deps_app, name="deps")
+
+
+def _secret_password(prompt: str) -> str:
+    value = questionary.password(prompt).ask()
+    if value is None:
+        raise KeyboardInterrupt
+    if not value:
+        raise ValueError("La contraseña no puede estar vacía.")
+    return value
+
+
+def _password_strength(value: str) -> str:
+    classes = sum(
+        (any(character.islower() for character in value), any(character.isupper() for character in value),
+         any(character.isdigit() for character in value), any(not character.isalnum() for character in value))
+    )
+    score = (len(value) >= 12) + (len(value) >= 16) + (len(value) >= 24) + (classes >= 3)
+    return ("muy débil", "débil", "aceptable", "fuerte", "muy fuerte")[score]
+
+
+def _new_secret_password(prompt: str) -> str:
+    value = _secret_password(prompt)
+    console.print(f"[concord.muted]Fortaleza estimada: {_password_strength(value)}[/]")
+    return value
+
+
+def _secret_tool_lookup(group_id: str) -> str | None:
+    if shutil.which("secret-tool") is None:
+        return None
+    result = subprocess.run(
+        ["secret-tool", "lookup", "application", "concord", "secret-group", group_id],
+        capture_output=True, text=True, check=False,
+    )
+    return result.stdout.rstrip("\n") if result.returncode == 0 and result.stdout else None
+
+
+def _secret_tool_store(group_id: str, password: str) -> bool:
+    if shutil.which("secret-tool") is None:
+        return False
+    result = subprocess.run(
+        ["secret-tool", "store", "--label", f"Concord {group_id}", "application", "concord", "secret-group", group_id],
+        input=password + "\n", text=True, capture_output=True, check=False,
+    )
+    return result.returncode == 0
+
+
+def unlock_secret_manager(secret_manager: SecretManager) -> SecretManager:
+    group_id = secret_manager._group()[0]
+    stored = _secret_tool_lookup(group_id)
+    if stored:
+        try:
+            secret_manager.unlock(stored)
+            return secret_manager
+        except ValueError:
+            warning("Secret Service devolvió una credencial inválida; se solicitará manualmente.")
+    for _ in range(3):
+        try:
+            secret_manager.unlock(_secret_password("Contraseña maestra:"))
+            return secret_manager
+        except ValueError:
+            warning("Contraseña incorrecta.")
+    if questionary.confirm("¿Usar la contraseña de recuperación?", default=True).ask():
+        secret_manager.unlock(_secret_password("Contraseña de recuperación:"), recovery=True)
+        return secret_manager
+    raise PermissionError("No fue posible desbloquear los secretos.")
+
+
+def ensure_age() -> None:
+    if Age.available():
+        return
+    if shutil.which("pacman") and sys.stdin.isatty() and questionary.confirm(
+        "age no está instalado. ¿Instalarlo ahora con pacman?", default=True
+    ).ask():
+        result = subprocess.run(["sudo", "pacman", "-S", "--needed", "age"], check=False)
+        if result.returncode == 0 and Age.available():
+            return
+        raise ValueError("pacman no pudo instalar age.")
+    raise FileNotFoundError("Falta age. En Arch Linux instálalo con: sudo pacman -S age")
+
+
+def _repository_secret_path(target_manager: TargetManager, path: Path) -> Path:
+    target, target_path, relative = target_manager.secret_manager.locate(path, target_manager.list())
+    result = Path(target.name) / target_path.relative_path
+    return result if relative == Path(".") else result / relative
+
+
+def _offer_history_rewrite(target_manager: TargetManager, path: Path) -> bool:
+    config = ConfigManager().load()
+    git = GitManager(config.repository_path)
+    if not git.initialized:
+        return False
+    relative = _repository_secret_path(target_manager, path)
+    found = subprocess.run(
+        ["git", "rev-list", "--all", "--", relative.as_posix()],
+        cwd=config.repository_path, capture_output=True, text=True, check=False,
+    )
+    if found.returncode or not found.stdout.strip():
+        return False
+    warning(f"'{relative}' ya aparece en el historial Git; cifrar el siguiente commit no borrará esas copias.")
+    if not sys.stdin.isatty() or not questionary.confirm(
+        "¿Eliminar ese archivo de todas las ramas y etiquetas antes de continuar?", default=True
+    ).ask():
+        raise ValueError("Protección cancelada: el contenido seguiría expuesto en el historial.")
+    if shutil.which("git-filter-repo") is None:
+        raise FileNotFoundError(
+            "Falta git-filter-repo. Instálalo y repite la operación para limpiar el historial."
+        )
+    remote_url = git.remote_url(config.git.remote)
+    result = subprocess.run(
+        ["git", "filter-repo", "--force", "--path", relative.as_posix(), "--invert-paths"],
+        cwd=config.repository_path, text=True, capture_output=True, check=False,
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or result.stdout.strip() or "No se pudo reescribir el historial.")
+    if remote_url:
+        GitManager(config.repository_path).set_remote(remote_url, config.git.remote)
+    return bool(remote_url)
+
+
+def _offer_force_push_after_rewrite(repository_path: Path, remote: str) -> None:
+    if not sys.stdin.isatty() or not questionary.confirm(
+        "El historial cambió. ¿Publicar todas las ramas y etiquetas con --force-with-lease?",
+        default=False,
+    ).ask():
+        warning("El historial remoto no se modificó; revisa y publícalo manualmente.")
+        return
+    for ref_kind in ("--all", "--tags"):
+        result = subprocess.run(
+            ["git", "push", remote, "--force-with-lease", ref_kind],
+            cwd=repository_path, text=True, capture_output=True, check=False,
+        )
+        if result.returncode:
+            raise ValueError(result.stderr.strip() or "No fue posible publicar el historial reescrito.")
 
 
 def manager(*, check_manifest: bool = True) -> TargetManager:
@@ -1503,6 +1639,8 @@ def status(
     profile_manager = profiles(target_manager)
     maybe_offer_suggestion(profile_manager)
     render_activation(profile_manager)
+    if any(target_manager.secret_manager.for_target(item.id) for item in target_manager.selected()):
+        execute(lambda: _prepared_secrets(target_manager))
     items = target_manager.status()
     if not items:
         warning("No hay targets que comprobar.")
@@ -1568,12 +1706,21 @@ def diff_targets(
             )
         )
     if name is not None:
+        selected = [target_manager.get(name)]
+        if any(target_manager.secret_manager.for_target(item.id) for item in selected):
+            execute(lambda: _prepared_secrets(target_manager))
+            differences = execute(lambda: target_manager.diff(name))
+            render_differences(differences, command=f"concord sync {name}")
+            return
         differences = execute(
             lambda: target_manager.content_diff(name, path=path, context=context),
             hint="La ruta debe pertenecer al target seleccionado.",
         )
         render_content_differences(name, differences, path=path)
         return
+    selected = [target_manager.get(name)] if name else target_manager.selected()
+    if any(target_manager.secret_manager.for_target(item.id) for item in selected):
+        execute(lambda: _prepared_secrets(target_manager))
     differences = execute(
         lambda: target_manager.diff(),
         hint="Consulta los nombres disponibles con: concord list",
@@ -1601,6 +1748,10 @@ def sync(
         profile_manager = profiles(target_manager)
         maybe_offer_suggestion(profile_manager)
         render_activation(profile_manager)
+        selected = [target_manager.get(name)] if name else target_manager.selected()
+        secret_count = sum(len(target_manager.secret_manager.for_target(item.id)) for item in selected)
+        if secret_count:
+            details([("Secretos afectados", str(secret_count))], title="Cifrado (simulación)")
         differences = execute(
             lambda: target_manager.preview_sync(name),
             hint="Consulta los nombres disponibles con: concord list",
@@ -1631,6 +1782,9 @@ def sync(
     profile_manager = profiles(target_manager)
     maybe_offer_suggestion(profile_manager)
     render_activation(profile_manager)
+    selected = [target_manager.get(name)] if name else target_manager.selected()
+    if any(target_manager.secret_manager.for_target(item.id) for item in selected):
+        execute(lambda: _prepared_secrets(target_manager))
     targets = execute(lambda: target_manager.sync(name), hint="Consulta los nombres disponibles con: concord list")
     for target in targets:
         console.print(f"[concord.success]✓[/] {target.name}  [concord.muted]← {len(target.paths)} ruta(s)[/]")
@@ -1706,11 +1860,26 @@ def restore(
         if force:
             command += " --force"
         render_differences(differences, command=command)
+        selected = target_manager.selected() if all_targets else [target_manager.get(name)]
+        secret_count = sum(len(target_manager.secret_manager.for_target(item.id)) for item in selected)
+        if secret_count:
+            details([("Secretos afectados", str(secret_count))], title="Cifrado (simulación)")
         return
     heading("RESTAURACIÓN", "Recuperando una configuración desde el repositorio")
+    selected = target_manager.selected() if all_targets else [target_manager.get(name)]
+    secret_unlock_failed = False
+    if any(target_manager.secret_manager.for_target(item.id) for item in selected):
+        if all_targets:
+            try:
+                _prepared_secrets(target_manager)
+            except (FileNotFoundError, PermissionError, ValueError) as error:
+                secret_unlock_failed = True
+                warning(f"No se restaurarán targets con secretos: {error}")
+        else:
+            execute(lambda: _prepared_secrets(target_manager))
     if all_targets:
         targets = execute(
-            lambda: target_manager.restore_all(force=force),
+            lambda: target_manager.restore_all(force=force, include_secrets=not secret_unlock_failed),
             hint="Usa --force si deseas reemplazar configuraciones locales existentes.",
         )
         for target in targets:
@@ -1820,6 +1989,8 @@ def bootstrap(
             yes=yes,
         )
     if should_restore:
+        if target_manager.secret_manager.configured() and target_manager.secret_manager.list():
+            execute(lambda: _prepared_secrets(target_manager))
         restore_force = force
         conflicts = target_manager.restore_conflicts()
         if conflicts and not restore_force:
@@ -2434,3 +2605,178 @@ def profile_validate() -> None:
         success("Los perfiles son válidos con advertencias.")
     else:
         success("Todos los perfiles y la activación son válidos.")
+
+
+@secret_app.command("init")
+def secret_init(
+    recovery_backup: Path | None = typer.Option(None, "--recovery-backup", help="Copia externa de recuperación."),
+) -> None:
+    """Configura las claves de cifrado del repositorio."""
+    heading("CONFIGURAR SECRETOS", "Creando una identidad age protegida por dos contraseñas")
+    ensure_age()
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    secret_manager = target_manager.secret_manager
+    if secret_manager.configured():
+        execute(lambda: (_ for _ in ()).throw(ValueError("Los secretos ya están configurados.")))
+    master = _new_secret_password("Contraseña maestra:")
+    if master != _secret_password("Confirmar contraseña maestra:"):
+        execute(lambda: (_ for _ in ()).throw(ValueError("Las contraseñas maestras no coinciden.")))
+    recovery = _new_secret_password("Contraseña de recuperación:")
+    if recovery != _secret_password("Confirmar contraseña de recuperación:"):
+        execute(lambda: (_ for _ in ()).throw(ValueError("Las contraseñas de recuperación no coinciden.")))
+    if master == recovery:
+        execute(lambda: (_ for _ in ()).throw(ValueError("La contraseña de recuperación debe ser distinta.")))
+    if recovery_backup is None:
+        chosen = questionary.path("Copia externa de recuperación:").ask()
+        if chosen is None:
+            raise typer.Abort()
+        recovery_backup = Path(chosen)
+    group_id = execute(lambda: secret_manager.initialize(master, recovery, recovery_backup))
+    if shutil.which("secret-tool") and questionary.confirm(
+        "¿Guardar la contraseña maestra en Secret Service?", default=True
+    ).ask():
+        if not _secret_tool_store(group_id, master):
+            warning("Secret Service no pudo guardar la contraseña; se solicitará en cada comando.")
+    target_manager._persist_manifest()
+    execute(lambda: finalize_git(git_paths(CONCORD_TARGET), "concord: initialize secrets", GitOptions(None, False, True, None)))
+    success("Cifrado configurado.", hint=f"UUID del grupo: {group_id}")
+
+
+def _prepared_secrets(target_manager: TargetManager, *, initialize: bool = True) -> SecretManager:
+    secret_manager = target_manager.secret_manager
+    if not secret_manager.configured():
+        if not initialize:
+            raise ValueError("Los secretos no están configurados.")
+        if not sys.stdin.isatty() or not questionary.confirm(
+            "Los secretos aún no están configurados. ¿Configurarlos ahora?", default=True
+        ).ask():
+            raise ValueError("Ejecuta primero: concord secret init")
+        ensure_age()
+        master = _new_secret_password("Contraseña maestra:")
+        if master != _secret_password("Confirmar contraseña maestra:"):
+            raise ValueError("Las contraseñas maestras no coinciden.")
+        recovery = _new_secret_password("Contraseña de recuperación:")
+        if recovery != _secret_password("Confirmar contraseña de recuperación:"):
+            raise ValueError("Las contraseñas de recuperación no coinciden.")
+        if master == recovery:
+            raise ValueError("La contraseña de recuperación debe ser distinta.")
+        chosen = questionary.path("Copia externa de recuperación:").ask()
+        if chosen is None:
+            raise KeyboardInterrupt
+        group_id = secret_manager.initialize(master, recovery, Path(chosen))
+        if shutil.which("secret-tool") and questionary.confirm(
+            "¿Guardar la contraseña maestra en Secret Service?", default=True
+        ).ask() and not _secret_tool_store(group_id, master):
+            warning("Secret Service no pudo guardar la contraseña; se solicitará en cada comando.")
+        target_manager._persist_manifest()
+        return secret_manager
+    ensure_age()
+    return unlock_secret_manager(secret_manager)
+
+
+@secret_app.command("protect")
+def secret_protect(path: Path = typer.Argument(..., exists=True, resolve_path=True)) -> None:
+    """Cifra completamente un archivo ya registrado en un target."""
+    heading("PROTEGER ARCHIVO", "Sustituyendo la copia del repositorio por archivo.age")
+    target_manager = execute(manager)
+    secret_manager = execute(lambda: _prepared_secrets(target_manager))
+    rewritten = execute(lambda: _offer_history_rewrite(target_manager, path))
+    secret = execute(lambda: secret_manager.protect(path, target_manager.list()))
+    execute(lambda: target_manager.sync(secret.target_name))
+    execute(lambda: finalize_git(git_paths(secret.target_name), f"{secret.target_name}: protect secret", GitOptions(None, False, True, False if rewritten else None)))
+    if rewritten:
+        config = ConfigManager().load()
+        execute(lambda: _offer_force_push_after_rewrite(config.repository_path, config.git.remote))
+    success(f"Archivo protegido en '{secret.target_name}'.")
+
+
+@secret_app.command("set")
+def secret_set(
+    path: Path = typer.Argument(..., exists=True, resolve_path=True),
+    name: str = typer.Argument(..., help="Nombre del marcador secreto."),
+) -> None:
+    """Registra o actualiza un valor secreto dentro de un archivo de texto."""
+    heading("GUARDAR SECRETO", "Creando una plantilla sin el valor sensible")
+    target_manager = execute(manager)
+    secret_manager = execute(lambda: _prepared_secrets(target_manager))
+    value = _secret_password(f"Valor de {name}:")
+    rewritten = execute(lambda: _offer_history_rewrite(target_manager, path))
+    secret = execute(lambda: secret_manager.set_value(path, name, value, target_manager.list()))
+    execute(lambda: target_manager.sync(secret.target_name))
+    execute(lambda: finalize_git(git_paths(secret.target_name), f"{secret.target_name}: set secret {name.lower()}", GitOptions(None, False, True, False if rewritten else None)))
+    if rewritten:
+        config = ConfigManager().load()
+        execute(lambda: _offer_force_push_after_rewrite(config.repository_path, config.git.remote))
+    success(f"Secreto '{name.lower()}' protegido.")
+
+
+@secret_app.command("list")
+def secret_list(all_targets: bool = typer.Option(False, "--all", help="Incluye targets fuera del perfil activo.")) -> None:
+    """Lista secretos sin revelar sus valores."""
+    heading("SECRETOS", "Inventario cifrado del repositorio")
+    target_manager = execute(manager)
+    secret_manager = target_manager.secret_manager
+    target_ids = None if all_targets else {target.id for target in target_manager.selected()}
+    items = secret_manager.list(target_ids)
+    table = Table(box=box.ROUNDED, border_style="#4C566A", header_style="bold #88C0D0")
+    table.add_column("Target")
+    table.add_column("Archivo")
+    table.add_column("Tipo")
+    table.add_column("Nombres")
+    for item in items:
+        kind = {"file": "completo", "partial": "parcial", "excluded": "retirado"}[item.kind]
+        table.add_row(item.target_name, item.relative_file.as_posix(), kind, ", ".join(item.names) or "—")
+    console.print(table)
+    success(f"{len(items)} archivo(s) registrado(s); valores siempre ocultos.")
+
+
+@secret_app.command("unprotect")
+def secret_unprotect(path: Path = typer.Argument(..., exists=True, resolve_path=True)) -> None:
+    """Retira del repositorio un archivo protegido y conserva su copia local."""
+    heading("RETIRAR SECRETO", "El archivo local se conservará")
+    target_manager = execute(manager)
+    secret_manager = target_manager.secret_manager
+    if not questionary.confirm("¿Retirar la copia cifrada del repositorio?", default=False).ask():
+        warning("Operación cancelada.")
+        return
+    secret = execute(lambda: secret_manager.unprotect(path, target_manager.list()))
+    execute(lambda: target_manager.sync(secret.target_name))
+    execute(lambda: finalize_git(git_paths(secret.target_name), f"{secret.target_name}: withdraw secret", GitOptions(None, False, True, None)))
+    success("La copia del repositorio fue retirada; el archivo local permanece intacto.")
+
+
+@secret_app.command("rekey")
+def secret_rekey(
+    recovery: bool = typer.Option(False, "--recovery", help="Rota la contraseña de recuperación."),
+) -> None:
+    """Cambia la contraseña maestra o la de recuperación."""
+    heading("ROTAR CONTRASEÑA", "Los archivos cifrados no necesitan regenerarse")
+    target_manager = execute(manager)
+    secret_manager = execute(lambda: _prepared_secrets(target_manager))
+    label = "recuperación" if recovery else "maestra"
+    password = _new_secret_password(f"Nueva contraseña de {label}:")
+    if password != _secret_password(f"Confirmar contraseña de {label}:"):
+        execute(lambda: (_ for _ in ()).throw(ValueError("Las contraseñas no coinciden.")))
+    execute(lambda: secret_manager.rekey(password, recovery=recovery))
+    if not recovery and _secret_tool_lookup(secret_manager._group()[0]) is not None:
+        if not _secret_tool_store(secret_manager._group()[0], password):
+            warning("La contraseña cambió, pero Secret Service no pudo actualizar su copia.")
+    target_manager._persist_manifest()
+    execute(lambda: finalize_git(git_paths(CONCORD_TARGET), f"concord: rotate {label} password", GitOptions(None, False, True, None)))
+    success(f"Contraseña de {label} actualizada.")
+
+
+@secret_app.command("recover")
+def secret_recover(
+    backup: Path = typer.Argument(..., exists=True, dir_okay=False, resolve_path=True),
+) -> None:
+    """Recupera la identidad usando la copia externa y su segunda contraseña."""
+    heading("RECUPERAR SECRETOS", "Validando la copia externa de recuperación")
+    ensure_age()
+    target_manager = execute(manager)
+    secret_manager = target_manager.secret_manager
+    password = _secret_password("Contraseña de recuperación:")
+    execute(lambda: secret_manager.recover_from_backup(backup, password))
+    target_manager._persist_manifest()
+    execute(lambda: finalize_git(git_paths(CONCORD_TARGET), "concord: restore recovery wrapper", GitOptions(None, False, True, None)))
+    success("La identidad fue recuperada y la envoltura portable se actualizó.")

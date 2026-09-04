@@ -1,7 +1,7 @@
 # Maintainer: David Torrez Reyes <davidtorrezreyes@gmail.com>
 
 pkgname=concord
-pkgver=2.7.0
+pkgver=2.8.0
 pkgrel=1
 pkgdesc='Gestor explícito y seguro de dotfiles con integración Git'
 arch=('any')
@@ -22,7 +22,12 @@ makedepends=(
     'python-uv-build'
 )
 checkdepends=('python-pytest')
-optdepends=('github-cli: crear y autenticar repositorios remotos en GitHub')
+optdepends=(
+    'age: cifrar y restaurar secretos'
+    'libsecret: guardar la contraseña maestra mediante Secret Service'
+    'git-filter-repo: limpiar secretos presentes en el historial Git'
+    'github-cli: crear y autenticar repositorios remotos en GitHub'
+)
 _commit='064a4184233ef9db68936c2da89529cbbc570295'
 source=("${pkgname}::git+${url}.git#commit=${_commit}")
 b2sums=('SKIP')

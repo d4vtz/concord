@@ -11,7 +11,7 @@ from questionary import ValidationError, Validator
 from concord import application as concord
 
 MANIFEST_VERSION = 2
-CONCORD_VERSION = "2.7.0"
+CONCORD_VERSION = "2.8.0"
 PROFILE_MINIMUM_VERSION = "2.3.1"
 DEPENDENCY_MINIMUM_VERSION = "2.5.0"
 CONCORD_TARGET = "concord"
@@ -21,6 +21,7 @@ CONCORD_TARGET = "concord"
 class TargetPathConfig:
     relative_path: Path
     type: str
+    id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -62,6 +63,25 @@ class SuggestedActivationConfig:
     complements: list[ManifestReference] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class SecretGroupConfig:
+    id: str
+    recipient: str
+    master_wrapper: str
+    recovery_wrapper: str
+
+
+@dataclass(frozen=True)
+class SecretConfig:
+    id: str
+    target: ManifestReference
+    target_path_id: str
+    relative_file: Path
+    kind: str
+    mode: int
+    names: list[str] = field(default_factory=list)
+
+
 @dataclass
 class GitConfig:
     enabled: bool = True
@@ -78,6 +98,8 @@ class Config:
     profiles: list[ProfileConfig] = field(default_factory=list)
     suggested_activation: SuggestedActivationConfig | None = None
     minimum_concord_version: str | None = None
+    secret_group: SecretGroupConfig | None = None
+    secrets: list[SecretConfig] = field(default_factory=list)
     git: GitConfig = field(default_factory=GitConfig)
     source_version: int = MANIFEST_VERSION
 
@@ -131,6 +153,7 @@ class ConfigManager:
                         {
                             "relative_path": path.relative_path.as_posix(),
                             "type": path.type,
+                            **({"id": path.id} if path.id else {}),
                         }
                         for path in target.paths
                     ],
@@ -183,6 +206,30 @@ class ConfigManager:
             ],
             **(
                 {
+                    "secret_group": {
+                        "id": config.secret_group.id,
+                        "recipient": config.secret_group.recipient,
+                        "master_wrapper": config.secret_group.master_wrapper,
+                        "recovery_wrapper": config.secret_group.recovery_wrapper,
+                    },
+                    "secrets": [
+                        {
+                            "id": secret.id,
+                            "target": {"id": secret.target.id, "name": secret.target.name},
+                            "target_path_id": secret.target_path_id,
+                            "relative_file": secret.relative_file.as_posix(),
+                            "kind": secret.kind,
+                            "mode": secret.mode,
+                            "names": secret.names,
+                        }
+                        for secret in config.secrets
+                    ],
+                }
+                if config.secret_group
+                else {}
+            ),
+            **(
+                {
                     "suggested_activation": {
                         "primary": {
                             "id": config.suggested_activation.primary.id,
@@ -230,6 +277,7 @@ class ConfigManager:
                         TargetPathConfig(
                             relative_path=Path(path["relative_path"]),
                             type=path["type"],
+                            id=path.get("id"),
                         )
                         for path in path_items
                     ],
@@ -271,6 +319,25 @@ class ConfigManager:
                     for value in suggested.get("complements", [])
                 ],
             )
+        group_data = settings.get("secret_group")
+        secret_group = SecretGroupConfig(**group_data) if group_data else None
+        secrets = []
+        for item in settings.get("secrets", []):
+            target = item["target"]
+            relative_file = Path(item["relative_file"])
+            if relative_file.is_absolute() or ".." in relative_file.parts:
+                raise ValueError(f"Ruta de secreto no segura: {relative_file}")
+            secrets.append(
+                SecretConfig(
+                    id=item["id"],
+                    target=ManifestReference(target["id"], target["name"]),
+                    target_path_id=item["target_path_id"],
+                    relative_file=relative_file,
+                    kind=item["kind"],
+                    mode=int(item["mode"]),
+                    names=list(item.get("names", [])),
+                )
+            )
         return Config(
             repository_path=Path(settings["repository_path"]).expanduser(),
             version=MANIFEST_VERSION,
@@ -278,6 +345,8 @@ class ConfigManager:
             profiles=profiles,
             suggested_activation=suggested_activation,
             minimum_concord_version=minimum,
+            secret_group=secret_group,
+            secrets=secrets,
             git=GitConfig(**settings.get("git", {})),
             source_version=version,
         )
