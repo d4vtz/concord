@@ -641,6 +641,9 @@ class Doctor:
                 active_complements = connection.execute(
                     "SELECT profile_id FROM profile_activation_complements"
                 ).fetchall()
+                selection = connection.execute(
+                    "SELECT value FROM local_settings WHERE key = 'profile_selection_mode'"
+                ).fetchone()
         except sqlite3.Error as error:
             self._add(checks, "Perfiles", "Integridad", "failure", f"No pudieron comprobarse: {error}")
             return
@@ -686,24 +689,34 @@ class Doctor:
             )
 
         ids = {profile_id for profile_id, _ in rows}
-        active_ids = ([active_primary[0]] if active_primary else []) + [
-            profile_id for (profile_id,) in active_complements
-        ]
+        active_ids = [active_primary[0]] if active_primary else []
         if any(profile_id not in ids for profile_id in active_ids):
             self._add(
                 checks, "Perfiles", "Activación local", "failure",
                 "La activación referencia perfiles inexistentes.",
-                "Ejecuta: concord profile activate o concord profile deactivate --all"
+                "Ejecuta: concord profile use <nombre> o concord profile use --all"
+            )
+        elif active_complements:
+            self._add(
+                checks, "Perfiles", "Activación local", "warning",
+                "La activación usa complementos del modelo anterior.",
+                "Ejecuta: concord profile use <nombre> o concord profile use --all"
             )
         elif active_primary:
             self._add(
                 checks, "Perfiles", "Activación local", "pass",
                 "La activación local es válida."
             )
-        else:
+        elif not rows or (selection and selection[0] == "all"):
             self._add(
                 checks, "Perfiles", "Activación local", "pass",
-                "No hay perfiles activos; se usarán todos los targets."
+                "Este equipo usa explícitamente todos los targets."
+            )
+        else:
+            self._add(
+                checks, "Perfiles", "Activación local", "warning",
+                "Hay perfiles disponibles, pero este equipo todavía no seleccionó uno.",
+                "Ejecuta: concord profile use <nombre> o concord profile use --all"
             )
 
     def _git_checks(self, config: Config, checks: list[DoctorCheck], *, fetch: bool) -> None:

@@ -6,6 +6,7 @@ from concord import application as concord
 from concord.application.config import Config, ConfigManager
 from concord.application.database import Database
 from concord.application.doctor import Doctor
+from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.secret_manager import (PARTIAL_SUFFIX, Age,
                                                 SecretManager)
@@ -185,3 +186,37 @@ def test_doctor_does_not_compare_plaintext_with_age_ciphertext(secret_environmen
         check for check in checks if check.name == "Sincronización"
     )
     assert synchronization.state == "pass"
+
+
+def test_profile_edit_does_not_downgrade_secret_manifest_version(secret_environment):
+    targets, _, home, _, _ = secret_environment
+    source = home / ".token"
+    source.write_text("secret")
+    targets.add(source, "token")
+    targets.secret_manager.protect(source, targets.list())
+    targets._persist_manifest()
+
+    profiles = ProfileManager(targets.database, targets.config_manager)
+    profiles.create("base")
+
+    assert ConfigManager().load().minimum_concord_version == "2.8.0"
+
+
+def test_restore_all_uses_each_targets_own_secret_metadata(secret_environment):
+    targets, secrets, home, _, _ = secret_environment
+    private = home / ".private"
+    public = home / ".public"
+    private.write_text("private")
+    public.write_text("public")
+    targets.add(private, "private")
+    targets.add(public, "public")
+    secrets.protect(private, targets.list())
+    targets.sync("private")
+    private.unlink()
+    public.unlink()
+
+    restored = targets.restore_all()
+
+    assert {target.name for target in restored} == {"private", "public"}
+    assert private.read_text() == "private"
+    assert public.read_text() == "public"

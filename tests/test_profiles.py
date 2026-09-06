@@ -6,10 +6,11 @@ from typer.testing import CliRunner
 from concord import application as concord
 from concord.application.config import Config, ConfigManager
 from concord.application.database import Database
+from concord.application.doctor import Doctor
 from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
-from concord.cli.app import app, request_checkbox, request_order
+from concord.cli.app import app, request_checkbox
 
 
 @pytest.fixture
@@ -53,7 +54,7 @@ def test_profiles_are_normalized_and_exported(profile_environment):
     assert next(target for target in config.targets if target.name == "bash").id == bash.id
 
 
-def test_profile_resolution_preserves_order_and_protects_primary(profile_environment):
+def test_profile_resolution_uses_permanent_composition(profile_environment):
     _, profiles, add_target = profile_environment
     for name in ("shell", "editor", "git", "qtile"):
         add_target(name)
@@ -61,35 +62,23 @@ def test_profile_resolution_preserves_order_and_protects_primary(profile_environ
     profiles.update("base", targets=["shell", "editor", "git"])
     profiles.create("linux")
     profiles.update("linux", includes=["base"], targets=["qtile"])
-    profiles.create("remove-git")
-    profiles.update("remove-git", excludes=["git"])
-    profiles.create("extra")
-    profiles.update("extra", targets=["git"])
+    profiles.create("minimal")
+    profiles.update("minimal", includes=["linux"], excludes=["git"])
 
-    profiles.activate("linux", ["remove-git", "extra"])
+    profiles.activate("minimal")
     resolution = profiles.resolve_active()
 
     assert resolution is not None
-    assert resolution.target_names == ["shell", "editor", "git", "qtile"]
-    assert "protegido 'git'" in resolution.warnings[0]
+    assert resolution.target_names == ["shell", "editor", "qtile"]
 
 
-def test_later_complement_readds_excluded_target_at_end(profile_environment):
-    _, profiles, add_target = profile_environment
-    for name in ("one", "two", "three"):
-        add_target(name)
-    profiles.create("primary")
-    profiles.update("primary", targets=["one"])
-    profiles.create("first")
-    profiles.update("first", targets=["two", "three"])
-    profiles.create("second")
-    profiles.update("second", excludes=["two"])
-    profiles.create("third")
-    profiles.update("third", targets=["two"])
+def test_runtime_complements_are_rejected(profile_environment):
+    _, profiles, _ = profile_environment
+    profiles.create("main")
+    profiles.create("extra")
 
-    profiles.activate("primary", ["first", "second", "third"])
-
-    assert profiles.resolve_active().target_names == ["one", "three", "two"]
+    with pytest.raises(ValueError, match="único perfil"):
+        profiles.activate("main", ["extra"])
 
 
 def test_cycle_is_rejected_without_changing_profile(profile_environment):
@@ -118,17 +107,18 @@ def test_active_profiles_filter_target_operations(profile_environment):
     assert targets.get("one").name == "one"
 
 
-def test_active_profile_cannot_be_deleted_and_repeated_complement_moves_last(
-    profile_environment,
-):
+def test_active_profile_cannot_be_deleted_and_all_is_explicit(profile_environment):
     _, profiles, _ = profile_environment
     for name in ("main", "first", "second"):
         profiles.create(name)
-    active = profiles.activate("main", ["first", "second", "first"])
+    active = profiles.activate("main")
 
-    assert active.complements == ["second", "first"]
+    assert active.primary == "main"
     with pytest.raises(ValueError, match="activo"):
-        profiles.delete("first")
+        profiles.delete("main")
+    profiles.use_all()
+    assert profiles.selection_mode() == "all"
+    assert profiles.activation() is None
 
 
 def test_manifest_import_replaces_profiles_and_keeps_stable_references(profile_environment):
@@ -150,18 +140,14 @@ def test_manifest_import_replaces_profiles_and_keeps_stable_references(profile_e
     assert manifest.profiles[0].id == profile.id
 
 
-def test_deactivate_primary_requires_replacement_or_all(profile_environment):
+def test_switching_profile_or_using_all_replaces_the_selection(profile_environment):
     _, profiles, _ = profile_environment
     profiles.create("one")
     profiles.create("two")
-    profiles.activate("one", ["two"])
-
-    with pytest.raises(ValueError, match="replace-with"):
-        profiles.deactivate("one")
-
-    assert profiles.deactivate("one", replace_with="two").primary == "two"
-    profiles.deactivate_all()
-    assert profiles.activation() is None
+    profiles.activate("one")
+    assert profiles.activate("two").primary == "two"
+    profiles.use_all()
+    assert profiles.selection_mode() == "all"
 
 
 def test_declined_suggestion_is_offered_again_only_after_it_changes(profile_environment):
@@ -206,6 +192,42 @@ def test_profile_cli_lifecycle_and_filtered_list(profile_environment, monkeypatc
     assert "bash" in listed_all.output and "nvim" in listed_all.output
 
 
+def test_profile_use_and_current_expose_single_selection(profile_environment, monkeypatch):
+    targets, _, add_target = profile_environment
+    add_target("bash")
+    profiles = ProfileManager(targets.database, targets.config_manager)
+    profiles.create("base")
+    profiles.update("base", targets=["bash"])
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+    runner = CliRunner()
+
+    used = runner.invoke(app, ["profile", "use", "base"])
+    current = runner.invoke(app, ["profile", "current"])
+    all_targets = runner.invoke(app, ["profile", "use", "--all"])
+
+    assert used.exit_code == 0, used.output
+    assert current.exit_code == 0, current.output
+    assert "base" in current.output and "bash" in current.output
+    assert all_targets.exit_code == 0, all_targets.output
+    assert profiles.selection_mode() == "all"
+
+
+def test_legacy_with_option_explains_permanent_composition(profile_environment, monkeypatch):
+    targets, profiles, _ = profile_environment
+    profiles.create("base")
+    profiles.create("extra")
+    monkeypatch.setattr("concord.cli.app.manager", lambda: targets)
+
+    result = CliRunner().invoke(
+        app,
+        ["profile", "activate", "--primary", "base", "--with", "extra"],
+    )
+
+    assert result.exit_code == 1
+    assert "Ya no se activan complementos temporales" in result.output
+    assert profiles.activation() is None
+
+
 def test_external_profile_manifest_change_is_detected(profile_environment):
     targets, profiles, _ = profile_environment
     profiles.create("local")
@@ -247,18 +269,6 @@ def test_empty_interactive_checkbox_returns_empty_selection(monkeypatch):
     assert request_checkbox("Sin opciones:", []) == []
 
 
-def test_complements_can_be_ordered_interactively(monkeypatch):
-    answers = iter(["third", "first"])
-
-    class Prompt:
-        def ask(self):
-            return next(answers)
-
-    monkeypatch.setattr("concord.cli.app.questionary.select", lambda *args, **kwargs: Prompt())
-
-    assert request_order(["first", "second", "third"]) == ["third", "first", "second"]
-
-
 def test_internal_concord_target_cannot_be_assigned_to_a_profile(profile_environment):
     _, profiles, _ = profile_environment
     profiles.create("base")
@@ -267,3 +277,35 @@ def test_internal_concord_target_cannot_be_assigned_to_a_profile(profile_environ
         profiles.update("base", targets=["concord"])
 
     assert profiles.get("base").targets == []
+
+
+def test_profile_cannot_add_and_exclude_the_same_target(profile_environment):
+    _, profiles, add_target = profile_environment
+    add_target("bash")
+    profiles.create("base")
+
+    with pytest.raises(ValueError, match="agregarse y excluirse"):
+        profiles.update("base", targets=["bash"], excludes=["bash"])
+
+
+def test_profiles_require_an_explicit_local_selection(profile_environment):
+    targets, profiles, add_target = profile_environment
+    add_target("bash")
+    profiles.create("base")
+    profiles.update("base", targets=["bash"])
+
+    with pytest.raises(ValueError, match="todavía no seleccionó"):
+        targets.selected()
+
+    profiles.activate("base")
+    assert [target.name for target in targets.selected()] == ["bash"]
+
+
+def test_doctor_warns_when_profile_selection_is_pending(profile_environment):
+    _, profiles, _ = profile_environment
+    profiles.create("base")
+
+    report = Doctor().run()
+    check = next(item for item in report.checks if item.name == "Activación local")
+
+    assert check.state == "warning"

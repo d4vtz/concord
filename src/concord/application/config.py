@@ -129,13 +129,26 @@ class ConfigManager:
         except ValueError:
             return str(path)
 
+    def _required_minimum_version(self, config: Config) -> str | None:
+        requirements: list[str] = []
+        if config.minimum_concord_version:
+            requirements.append(config.minimum_concord_version)
+        if config.profiles:
+            requirements.append(PROFILE_MINIMUM_VERSION)
+        if any(target.dependencies for target in config.targets):
+            requirements.append(DEPENDENCY_MINIMUM_VERSION)
+        if config.secret_group or config.secrets:
+            requirements.append(CONCORD_VERSION)
+        return max(requirements, key=self._version_tuple) if requirements else None
+
     def save(self, config: Config) -> None:
         concord.config_dir.mkdir(parents=True, exist_ok=True)
+        minimum_version = self._required_minimum_version(config)
         settings = {
             "version": config.version,
             **(
-                {"minimum_concord_version": config.minimum_concord_version}
-                if config.minimum_concord_version
+                {"minimum_concord_version": minimum_version}
+                if minimum_version
                 else {}
             ),
             "repository_path": self._portable_path(config.repository_path),
@@ -235,10 +248,6 @@ class ConfigManager:
                             "id": config.suggested_activation.primary.id,
                             "name": config.suggested_activation.primary.name,
                         },
-                        "complements": [
-                            {"id": reference.id, "name": reference.name}
-                            for reference in config.suggested_activation.complements
-                        ],
                     }
                 }
                 if config.suggested_activation

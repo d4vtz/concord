@@ -119,47 +119,51 @@ La edición sin opciones abre un selector interactivo:
 concord profile edit linux
 ```
 
-Una activación contiene un perfil principal y complementos ordenados. Sin
-opciones, Concord guía la selección de la base, los complementos, su orden,
-muestra una vista previa de targets y exclusiones, y pide confirmación:
+Cada equipo selecciona un único perfil. La reutilización se define de forma
+permanente con `--include`, por lo que el resultado de un perfil no cambia según
+el contexto donde se utilice. Sin opciones, Concord muestra una vista previa y
+pide confirmación:
 
 ```bash
-concord profile activate
-concord profile activate --primary linux --with trabajo
+concord profile use
+concord profile use linux
 ```
 
-El principal forma una base protegida. Los complementos pueden agregar
-targets y excluir targets aportados por complementos anteriores, pero no
-pueden retirar los del principal. Las inclusiones se expanden primero, después
-se agregan los targets directos y al final se aplican las exclusiones. Los ciclos
-y referencias inexistentes se rechazan antes de guardar.
+Las inclusiones se expanden primero, después se agregan los targets directos y
+al final se aplican las exclusiones. Un target no puede agregarse y excluirse en
+el mismo perfil. Los ciclos y referencias inexistentes se rechazan antes de
+guardar.
 
 El target interno `concord` no aparece en los selectores y no puede agregarse
 ni excluirse desde un perfil. `profile list` ofrece un resumen compacto;
 `profile show <nombre>` conserva el árbol completo y el resultado expandido.
 
-Con una activación, `list`, `status`, `diff`, `sync` y `restore --all` trabajan
+Con un perfil seleccionado, `list`, `status`, `diff`, `sync` y `restore --all` trabajan
 por defecto sobre sus targets efectivos. Un target indicado explícitamente
-continúa siendo válido aunque esté fuera del perfil. Para volver al comportamiento
-global:
+continúa siendo válido aunque esté fuera del perfil. Usar todos los targets es
+una decisión explícita:
 
 ```bash
-concord profile deactivate --all
+concord profile use --all
 ```
+
+Si existen perfiles y el equipo todavía no eligió uno, los comandos globales
+se detienen en lugar de asumir que deben operar sobre todos.
 
 Comandos de consulta y mantenimiento:
 
 ```bash
 concord profile list
 concord profile show linux
+concord profile current
 concord profile rename linux laptop
 concord profile validate
-concord profile suggest --primary linux --with trabajo
+concord profile suggest --primary linux
 concord profile delete laptop
 ```
 
-La activación efectiva se guarda únicamente en el equipo local. El manifiesto
-puede llevar una combinación sugerida; Concord pregunta antes de adoptarla y,
+El perfil efectivo se guarda únicamente en el equipo local. El manifiesto
+puede llevar un perfil sugerido; Concord pregunta antes de adoptarlo y,
 si se rechaza, no vuelve a ofrecerla hasta que cambie.
 
 ## Dependencias de paquetes
@@ -708,9 +712,8 @@ Comportamiento esperado:
 - `status` y `doctor` comprobarán targets inexistentes, perfiles vacíos y ciclos
   de composición.
 
-Más adelante podrá añadirse un perfil activo por máquina, pero la primera
-versión no sincronizará automáticamente el nombre del equipo ni decidirá qué
-perfil restaurar sin confirmación.
+La selección del perfil es local a cada máquina y nunca se decide implícitamente
+durante una restauración.
 
 
 Las dependencias de Python que forman parte interna de Concord seguirán
@@ -726,12 +729,13 @@ concord bootstrap https://github.com/usuario/dotfiles.git
 ```
 
 El comando clona el repositorio, recupera `concord.toml`, reconstruye SQLite y
-ofrece restaurar todos los targets. También puede controlarse explícitamente:
+obliga a seleccionar un perfil, todos los targets o importar sin restaurar.
+También puede controlarse explícitamente:
 
 ```bash
-concord bootstrap https://github.com/usuario/dotfiles.git --restore
+concord bootstrap https://github.com/usuario/dotfiles.git --profile linux --restore
+concord bootstrap https://github.com/usuario/dotfiles.git --all-targets --restore
 concord bootstrap https://github.com/usuario/dotfiles.git --no-restore
-concord bootstrap https://github.com/usuario/dotfiles.git --install-deps
 ```
 
 Después de importar el manifiesto y resolver los perfiles activos, `bootstrap`
@@ -740,7 +744,7 @@ interactivo debe indicarse explícitamente:
 
 ```bash
 concord bootstrap https://github.com/usuario/dotfiles.git \
-  --restore --install-deps --yes
+  --profile linux --restore --install-deps --yes
 ```
 
 La forma no interactiva solo funciona si ya existe un helper AUR preferido. Si
@@ -748,19 +752,31 @@ falta, la preparación de `paru-bin` o `yay-bin` debe completarse previamente en
 una terminal con `concord deps helper install`; Concord nunca ejecuta un
 PKGBUILD sin revisión interactiva.
 
-Si existen configuraciones locales, `bootstrap` muestra las rutas afectadas y
-pregunta si deben reemplazarse con las copias del repositorio. Rechazar la
-confirmación conserva HOME sin cambios y deja Concord importado para restaurar
-más tarde. En ejecuciones no interactivas, el reemplazo debe autorizarse de
-forma explícita:
+Antes de modificar HOME, `bootstrap` clasifica cada archivo como idéntico, solo
+local, solo repositorio o diferente. Los idénticos se conservan, los que solo
+existen localmente nunca se borran y los que faltan se restauran. Cada diferencia
+puede conservarse, reemplazarse o respaldarse antes del reemplazo.
+
+En modo no interactivo se define una política explícita:
 
 ```bash
-concord bootstrap https://github.com/usuario/dotfiles.git --restore --force
+concord bootstrap https://github.com/usuario/dotfiles.git \
+  --profile linux --restore --conflict keep-local
+
+concord bootstrap https://github.com/usuario/dotfiles.git \
+  --profile linux --restore --conflict backup-and-replace
 ```
 
-`--force` solo resuelve conflictos en HOME. Si falta la copia de un target en
-el repositorio, debe sincronizarse desde el equipo original o eliminarse del
-manifiesto.
+Los respaldos se guardan en
+`~/.local/share/concord/backups/bootstrap-<fecha>/`. `--force` se conserva como
+alias compatible de `--conflict backup-and-replace`.
+
+Si el proceso se cancela después de importar, puede continuar sin volver a
+clonar:
+
+```bash
+concord bootstrap --resume --profile linux --restore
+```
 
 ## Reiniciar Concord
 

@@ -53,6 +53,14 @@ class ContentDiff:
     detail: str | None = None
 
 
+@dataclass(frozen=True)
+class RestorePlanEntry:
+    target_name: str
+    path: Path
+    state: str
+    kind: str
+
+
 class TargetManager:
     RESERVED_NAMES = {"ignore", "manifest", "config"}
 
@@ -274,8 +282,14 @@ class TargetManager:
         return targets
 
     def selected(self) -> list[Target]:
-        resolution = ProfileManager(self.database, self.config_manager).resolve_active()
+        profile_manager = ProfileManager(self.database, self.config_manager)
+        resolution = profile_manager.resolve_active()
         if resolution is None:
+            if profile_manager.selection_mode() == "unset":
+                raise ValueError(
+                    "Hay perfiles disponibles, pero este equipo todavía no seleccionó uno. "
+                    "Use concord profile use <nombre> o concord profile use --all."
+                )
             return self.list()
         return [self.get(name) for name in resolution.target_names]
 
@@ -421,7 +435,7 @@ class TargetManager:
                 raise FileExistsError(f"'{path.local_path}' ya existe; use --force para reemplazar todo el target.")
         staged = []
         try:
-            for _, path, source in pairs:
+            for target, path, source in pairs:
                 temporary = path.local_path.with_name(f".{path.local_path.name}.concord.tmp")
                 if os.path.lexists(temporary):
                     self._remove_local(temporary)
@@ -435,6 +449,10 @@ class TargetManager:
                 if os.path.lexists(temporary):
                     self._remove_local(temporary)
             raise
+        self._install_local_paths(staged)
+        return targets
+
+    def _install_local_paths(self, staged: list[tuple[Path, Path]]) -> None:
         installed: list[tuple[Path, Path]] = []
         try:
             for destination, temporary in staged:
@@ -463,6 +481,216 @@ class TargetManager:
         for _, backup in installed:
             if os.path.lexists(backup):
                 self._remove_local(backup)
+
+    def restore_plan(self) -> list[RestorePlanEntry]:
+        """Clasifica la restauración seleccionada sin modificar HOME."""
+        result: list[RestorePlanEntry] = []
+        for target in self.selected():
+            if target.name == CONCORD_TARGET:
+                continue
+            target_has_secrets = bool(self.secret_manager.for_target(target.id))
+            for path in target.paths:
+                local = path.local_path
+                stored = self._destination(target, path)
+                if not os.path.lexists(local):
+                    result.append(
+                        RestorePlanEntry(target.name, path.relative_path, "repository_only", path.type.value)
+                    )
+                    continue
+                if target_has_secrets:
+                    if self.secret_manager.unlocked and self.secret_manager.path_clean(target, path, stored):
+                        result.append(
+                            RestorePlanEntry(target.name, path.relative_path, "identical", path.type.value)
+                        )
+                    else:
+                        result.append(
+                            RestorePlanEntry(target.name, path.relative_path, "modified", path.type.value)
+                        )
+                    continue
+                if os.path.lexists(stored) and paths_equal(local, stored):
+                    result.append(
+                        RestorePlanEntry(target.name, path.relative_path, "identical", path.type.value)
+                    )
+                    continue
+                if local.is_dir() and stored.is_dir():
+                    local_entries = self._tree_entries(local)
+                    stored_entries = self._tree_entries(stored)
+                    for relative in sorted(local_entries.keys() | stored_entries.keys(), key=str):
+                        display = path.relative_path / relative
+                        if relative not in local_entries:
+                            if stored_entries[relative].is_dir() and any(
+                                candidate != relative and candidate.is_relative_to(relative)
+                                for candidate in stored_entries
+                            ):
+                                continue
+                            result.append(
+                                RestorePlanEntry(
+                                    target.name,
+                                    display,
+                                    "repository_only",
+                                    self._content_kind(stored_entries[relative]),
+                                )
+                            )
+                        elif relative not in stored_entries:
+                            if local_entries[relative].is_dir() and any(
+                                candidate != relative and candidate.is_relative_to(relative)
+                                for candidate in local_entries
+                            ):
+                                continue
+                            result.append(
+                                RestorePlanEntry(
+                                    target.name,
+                                    display,
+                                    "local_only",
+                                    self._content_kind(local_entries[relative]),
+                                )
+                            )
+                        elif not self._paths_equal(
+                            local_entries[relative], stored_entries[relative]
+                        ):
+                            result.append(
+                                RestorePlanEntry(
+                                    target.name,
+                                    display,
+                                    "modified",
+                                    self._content_kind(local_entries[relative]),
+                                )
+                            )
+                else:
+                    result.append(
+                        RestorePlanEntry(target.name, path.relative_path, "modified", self._content_kind(local))
+                    )
+        return result
+
+    @staticmethod
+    def _tree_entries(root: Path) -> dict[Path, Path]:
+        return {
+            item.relative_to(root): item
+            for item in root.rglob("*")
+            if item.is_dir() or item.is_file() or item.is_symlink()
+        }
+
+    def _backup_local(self, source: Path, backup_root: Path | None) -> None:
+        if backup_root is None or not os.path.lexists(source):
+            return
+        relative = source.relative_to(Path.home().resolve())
+        destination = backup_root / relative
+        if os.path.lexists(destination):
+            self._remove_local(destination)
+        self._copy(source, destination)
+
+    def _replace_in_tree(self, source: Path, destination: Path) -> None:
+        if os.path.lexists(destination):
+            self._remove_local(destination)
+        self._copy(source, destination)
+
+    def _merge_directory(
+        self,
+        desired: Path,
+        local: Path,
+        merged: Path,
+        *,
+        decisions: dict[Path, str],
+        default_policy: str,
+        backup_root: Path | None,
+    ) -> None:
+        self._copy(local, merged)
+        skipped: list[Path] = []
+        desired_entries = self._tree_entries(desired)
+        for relative, desired_entry in sorted(
+            desired_entries.items(), key=lambda item: (len(item[0].parts), str(item[0]))
+        ):
+            if any(relative == root or relative.is_relative_to(root) for root in skipped):
+                continue
+            destination = merged / relative
+            original = local / relative
+            display = local.relative_to(Path.home().resolve()) / relative
+            if not os.path.lexists(original):
+                self._replace_in_tree(desired_entry, destination)
+                continue
+            if self._paths_equal(original, desired_entry):
+                continue
+            action = decisions.get(display, default_policy)
+            if action == "keep-local":
+                if desired_entry.is_dir() and not desired_entry.is_symlink():
+                    skipped.append(relative)
+                continue
+            if action == "abort":
+                raise FileExistsError(f"Conflicto local sin resolver: ~/{display}")
+            if action == "backup-and-replace":
+                self._backup_local(original, backup_root)
+            self._replace_in_tree(desired_entry, destination)
+
+    def restore_conservative(
+        self,
+        *,
+        default_policy: str = "abort",
+        decisions: dict[Path, str] | None = None,
+        backup_root: Path | None = None,
+        skip_targets: set[str] | None = None,
+    ) -> list[Target]:
+        """Restaura faltantes y mezcla directorios sin borrar archivos solo locales."""
+        if default_policy not in {"abort", "keep-local", "replace", "backup-and-replace"}:
+            raise ValueError(f"Política de conflicto no válida: {default_policy}")
+        decisions = decisions or {}
+        skip_targets = skip_targets or set()
+        targets = [
+            target
+            for target in self.selected()
+            if target.name != CONCORD_TARGET and target.name not in skip_targets
+        ]
+        staged: list[tuple[Path, Path]] = []
+        temporaries: list[Path] = []
+        try:
+            for target in targets:
+                for path in target.paths:
+                    source = self._destination(target, path)
+                    desired = path.local_path.with_name(f".{path.local_path.name}.concord.desired.tmp")
+                    merged = path.local_path.with_name(f".{path.local_path.name}.concord.tmp")
+                    for temporary in (desired, merged):
+                        if os.path.lexists(temporary):
+                            self._remove_local(temporary)
+                        temporaries.append(temporary)
+                    if self.secret_manager.for_target(target.id):
+                        self.secret_manager.stage_restore_path(target, path, source, desired)
+                    else:
+                        self._copy(source, desired)
+                    if not os.path.lexists(path.local_path):
+                        desired.rename(merged)
+                        staged.append((path.local_path, merged))
+                        continue
+                    if paths_equal(path.local_path, desired):
+                        self._remove_local(desired)
+                        continue
+                    if path.local_path.is_dir() and desired.is_dir():
+                        self._merge_directory(
+                            desired,
+                            path.local_path,
+                            merged,
+                            decisions=decisions,
+                            default_policy=default_policy,
+                            backup_root=backup_root,
+                        )
+                        self._remove_local(desired)
+                        staged.append((path.local_path, merged))
+                        continue
+                    display = path.relative_path
+                    action = decisions.get(display, default_policy)
+                    if action == "keep-local":
+                        self._remove_local(desired)
+                        continue
+                    if action == "abort":
+                        raise FileExistsError(f"Conflicto local sin resolver: ~/{display}")
+                    if action == "backup-and-replace":
+                        self._backup_local(path.local_path, backup_root)
+                    desired.rename(merged)
+                    staged.append((path.local_path, merged))
+        except Exception:
+            for temporary in temporaries:
+                if os.path.lexists(temporary):
+                    self._remove_local(temporary)
+            raise
+        self._install_local_paths(staged)
         return targets
 
     def _remove_local(self, path: Path) -> None:
@@ -481,13 +709,11 @@ class TargetManager:
         return self._restore_targets(targets, force=force)
 
     def restore_conflicts(self) -> list[Path]:
-        """Devuelve las rutas seleccionadas que ya existen en HOME."""
-        targets = [target for target in self.selected() if target.name != CONCORD_TARGET]
+        """Devuelve únicamente archivos diferentes que requieren una decisión."""
         return [
-            path.local_path
-            for target in targets
-            for path in target.paths
-            if os.path.lexists(path.local_path)
+            Path.home().resolve() / entry.path
+            for entry in self.restore_plan()
+            if entry.state == "modified"
         ]
 
     def remove(self, name: str, *, keep_repository: bool = False) -> None:

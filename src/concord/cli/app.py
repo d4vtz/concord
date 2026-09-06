@@ -29,7 +29,7 @@ from concord.application.profile_manager import Activation, ProfileManager
 from concord.application.reset import ResetManager
 from concord.application.secret_manager import Age, SecretManager
 from concord.application.target_manager import TargetManager
-from concord.cli.completion import (complete_editables,
+from concord.cli.completion import (complete_editables, complete_profiles,
                                     complete_removable_targets,
                                     complete_target_paths, complete_targets)
 from concord.cli.ui import console, details, execute, heading, success, warning
@@ -273,13 +273,16 @@ def dependencies(target_manager: TargetManager | None = None) -> DependencyManag
 def render_activation(profile_manager: ProfileManager) -> None:
     activation = profile_manager.activation()
     if activation is None:
-        details([("Perfiles", "ninguno — se usan todos los targets")], title="Selección activa")
+        mode = profile_manager.selection_mode()
+        label = (
+            "todos los targets"
+            if mode == "all"
+            else "sin seleccionar — usa concord profile use <nombre>"
+        )
+        details([("Perfil", label)], title="Selección activa")
         return
     details(
-        [
-            ("Principal", activation.primary),
-            ("Complementos", ", ".join(activation.complements) or "ninguno"),
-        ],
+        [("Perfil", activation.primary)],
         title="Selección activa",
     )
     resolution = profile_manager.resolve_active()
@@ -295,12 +298,10 @@ def maybe_offer_suggestion(profile_manager: ProfileManager) -> None:
     if suggestion is None:
         return
     label = suggestion.primary
-    if suggestion.complements:
-        label += f" + {', '.join(suggestion.complements)}"
     if questionary.confirm(
         f"El manifiesto sugiere activar {label}. ¿Deseas adoptarlo?", default=True
     ).ask():
-        profile_manager.activate(suggestion.primary, suggestion.complements)
+        profile_manager.activate(suggestion.primary)
         success("Se adoptó la activación sugerida para este equipo.")
     else:
         profile_manager.decline_suggestion()
@@ -314,6 +315,26 @@ def persist_profile_manifest(target_manager: TargetManager, message: str) -> Non
             message,
             GitOptions(message=None, yes=False, commit=True, push=None),
         )
+
+
+def _bootstrap_state(target_manager: TargetManager, value: str | None = None) -> str | None:
+    with target_manager.database.connect() as connection:
+        if value is None:
+            row = connection.execute(
+                "SELECT value FROM local_settings WHERE key = 'bootstrap_state'"
+            ).fetchone()
+            return row[0] if row else None
+        if value == "complete":
+            connection.execute("DELETE FROM local_settings WHERE key = 'bootstrap_state'")
+        else:
+            connection.execute(
+                """
+                INSERT INTO local_settings (key, value) VALUES ('bootstrap_state', ?)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (value,),
+            )
+    return value
 
 
 def format_date(value: datetime) -> str:
@@ -366,22 +387,6 @@ def request_checkbox(
     if answer is None:
         raise KeyboardInterrupt
     return answer
-
-
-def request_order(choices: list[str]) -> list[str]:
-    """Permite ordenar una selección eligiendo cada capa sucesivamente."""
-    remaining = list(choices)
-    ordered: list[str] = []
-    while len(remaining) > 1:
-        selected = questionary.select(
-            f"Siguiente complemento ({len(ordered) + 1}/{len(choices)}):",
-            choices=remaining,
-        ).ask()
-        if selected is None:
-            raise KeyboardInterrupt
-        ordered.append(selected)
-        remaining.remove(selected)
-    return [*ordered, *remaining]
 
 
 def request_select(message: str, choices: list[str]) -> str:
@@ -1325,7 +1330,7 @@ def add(
     selected_profiles = list(profile or [])
     active = execute(profile_manager.activation)
     if not selected_profiles and active and sys.stdin.isatty():
-        choices = [active.primary, *active.complements]
+        choices = [active.primary]
         selected_profiles = request_checkbox(
             "¿A qué perfiles activos deseas agregar el target?", choices
         )
@@ -1925,18 +1930,38 @@ def restore(
 
 @app.command()
 def bootstrap(
-    remote_url: str = typer.Argument(..., help="URL del repositorio remoto de dotfiles."),
+    remote_url: str | None = typer.Argument(None, help="URL del repositorio remoto de dotfiles."),
     repository: Path | None = typer.Option(None, "--repository", "-r", help="Directorio local del repositorio."),
     restore_files: bool | None = typer.Option(
         None,
         "--restore/--no-restore",
-        help="Restaura todos los targets después de importar el manifiesto.",
+        help="Restaura los targets seleccionados después de importar el manifiesto.",
     ),
     force: bool = typer.Option(
         False,
         "--force",
         "-f",
-        help="Reemplaza rutas locales existentes al restaurar.",
+        help="Compatibilidad: equivale a --conflict backup-and-replace.",
+    ),
+    profile: str | None = typer.Option(
+        None,
+        "--profile",
+        help="Perfil que usará este equipo.",
+    ),
+    all_targets: bool = typer.Option(
+        False,
+        "--all-targets",
+        help="Selecciona explícitamente todos los targets.",
+    ),
+    resume: bool = typer.Option(
+        False,
+        "--resume",
+        help="Continúa un bootstrap previamente importado.",
+    ),
+    conflict: str | None = typer.Option(
+        None,
+        "--conflict",
+        help="Política: abort, keep-local, replace o backup-and-replace.",
     ),
     install_deps: bool | None = typer.Option(
         None,
@@ -1963,43 +1988,219 @@ def bootstrap(
                 ValueError("--force no puede combinarse con --no-restore.")
             )
         )
-    if concord.is_initialized():
-        execute(lambda: (_ for _ in ()).throw(ValueError("Concord ya está inicializado.")))
-    if not GitManager.available():
-        execute(lambda: (_ for _ in ()).throw(FileNotFoundError("Git no está instalado.")))
-    destination = (repository or concord.default_repository_dir).expanduser().resolve()
-    if destination.exists() and any(destination.iterdir()):
+    if profile and all_targets:
         execute(
             lambda: (_ for _ in ()).throw(
-                FileExistsError(f"El directorio de destino no está vacío: {destination}")
+                ValueError("No combine --profile con --all-targets.")
             )
         )
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    clone = subprocess.run(
-        ["git", "clone", remote_url, str(destination)],
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-    if clone.returncode:
-        execute(lambda: (_ for _ in ()).throw(ValueError(clone.stderr.strip() or "No fue posible clonar.")))
+    if force and conflict is not None:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("No combine --force con --conflict.")
+            )
+        )
+    conflict_policy = "backup-and-replace" if force else (conflict or "abort")
+    if conflict_policy not in {"abort", "keep-local", "replace", "backup-and-replace"}:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("--conflict debe ser abort, keep-local, replace o backup-and-replace.")
+            )
+        )
+    initialized = concord.is_initialized()
+    if initialized and not resume:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("Concord ya está inicializado; use --resume para continuar el bootstrap.")
+            )
+        )
+    if resume and not initialized:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("No existe un bootstrap importado para reanudar.")
+            )
+        )
+    if not resume and not remote_url:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError("Indique el repositorio remoto o use --resume.")
+            )
+        )
+    if not GitManager.available():
+        execute(lambda: (_ for _ in ()).throw(FileNotFoundError("Git no está instalado.")))
     config_manager = ConfigManager()
-    config = execute(
-        lambda: config_manager.load_from_repository(destination),
-        hint="El repositorio debe contener el manifiesto administrado por Concord.",
-    )
-    config.repository_path = destination
-    config_manager.save(config)
-    target_manager = TargetManager()
-    targets = execute(lambda: target_manager.import_manifest(replace=True))
-    success(f"Se importaron {len(targets)} target(s) desde el manifiesto.")
+    if resume:
+        config = config_manager.load()
+        destination = config.repository_path
+        target_manager = TargetManager()
+        if _bootstrap_state(target_manager) != "pending":
+            execute(
+                lambda: (_ for _ in ()).throw(
+                    ValueError("No hay un bootstrap pendiente para reanudar.")
+                )
+            )
+        targets = target_manager.list()
+        success("Se reanudó el bootstrap previamente importado.")
+    else:
+        destination = (repository or concord.default_repository_dir).expanduser().resolve()
+        if destination.exists() and any(destination.iterdir()):
+            execute(
+                lambda: (_ for _ in ()).throw(
+                    FileExistsError(f"El directorio de destino no está vacío: {destination}")
+                )
+            )
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        clone = subprocess.run(
+            ["git", "clone", remote_url, str(destination)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if clone.returncode:
+            execute(lambda: (_ for _ in ()).throw(ValueError(clone.stderr.strip() or "No fue posible clonar.")))
+        config = execute(
+            lambda: config_manager.load_from_repository(destination),
+            hint="El repositorio debe contener el manifiesto administrado por Concord.",
+        )
+        config.repository_path = destination
+        config_manager.save(config)
+        target_manager = TargetManager()
+        _bootstrap_state(target_manager, "pending")
+        targets = target_manager.list()
+        success(f"Se importaron {len(targets)} target(s) desde el manifiesto.")
     profile_manager = profiles(target_manager)
-    maybe_offer_suggestion(profile_manager)
+    available_profiles = profile_manager.list()
+    legacy_notice = profile_manager.legacy_notice()
+    if legacy_notice:
+        warning(legacy_notice)
+    if profile:
+        execute(lambda: profile_manager.activate(profile))
+    elif all_targets or not available_profiles:
+        profile_manager.use_all()
+    elif profile_manager.selection_mode() != "unset":
+        pass
+    elif sys.stdin.isatty():
+        suggestion = None if legacy_notice else profile_manager.suggestion()
+        choices = [item.name for item in available_profiles]
+        choices.extend(["Todos los targets", "Importar sin restaurar"])
+        selected_profile = questionary.select(
+            "¿Qué configuración debe usar este equipo?",
+            choices=choices,
+            default=suggestion.primary if suggestion else None,
+        ).ask()
+        if selected_profile is None:
+            raise typer.Abort()
+        if selected_profile == "Todos los targets":
+            profile_manager.use_all()
+        elif selected_profile == "Importar sin restaurar":
+            profile_manager.clear_selection()
+            restore_files = False
+        else:
+            profile_manager.activate(selected_profile)
+    elif restore_files or install_deps:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError(
+                    "El manifiesto contiene perfiles. Indique --profile <nombre> "
+                    "o --all-targets."
+                )
+            )
+        )
     render_activation(profile_manager)
     should_restore = restore_files
     if should_restore is None and sys.stdin.isatty():
-        should_restore = bool(questionary.confirm("¿Restaurar ahora todos los targets?", default=True).ask())
-    if should_restore or install_deps is True:
+        should_restore = bool(questionary.confirm("¿Restaurar ahora los targets seleccionados?", default=True).ask())
+    if should_restore:
+        if target_manager.secret_manager.configured() and target_manager.secret_manager.list():
+            execute(lambda: _prepared_secrets(target_manager))
+        plan = execute(target_manager.restore_plan)
+        plan_table = Table(box=box.ROUNDED, title="Plan de restauración")
+        plan_table.add_column("Target")
+        plan_table.add_column("Ruta")
+        plan_table.add_column("Estado")
+        state_labels = {
+            "identical": "idéntico — conservar",
+            "repository_only": "solo repositorio — restaurar",
+            "local_only": "solo local — conservar",
+            "modified": "diferente — decidir",
+        }
+        for entry in plan:
+            plan_table.add_row(entry.target_name, f"~/{entry.path}", state_labels[entry.state])
+        console.print(plan_table)
+        decisions: dict[Path, str] = {}
+        skipped_targets: set[str] = set()
+        modified = [entry for entry in plan if entry.state == "modified"]
+        if modified and conflict is None and not force and sys.stdin.isatty():
+            labels = {
+                "Conservar versión local": "keep-local",
+                "Usar versión del repositorio": "replace",
+                "Respaldar local y usar repositorio": "backup-and-replace",
+                "Omitir todo el target": "skip-target",
+                "Cancelar bootstrap": "abort",
+            }
+            for entry in modified:
+                if entry.target_name in skipped_targets:
+                    continue
+                answer = questionary.select(
+                    f"Conflicto en ~/{entry.path}:", choices=list(labels)
+                ).ask()
+                if answer is None or labels[answer] == "abort":
+                    warning("Restauración cancelada; no se modificaron las rutas locales.")
+                    return
+                if labels[answer] == "skip-target":
+                    skipped_targets.add(entry.target_name)
+                else:
+                    decisions[entry.path] = labels[answer]
+            conflict_policy = "abort"
+        elif modified and conflict_policy == "abort":
+            execute(
+                lambda: (_ for _ in ()).throw(
+                    FileExistsError(
+                        "Hay archivos diferentes. Use --conflict keep-local, replace o "
+                        "backup-and-replace."
+                    )
+                )
+            )
+        dependency_targets = [
+            target.name
+            for target in target_manager.selected()
+            if target.name != CONCORD_TARGET and target.name not in skipped_targets
+        ]
+        offer_dependency_installation(
+            target_manager,
+            dependency_targets,
+            scope_name="los targets seleccionados",
+            requested=install_deps,
+            include_optional=include_optional,
+            dry_run=False,
+            yes=yes,
+        )
+        needs_backup = conflict_policy == "backup-and-replace" or any(
+            action == "backup-and-replace" for action in decisions.values()
+        )
+        backup_root = None
+        if needs_backup:
+            backup_root = (
+                concord.data_dir
+                / "backups"
+                / f"bootstrap-{datetime.now().strftime('%Y%m%d-%H%M%S-%f')}"
+            )
+        restored = execute(
+            lambda: target_manager.restore_conservative(
+                default_policy=conflict_policy,
+                decisions=decisions,
+                backup_root=backup_root,
+                skip_targets=skipped_targets,
+            ),
+            hint=(
+                "Si falta una copia en el repositorio, sincroniza ese target desde el equipo original "
+                "o elimínalo del manifiesto."
+            ),
+        )
+        success(f"Se restauraron {len(restored)} target(s).")
+        if backup_root and backup_root.exists():
+            success(f"Respaldo local creado en: {backup_root}")
+    elif install_deps is True:
         dependency_targets = [
             target.name
             for target in target_manager.selected()
@@ -2008,56 +2209,16 @@ def bootstrap(
         offer_dependency_installation(
             target_manager,
             dependency_targets,
-            scope_name="los targets activos importados",
-            requested=install_deps,
+            scope_name="los targets seleccionados",
+            requested=True,
             include_optional=include_optional,
             dry_run=False,
             yes=yes,
         )
-    if should_restore:
-        if target_manager.secret_manager.configured() and target_manager.secret_manager.list():
-            execute(lambda: _prepared_secrets(target_manager))
-        restore_force = force
-        conflicts = target_manager.restore_conflicts()
-        if conflicts and not restore_force:
-            details(
-                [
-                    ("Rutas detectadas", str(len(conflicts))),
-                    ("Se reemplazarán", "\n".join(format_home_path(path) for path in conflicts)),
-                ],
-                title="Configuraciones locales existentes",
-            )
-            if not sys.stdin.isatty():
-                execute(
-                    lambda: (_ for _ in ()).throw(
-                        FileExistsError(
-                            "Existen rutas locales que requieren confirmación; "
-                            "vuelva a ejecutar bootstrap con --restore --force para reemplazarlas."
-                        )
-                    )
-                )
-            restore_force = bool(
-                questionary.confirm(
-                    "¿Reemplazar estas rutas con las copias del repositorio?",
-                    default=False,
-                ).ask()
-            )
-            if not restore_force:
-                warning("Restauración cancelada; no se modificaron las rutas locales.")
-                console.print("  [concord.muted]Cuando estés listo:[/] concord restore --all --force")
-                render_git_status(GitManager(destination).status(remote=config.git.remote))
-                return
-        restored = execute(
-            lambda: target_manager.restore_all(force=restore_force),
-            hint=(
-                "Si falta una copia en el repositorio, sincroniza ese target desde el equipo original "
-                "o elimínalo del manifiesto."
-            ),
-        )
-        success(f"Se restauraron {len(restored)} target(s).")
     else:
         warning("Los targets fueron importados pero todavía no se restauraron.")
         console.print("  [concord.muted]Cuando estés listo:[/] concord restore --all")
+    _bootstrap_state(target_manager, "complete")
     render_git_status(GitManager(destination).status(remote=config.git.remote))
 
 
@@ -2352,24 +2513,18 @@ def profile_tree(profile_manager: ProfileManager, name: str, *, root: Tree | Non
 
 
 def choose_profile_activation(
-    profile_manager: ProfileManager, *, confirmation: str = "¿Activar esta combinación?"
+    profile_manager: ProfileManager, *, confirmation: str = "¿Usar este perfil?"
 ) -> Activation | None:
     available = [profile.name for profile in profile_manager.list()]
     if not available:
         raise ValueError("No hay perfiles; cree uno con: concord profile create <nombre>.")
-    primary = questionary.select("Perfil principal:", choices=available).ask()
+    primary = questionary.select("Perfil para este equipo:", choices=available).ask()
     if primary is None:
         raise KeyboardInterrupt
-    complements = request_checkbox(
-        "Complementos:",
-        [name for name in available if name != primary],
-    )
-    complements = request_order(complements)
-    resolution = profile_manager.resolve_activation(primary, complements)
+    resolution = profile_manager.resolve(primary)
     details(
         [
-            ("Principal", primary),
-            ("Complementos (en orden)", "\n".join(complements) or "—"),
+            ("Perfil", primary),
             ("Targets efectivos", "\n".join(resolution.target_names) or "vacío"),
             ("Exclusiones aplicadas", "\n".join(resolution.applied_exclusions) or "—"),
         ],
@@ -2382,7 +2537,7 @@ def choose_profile_activation(
     if not questionary.confirm(confirmation, default=True).ask():
         warning("Operación cancelada; no se modificó la activación.")
         return None
-    return resolution.activation
+    return Activation(primary)
 
 
 @profile_app.command("create")
@@ -2429,19 +2584,36 @@ def profile_edit(
             available_profiles,
             checked=current.includes,
         )
+        inherited: list[str] = []
+        for included in includes:
+            for target_name in execute(lambda included=included: profile_manager.resolve(included)).target_names:
+                if target_name not in inherited:
+                    inherited.append(target_name)
         available_targets = [
             target.name for target in target_manager.list()
             if target.name != CONCORD_TARGET
         ]
         targets = request_checkbox(
-            "Targets directos:",
+            "Targets agregados directamente:",
             available_targets,
             checked=current.targets,
         )
+        profile_state = Table(box=box.SIMPLE, title="Composición resultante")
+        profile_state.add_column("Target")
+        profile_state.add_column("Estado")
+        for target_name in available_targets:
+            if target_name in targets:
+                state = "directo"
+            elif target_name in inherited:
+                state = "heredado"
+            else:
+                state = "no seleccionado"
+            profile_state.add_row(target_name, state)
+        console.print(profile_state)
         excludes = request_checkbox(
-            "Targets excluidos:",
-            available_targets,
-            checked=current.excludes,
+            "Targets heredados que se excluirán:",
+            [target_name for target_name in inherited if target_name not in targets],
+            checked=[target_name for target_name in current.excludes if target_name in inherited],
         )
         if not questionary.confirm("¿Guardar todos los cambios?", default=True).ask():
             warning("Edición cancelada; no se modificó el perfil.")
@@ -2503,19 +2675,24 @@ def profile_list() -> None:
     table.add_column("Nombre", style="bold #88C0D0")
     table.add_column("Descripción")
     table.add_column("Composición", style="concord.muted")
+    table.add_column("Efectivos", justify="right")
     table.add_column("Estado", no_wrap=True)
     for profile in available:
         state = "—"
         if active and profile.name == active.primary:
-            state = "[concord.success]Principal[/]"
-        elif active and profile.name in active.complements:
-            position = active.complements.index(profile.name) + 1
-            state = f"[concord.accent]Complemento {position}[/]"
+            state = "[concord.success]Activo[/]"
         composition = (
             f"{len(profile.includes)} incluidos · {len(profile.targets)} targets · "
             f"{len(profile.excludes)} exclusiones"
         )
-        table.add_row(profile.name, profile.description or "—", composition, state)
+        effective = execute(lambda profile=profile: profile_manager.resolve(profile.name))
+        table.add_row(
+            profile.name,
+            profile.description or "—",
+            composition,
+            str(len(effective.target_names)),
+            state,
+        )
     console.print(table)
 
 
@@ -2546,43 +2723,92 @@ def profile_show(name: str) -> None:
 
 @profile_app.command("activate")
 def profile_activate(
-    primary: str | None = typer.Option(None, "--primary", help="Perfil principal."),
-    complements: list[str] | None = typer.Option(None, "--with", help="Complemento; puede repetirse."),
+    primary: str | None = typer.Option(None, "--primary", help="Perfil que usará este equipo."),
+    complements: list[str] | None = typer.Option(None, "--with", hidden=True),
 ) -> None:
-    """Activa un perfil principal y complementos ordenados."""
-    heading("ACTIVAR PERFILES", "Seleccionando los targets efectivos de este equipo")
+    """Alias compatible de `profile use`."""
+    heading("USAR PERFIL", "Seleccionando los targets efectivos de este equipo")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
+    if complements:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError(
+                    "Ya no se activan complementos temporales. Incluya esos perfiles "
+                    "permanentemente con concord profile edit <perfil> --include <perfil>."
+                )
+            )
+        )
     if primary is None:
         chosen = execute(lambda: choose_profile_activation(profile_manager))
         if chosen is None:
             return
         activation = execute(
-            lambda: profile_manager.activate(chosen.primary, chosen.complements)
+            lambda: profile_manager.activate(chosen.primary)
         )
     else:
-        activation = execute(lambda: profile_manager.activate(primary, complements))
+        activation = execute(lambda: profile_manager.activate(primary))
     render_activation(profile_manager)
     resolution = execute(profile_manager.resolve_active)
     if resolution and not resolution.target_names:
         warning("La activación es válida, pero su resultado está vacío.")
-    success(f"Se activó el perfil principal '{activation.primary}'.")
+    success(f"Este equipo usará el perfil '{activation.primary}'.")
+
+
+@profile_app.command("use")
+def profile_use(
+    name: str | None = typer.Argument(None, autocompletion=complete_profiles),
+    all_targets: bool = typer.Option(False, "--all", help="Usa explícitamente todos los targets."),
+) -> None:
+    """Selecciona el único perfil activo de este equipo."""
+    heading("USAR PERFIL", "Definiendo la selección local de targets")
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    if all_targets:
+        if name is not None:
+            execute(lambda: (_ for _ in ()).throw(ValueError("No combine un perfil con --all.")))
+        profile_manager.use_all()
+        success("Este equipo usará explícitamente todos los targets.")
+        return
+    if name is None:
+        chosen = execute(lambda: choose_profile_activation(profile_manager))
+        if chosen is None:
+            return
+        name = chosen.primary
+    activation = execute(lambda: profile_manager.activate(name))
+    render_activation(profile_manager)
+    success(f"Este equipo usará el perfil '{activation.primary}'.")
+
+
+@profile_app.command("current")
+def profile_current() -> None:
+    """Muestra el perfil seleccionado y sus targets efectivos."""
+    target_manager = execute(manager, hint="Ejecuta primero: concord init")
+    profile_manager = profiles(target_manager)
+    render_activation(profile_manager)
+    if profile_manager.selection_mode() == "unset":
+        return
+    selected = execute(target_manager.selected)
+    details(
+        [("Targets efectivos", "\n".join(target.name for target in selected) or "vacío")],
+        title="Resultado",
+    )
 
 
 @profile_app.command("deactivate")
 def profile_deactivate(
     name: str | None = typer.Argument(None),
     all_profiles: bool = typer.Option(False, "--all", help="Desactiva la selección completa."),
-    replace_with: str | None = typer.Option(None, "--replace-with", help="Nuevo perfil principal."),
+    replace_with: str | None = typer.Option(None, "--replace-with", help="Perfil sustituto."),
 ) -> None:
-    """Desactiva un perfil o vuelve al modo global."""
+    """Alias compatible para cambiar de perfil o usar todos."""
     heading("DESACTIVAR PERFILES", "Actualizando la selección local")
     profile_manager = profiles(execute(manager, hint="Ejecuta primero: concord init"))
     if all_profiles:
         if name is not None:
             execute(lambda: (_ for _ in ()).throw(ValueError("No combine un nombre con --all.")))
         profile_manager.deactivate_all()
-        success("Se desactivaron todos los perfiles; Concord usará todos los targets.")
+        success("Este equipo usará explícitamente todos los targets.")
         return
     if name is None:
         execute(lambda: (_ for _ in ()).throw(ValueError("Indique un perfil o use --all.")))
@@ -2595,12 +2821,21 @@ def profile_deactivate(
 @profile_app.command("suggest")
 def profile_suggest(
     primary: str | None = typer.Option(None, "--primary"),
-    complements: list[str] | None = typer.Option(None, "--with"),
+    complements: list[str] | None = typer.Option(None, "--with", hidden=True),
 ) -> None:
-    """Guarda en el manifiesto una activación recomendada."""
-    heading("SUGERIR ACTIVACIÓN", "Definiendo la combinación recomendada para otros equipos")
+    """Guarda en el manifiesto el perfil recomendado para otros equipos."""
+    heading("SUGERIR PERFIL", "Definiendo el perfil recomendado para otros equipos")
     target_manager = execute(manager, hint="Ejecuta primero: concord init")
     profile_manager = profiles(target_manager)
+    if complements:
+        execute(
+            lambda: (_ for _ in ()).throw(
+                ValueError(
+                    "Ya no se sugieren combinaciones temporales. Sugiera un único perfil "
+                    "que componga sus inclusiones permanentes."
+                )
+            )
+        )
     if primary is None:
         chosen = execute(
             lambda: choose_profile_activation(
@@ -2609,13 +2844,12 @@ def profile_suggest(
         )
         if chosen is None:
             return
-        activation = execute(lambda: profile_manager.suggest(chosen.primary, chosen.complements))
+        activation = execute(lambda: profile_manager.suggest(chosen.primary))
     else:
-        activation = execute(lambda: profile_manager.suggest(primary, complements))
+        activation = execute(lambda: profile_manager.suggest(primary))
     execute(lambda: persist_profile_manifest(target_manager, "concord: update suggested profiles"))
     success(
-        f"Se sugirió '{activation.primary}'"
-        + (f" con {', '.join(activation.complements)}." if activation.complements else ".")
+        f"Se sugirió el perfil '{activation.primary}'."
     )
 
 

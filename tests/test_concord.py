@@ -10,6 +10,7 @@ from concord.application.database import Database
 from concord.application.doctor import Doctor
 from concord.application.git import GitManager
 from concord.application.initializer import Initializer
+from concord.application.profile_manager import ProfileManager
 from concord.application.repository import RepositoryManager
 from concord.application.target_manager import TargetManager
 from concord.cli.app import app, editor_command, sync_commit_message
@@ -351,7 +352,7 @@ def test_repository_bootstraps_a_new_home(tmp_path, monkeypatch):
     assert imported.updated_at == original.updated_at
 
 
-def test_restore_conflicts_reports_existing_selected_paths(manager):
+def test_restore_conflicts_ignores_identical_existing_paths(manager):
     instance, home, _ = manager
     first = home / ".bashrc"
     second = home / ".config/nvim"
@@ -361,7 +362,71 @@ def test_restore_conflicts_reports_existing_selected_paths(manager):
     instance.add(second, "nvim")
     first.unlink()
 
-    assert instance.restore_conflicts() == [second]
+    assert instance.restore_conflicts() == []
+
+
+def test_conservative_restore_merges_directories_without_deleting_local_files(manager):
+    instance, home, repository = manager
+    local = home / ".config/app"
+    local.mkdir(parents=True)
+    (local / "shared.conf").write_text("repository")
+    (local / "repo-only.conf").write_text("restore me")
+    instance.add(local, "app")
+
+    (local / "shared.conf").write_text("local change")
+    (local / "repo-only.conf").unlink()
+    (local / "local-only.conf").write_text("keep me")
+
+    plan = instance.restore_plan()
+    assert {(entry.path.name, entry.state) for entry in plan} == {
+        ("shared.conf", "modified"),
+        ("repo-only.conf", "repository_only"),
+        ("local-only.conf", "local_only"),
+    }
+
+    instance.restore_conservative(default_policy="keep-local")
+
+    assert (local / "shared.conf").read_text() == "local change"
+    assert (local / "repo-only.conf").read_text() == "restore me"
+    assert (local / "local-only.conf").read_text() == "keep me"
+    assert (repository / "app/.config/app/shared.conf").read_text() == "repository"
+
+
+def test_conservative_restore_backs_up_before_replacing(manager, tmp_path):
+    instance, home, _ = manager
+    local = home / ".bashrc"
+    local.write_text("repository")
+    instance.add(local, "bash")
+    local.write_text("local")
+    backup = tmp_path / "backup"
+
+    instance.restore_conservative(
+        default_policy="backup-and-replace", backup_root=backup
+    )
+
+    assert local.read_text() == "repository"
+    assert (backup / ".bashrc").read_text() == "local"
+
+
+def test_conservative_restore_handles_nested_type_conflict(manager):
+    instance, home, _ = manager
+    local = home / ".config/app"
+    nested = local / "plugins"
+    nested.mkdir(parents=True)
+    (nested / "one.conf").write_text("repository")
+    instance.add(local, "app")
+
+    (nested / "one.conf").unlink()
+    nested.rmdir()
+    nested.write_text("local file")
+
+    plan = instance.restore_plan()
+    assert any(entry.path.name == "plugins" and entry.state == "modified" for entry in plan)
+
+    instance.restore_conservative(default_policy="replace")
+
+    assert nested.is_dir()
+    assert (nested / "one.conf").read_text() == "repository"
 
 
 def test_bootstrap_force_replaces_existing_local_files(tmp_path, monkeypatch):
@@ -392,6 +457,13 @@ def test_bootstrap_force_replaces_existing_local_files(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert local.read_text() == "from repository\n"
     assert "Se restauraron 1 target(s)" in result.output
+    backups = list(
+        (destination_home / ".local/share/concord/backups").glob(
+            "bootstrap-*/.bashrc"
+        )
+    )
+    assert len(backups) == 1
+    assert backups[0].read_text() == "local configuration\n"
 
 
 def test_bootstrap_noninteractive_conflicts_require_force(tmp_path, monkeypatch):
@@ -421,7 +493,55 @@ def test_bootstrap_noninteractive_conflicts_require_force(tmp_path, monkeypatch)
 
     assert result.exit_code == 1
     assert local.read_text() == "local configuration\n"
-    assert "--restore --force" in result.output
+
+
+def test_bootstrap_uses_explicit_profile_and_can_resume(tmp_path, monkeypatch):
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    source_home.mkdir()
+    destination_home.mkdir()
+    source_repository = tmp_path / "source-repository"
+
+    configure_environment(source_home, monkeypatch)
+    Initializer().initialize(
+        source_repository,
+        git_identity=("Concord Test", "concord@example.com"),
+    )
+    bashrc = source_home / ".bashrc"
+    gitconfig = source_home / ".gitconfig"
+    bashrc.write_text("bash")
+    gitconfig.write_text("git")
+    targets = TargetManager()
+    targets.add(bashrc, "bash")
+    targets.add(gitconfig, "git")
+    profiles = ProfileManager(targets.database, targets.config_manager)
+    profiles.create("base")
+    profiles.update("base", targets=["bash"])
+    targets.sync("concord")
+    GitManager(source_repository).commit([Path(".")], "add profile")
+
+    configure_environment(destination_home, monkeypatch)
+    incomplete = CliRunner().invoke(
+        app,
+        ["bootstrap", str(source_repository), "--restore", "--no-install-deps"],
+    )
+    resumed = CliRunner().invoke(
+        app,
+        [
+            "bootstrap",
+            "--resume",
+            "--profile",
+            "base",
+            "--restore",
+            "--no-install-deps",
+        ],
+    )
+
+    assert incomplete.exit_code == 1
+    assert "--profile" in incomplete.output
+    assert resumed.exit_code == 0, resumed.output
+    assert (destination_home / ".bashrc").read_text() == "bash"
+    assert not (destination_home / ".gitconfig").exists()
 
 
 def test_sync_updates_last_modification_without_changing_creation(manager):

@@ -25,7 +25,6 @@ class Profile:
 @dataclass(frozen=True)
 class Activation:
     primary: str
-    complements: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -40,6 +39,7 @@ class ProfileResolution:
 class ProfileManager:
     RESERVED_NAMES = {"all", "none", "default"}
     NAME_PATTERN = re.compile(r"^[a-z0-9_-]+$")
+    SELECTION_KEY = "profile_selection_mode"
 
     def __init__(
         self,
@@ -171,6 +171,16 @@ class ProfileManager:
         excludes: list[str] | None = None,
     ) -> Profile:
         current = self.get(name)
+        resulting_targets = current.targets if targets is None else targets
+        resulting_excludes = current.excludes if excludes is None else excludes
+        overlap = {
+            item.strip().lower() for item in resulting_targets
+        } & {item.strip().lower() for item in resulting_excludes}
+        if overlap:
+            raise ValueError(
+                "Un target no puede agregarse y excluirse en el mismo perfil: "
+                + ", ".join(sorted(overlap))
+            )
         with self.database.connect() as connection:
             if description is not None:
                 connection.execute(
@@ -229,7 +239,7 @@ class ProfileManager:
     def delete(self, name: str) -> None:
         profile = self.get(name)
         active = self.activation()
-        if active and profile.name in {active.primary, *active.complements}:
+        if active and profile.name == active.primary:
             raise ValueError(
                 f"El perfil '{profile.name}' está activo; desactívelo antes de eliminarlo."
             )
@@ -283,6 +293,15 @@ class ProfileManager:
 
     def activation(self) -> Activation | None:
         with self.database.connect() as connection:
+            legacy = connection.execute(
+                "SELECT 1 FROM profile_activation_complements LIMIT 1"
+            ).fetchone()
+            if legacy:
+                raise ValueError(
+                    "La activación local usa el modelo anterior de complementos. "
+                    "Seleccione el perfil equivalente con concord profile use <nombre> "
+                    "o use concord profile use --all."
+                )
             row = connection.execute(
                 "SELECT primary_profile_id FROM profile_activation WHERE singleton = 1"
             ).fetchone()
@@ -294,65 +313,76 @@ class ProfileManager:
             if primary is None:
                 raise ValueError(
                     "La activación local referencia un perfil inexistente; corríjala con "
-                    "concord profile activate o concord profile deactivate --all."
+                    "concord profile use <nombre> o concord profile use --all."
                 )
-            complements = [
-                item
-                for item in connection.execute(
-                    "SELECT profile_id FROM profile_activation_complements ORDER BY position"
-                )
-            ]
-            complement_names = []
-            for (profile_id,) in complements:
-                item = connection.execute(
-                    "SELECT name FROM profiles WHERE id = ?", (profile_id,)
-                ).fetchone()
-                if item is None:
-                    raise ValueError(
-                        "La activación local contiene complementos inexistentes; "
-                        "corríjala con concord profile activate o concord profile deactivate --all."
-                    )
-                complement_names.append(item[0])
-        return Activation(primary[0], complement_names)
+        return Activation(primary[0])
 
     def _normalize_activation(
         self, primary: str, complements: list[str] | None = None
     ) -> Activation:
         complements = complements or []
+        if complements:
+            raise ValueError(
+                "La activación admite un único perfil. Componga perfiles mediante --include."
+            )
         primary_name = primary.strip().lower()
-        ordered = []
-        for name in complements:
-            normalized = name.strip().lower()
-            if normalized in ordered:
-                ordered.remove(normalized)
-            ordered.append(normalized)
-        if primary_name in ordered:
-            raise ValueError("El perfil principal no puede ser también un complemento.")
-        return Activation(primary_name, ordered)
+        return Activation(primary_name)
 
     def activate(self, primary: str, complements: list[str] | None = None) -> Activation:
         activation = self._normalize_activation(primary, complements)
         with self.database.connect() as connection:
             primary_id = self._id(connection, "profiles", activation.primary, "un perfil")
-            complement_ids = [
-                self._id(connection, "profiles", name, "un perfil")
-                for name in activation.complements
-            ]
             connection.execute("DELETE FROM profile_activation_complements")
             connection.execute("DELETE FROM profile_activation")
             connection.execute(
                 "INSERT INTO profile_activation VALUES (1, ?)", (primary_id,)
             )
-            connection.executemany(
-                "INSERT INTO profile_activation_complements VALUES (?, ?)",
-                [(profile_id, position) for position, profile_id in enumerate(complement_ids)],
+            connection.execute(
+                """
+                INSERT INTO local_settings (key, value) VALUES (?, 'profile')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (self.SELECTION_KEY,),
             )
         return self.activation()  # type: ignore[return-value]
 
-    def deactivate_all(self) -> None:
+    def use_all(self) -> None:
         with self.database.connect() as connection:
             connection.execute("DELETE FROM profile_activation_complements")
             connection.execute("DELETE FROM profile_activation")
+            connection.execute(
+                """
+                INSERT INTO local_settings (key, value) VALUES (?, 'all')
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                """,
+                (self.SELECTION_KEY,),
+            )
+
+    def deactivate_all(self) -> None:
+        """Alias compatible: selecciona explícitamente todos los targets."""
+        self.use_all()
+
+    def clear_selection(self) -> None:
+        with self.database.connect() as connection:
+            connection.execute("DELETE FROM profile_activation_complements")
+            connection.execute("DELETE FROM profile_activation")
+            connection.execute(
+                "DELETE FROM local_settings WHERE key = ?", (self.SELECTION_KEY,)
+            )
+
+    def selection_mode(self) -> str:
+        if self.activation() is not None:
+            return "profile"
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM local_settings WHERE key = ?", (self.SELECTION_KEY,)
+            ).fetchone()
+            profiles_exist = connection.execute(
+                "SELECT 1 FROM profiles LIMIT 1"
+            ).fetchone() is not None
+        if row and row[0] == "all":
+            return "all"
+        return "unset" if profiles_exist else "all"
 
     def deactivate(self, name: str, *, replace_with: str | None = None) -> Activation | None:
         active = self.activation()
@@ -360,21 +390,17 @@ class ProfileManager:
             return None
         normalized = name.strip().lower()
         if normalized == active.primary:
-            if replace_with is None:
-                raise ValueError("Indique el nuevo perfil principal con --replace-with o use --all.")
-            replacement = replace_with.strip().lower()
-            complements = [item for item in active.complements if item != replacement]
-            return self.activate(replacement, complements)
-        if normalized not in active.complements:
-            raise ValueError(f"El perfil '{normalized}' no está activo.")
-        return self.activate(active.primary, [item for item in active.complements if item != normalized])
+            if replace_with is not None:
+                return self.activate(replace_with)
+            self.use_all()
+            return None
+        raise ValueError(f"El perfil '{normalized}' no está activo.")
 
     def _apply_profile(
         self,
         connection,
         profile_id: str,
         ordered: dict[str, None],
-        protected: set[str],
         warnings: list[str],
         applied_exclusions: list[str],
         stack: list[str],
@@ -394,7 +420,7 @@ class ProfileManager:
         ]
         for included_id in included_ids:
             self._apply_profile(
-                connection, included_id, ordered, protected, warnings, applied_exclusions, stack
+                connection, included_id, ordered, warnings, applied_exclusions, stack
             )
         target_ids = [
             row[0]
@@ -416,11 +442,7 @@ class ProfileManager:
             target_name = connection.execute(
                 "SELECT name FROM targets WHERE id = ?", (target_id,)
             ).fetchone()[0]
-            if target_id in protected:
-                warnings.append(
-                    f"'{profile_name}' no puede excluir el target protegido '{target_name}'."
-                )
-            elif target_id in ordered:
+            if target_id in ordered:
                 del ordered[target_id]
                 if target_name not in applied_exclusions:
                     applied_exclusions.append(target_name)
@@ -434,7 +456,7 @@ class ProfileManager:
         activation = self.activation()
         if activation is None:
             return None
-        return self.resolve_activation(activation.primary, activation.complements)
+        return self.resolve_activation(activation.primary)
 
     def resolve_activation(
         self, primary: str, complements: list[str] | None = None
@@ -446,15 +468,8 @@ class ProfileManager:
             warnings: list[str] = []
             applied_exclusions: list[str] = []
             self._apply_profile(
-                connection, primary_id, ordered, set(), warnings, applied_exclusions, []
+                connection, primary_id, ordered, warnings, applied_exclusions, []
             )
-            protected = set(ordered)
-            for complement in activation.complements:
-                complement_id = self._id(connection, "profiles", complement, "un perfil")
-                self._apply_profile(
-                    connection, complement_id, ordered, protected, warnings,
-                    applied_exclusions, []
-                )
             names = []
             for target_id in ordered:
                 row = connection.execute(
@@ -464,7 +479,11 @@ class ProfileManager:
                     raise ValueError(f"La activación referencia un target inexistente: {target_id}.")
                 names.append(row[0])
         return ProfileResolution(
-            list(ordered), names, warnings, activation, applied_exclusions
+            list(ordered),
+            names,
+            warnings,
+            activation,
+            [name for name in applied_exclusions if name not in names],
         )
 
     def resolve(self, name: str) -> ProfileResolution:
@@ -474,39 +493,33 @@ class ProfileManager:
             warnings: list[str] = []
             applied_exclusions: list[str] = []
             self._apply_profile(
-                connection, profile.id, ordered, set(), warnings, applied_exclusions, []
+                connection, profile.id, ordered, warnings, applied_exclusions, []
             )
             names = [
                 connection.execute("SELECT name FROM targets WHERE id = ?", (target_id,)).fetchone()[0]
                 for target_id in ordered
             ]
         return ProfileResolution(
-            list(ordered), names, warnings, Activation(profile.name, []), applied_exclusions
+            list(ordered),
+            names,
+            warnings,
+            Activation(profile.name),
+            [name for name in applied_exclusions if name not in names],
         )
 
     def suggest(self, primary: str, complements: list[str] | None = None) -> Activation:
-        complements = complements or []
+        if complements:
+            raise ValueError(
+                "Solo puede sugerirse un perfil. Componga perfiles mediante --include."
+            )
         primary_name = primary.strip().lower()
-        ordered = []
-        for name in complements:
-            normalized = name.strip().lower()
-            if normalized in ordered:
-                ordered.remove(normalized)
-            ordered.append(normalized)
-        if primary_name in ordered:
-            raise ValueError("El perfil principal no puede ser también un complemento.")
         with self.database.connect() as connection:
             primary_id = self._id(connection, "profiles", primary_name, "un perfil")
-            ids = [self._id(connection, "profiles", name, "un perfil") for name in ordered]
             connection.execute("DELETE FROM profile_suggestion_complements")
             connection.execute("DELETE FROM profile_suggestion")
             connection.execute("INSERT INTO profile_suggestion VALUES (1, ?)", (primary_id,))
-            connection.executemany(
-                "INSERT INTO profile_suggestion_complements VALUES (?, ?)",
-                [(profile_id, position) for position, profile_id in enumerate(ids)],
-            )
             self._save_manifest(connection)
-        return Activation(primary_name, ordered)
+        return Activation(primary_name)
 
     def suggestion(self) -> Activation | None:
         with self.database.connect() as connection:
@@ -519,27 +532,17 @@ class ProfileManager:
             ).fetchone()
             if row is None:
                 return None
-            complements = [
-                item[0]
-                for item in connection.execute(
-                    """
-                    SELECT profiles.name FROM profile_suggestion_complements
-                    JOIN profiles ON profiles.id = profile_suggestion_complements.profile_id
-                    ORDER BY position
-                    """
-                )
-            ]
-        return Activation(row[0], complements)
+        return Activation(row[0])
 
     def suggestion_fingerprint(self) -> str | None:
         suggestion = self.suggestion()
         if suggestion is None:
             return None
-        value = json.dumps([suggestion.primary, suggestion.complements])
+        value = json.dumps(suggestion.primary)
         return hashlib.sha256(value.encode()).hexdigest()
 
     def should_offer_suggestion(self) -> bool:
-        if self.activation() is not None:
+        if self.selection_mode() != "unset":
             return False
         fingerprint = self.suggestion_fingerprint()
         if fingerprint is None:
@@ -562,6 +565,13 @@ class ProfileManager:
                 """,
                 (fingerprint,),
             )
+
+    def legacy_notice(self) -> str | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM local_settings WHERE key = 'legacy_profile_notice'"
+            ).fetchone()
+        return row[0] if row else None
 
     def apply_to_config(self, config: Config, *, connection=None) -> None:
         owns_connection = connection is None
@@ -623,9 +633,12 @@ class ProfileManager:
     def matches_config(self, config: Config) -> bool:
         local = Config(repository_path=config.repository_path)
         self.apply_to_config(local)
+        suggested = config.suggested_activation
+        if suggested is not None:
+            suggested = SuggestedActivationConfig(suggested.primary)
         return (
             local.profiles == config.profiles
-            and local.suggested_activation == config.suggested_activation
+            and local.suggested_activation == suggested
         )
 
     def _suggestion_from_connection(self, connection) -> SuggestedActivationConfig | None:
@@ -638,17 +651,7 @@ class ProfileManager:
         ).fetchone()
         if row is None:
             return None
-        complements = [
-            ManifestReference(item[0], item[1])
-            for item in connection.execute(
-                """
-                SELECT profiles.id, profiles.name FROM profile_suggestion_complements
-                JOIN profiles ON profiles.id = profile_suggestion_complements.profile_id
-                ORDER BY position
-                """
-            )
-        ]
-        return SuggestedActivationConfig(ManifestReference(row[0], row[1]), complements)
+        return SuggestedActivationConfig(ManifestReference(row[0], row[1]))
 
     def import_config(self, config: Config, *, connection=None) -> None:
         owns_connection = connection is None
@@ -703,19 +706,24 @@ class ProfileManager:
                 )
             connection.execute("DELETE FROM profile_suggestion_complements")
             connection.execute("DELETE FROM profile_suggestion")
+            connection.execute(
+                "DELETE FROM local_settings WHERE key = 'legacy_profile_notice'"
+            )
             if config.suggested_activation:
                 primary_id = config.suggested_activation.primary.id
                 if primary_id not in profile_ids:
                     raise ValueError("La activación sugerida referencia un perfil inexistente.")
-                connection.execute("INSERT INTO profile_suggestion VALUES (1, ?)", (primary_id,))
-                connection.executemany(
-                    "INSERT INTO profile_suggestion_complements VALUES (?, ?)",
-                    [
-                        (reference.id, position)
-                        for position, reference in enumerate(
-                            config.suggested_activation.complements
-                        )
-                    ],
+                if config.suggested_activation.complements:
+                    connection.execute(
+                        "INSERT INTO local_settings (key, value) VALUES ('legacy_profile_notice', ?)"
+                        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                        (
+                            "La sugerencia anterior combinaba perfiles. Elija explícitamente "
+                            "el perfil compuesto que debe usar este equipo.",
+                        ),
+                    )
+                connection.execute(
+                    "INSERT INTO profile_suggestion VALUES (1, ?)", (primary_id,)
                 )
             self._validate_graph(connection)
         finally:

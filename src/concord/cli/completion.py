@@ -76,6 +76,18 @@ def complete_removable_targets(incomplete: str) -> list[tuple[str, str]]:
     return _complete(incomplete, include_concord=False)
 
 
+def complete_profiles(incomplete: str) -> list[tuple[str, str]]:
+    try:
+        profiles = ConfigManager().load().profiles
+    except Exception:
+        return []
+    return [
+        (profile.name, profile.description)
+        for profile in profiles
+        if profile.name.startswith(incomplete)
+    ]
+
+
 def complete_editables(incomplete: str) -> list[tuple[str, str]]:
     targets = registered_targets()
     if not targets:
