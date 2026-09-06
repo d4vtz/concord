@@ -2,6 +2,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 @dataclass(frozen=True)
@@ -194,9 +195,27 @@ class GitManager:
         result = self._run("remote", "get-url", name, check=False)
         return result.stdout.strip() or None if result.returncode == 0 else None
 
+    @staticmethod
+    def preferred_remote_url(url: str) -> str:
+        """Prefiere SSH para repositorios github.com y conserva otros remotos."""
+        normalized = url.strip()
+        parsed = urlparse(normalized)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+            "github.com",
+            "www.github.com",
+        }:
+            return normalized
+        parts = [part for part in parsed.path.split("/") if part]
+        if len(parts) != 2:
+            return normalized
+        owner, repository = parts
+        if not repository.endswith(".git"):
+            repository += ".git"
+        return f"git@github.com:{owner}/{repository}"
+
     def set_remote(self, url: str, name: str = "origin") -> None:
         action = "set-url" if self.has_remote(name) else "add"
-        self._run("remote", action, name, url)
+        self._run("remote", action, name, self.preferred_remote_url(url))
 
     def remove_remote(self, name: str = "origin") -> None:
         if not self.has_remote(name):
@@ -285,4 +304,6 @@ class GitManager:
         )
         if result.returncode:
             raise ValueError(result.stderr.strip() or "No fue posible crear el repositorio en GitHub.")
-        return self.remote_url() or result.stdout.strip()
+        remote_url = self.remote_url() or result.stdout.strip()
+        self.set_remote(remote_url)
+        return self.remote_url() or self.preferred_remote_url(remote_url)

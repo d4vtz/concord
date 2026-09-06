@@ -563,6 +563,14 @@ concord repo init               # inicializa o repara Git
 `concord status` también muestra la rama, remoto, último commit y divergencia
 con el upstream. Solo `--fetch` consulta la red.
 
+Cuando el remoto pertenece a GitHub, Concord convierte automáticamente las
+URLs HTTPS a SSH (`git@github.com:usuario/repositorio.git`). Los remotos de
+otros servicios se conservan sin cambios. Puedes comprobarlo con:
+
+```bash
+concord repo remote
+```
+
 ## Diagnóstico
 
 Antes de probar o después de migrar una instalación, ejecuta:
@@ -580,6 +588,14 @@ El diagnóstico es de solo lectura y comprueba:
 - Instalación, identidad, rama y estado de Git.
 - Configuración del remoto y seguimiento de la rama.
 - Presencia de GitHub CLI y posibles archivos sensibles.
+
+Las comprobaciones de rutas locales, sincronización y paquetes se limitan al
+perfil activo. Las validaciones estructurales siguen cubriendo todo el
+manifiesto. Para revisar todos los targets explícitamente:
+
+```bash
+concord doctor --all
+```
 
 Por defecto no consulta la red. Para actualizar primero las referencias remotas:
 

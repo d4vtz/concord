@@ -1065,6 +1065,27 @@ def test_target_completion_reads_manifest_and_includes_paths(manager):
     assert complete_targets("missing") == []
 
 
+def test_github_remotes_prefer_ssh_and_other_hosts_are_preserved(tmp_path):
+    repository = tmp_path / "repository"
+    git = GitManager(repository)
+    git.initialize()
+
+    git.set_remote("https://github.com/d4vtz/dotfiles")
+    assert git.remote_url() == "git@github.com:d4vtz/dotfiles.git"
+
+    git.set_remote("https://gitlab.com/example/dotfiles.git")
+    assert git.remote_url() == "https://gitlab.com/example/dotfiles.git"
+
+
+def test_github_remote_normalization_accepts_existing_ssh_urls():
+    assert GitManager.preferred_remote_url("git@github.com:d4vtz/dotfiles.git") == (
+        "git@github.com:d4vtz/dotfiles.git"
+    )
+    assert GitManager.preferred_remote_url("https://github.com/d4vtz/dotfiles.git") == (
+        "git@github.com:d4vtz/dotfiles.git"
+    )
+
+
 def test_target_completion_falls_back_to_read_only_database(tmp_path, monkeypatch):
     from concord import application as concord
 
@@ -1417,6 +1438,7 @@ def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch
     result = CliRunner().invoke(app, ["doctor"])
     strict = CliRunner().invoke(app, ["doctor", "--strict"])
     timed = CliRunner().invoke(app, ["doctor", "--timings"])
+    all_scope = CliRunner().invoke(app, ["doctor", "--all"])
 
     assert result.exit_code == 0
     assert "Resumen del diagnóstico" in result.output
@@ -1427,6 +1449,7 @@ def test_doctor_command_returns_success_with_only_warnings(tmp_path, monkeypatch
     assert "Tiempos" in timed.output
     assert "Targets" in timed.output
     assert "Total" in timed.output
+    assert all_scope.exit_code == 0
 
 
 def test_reset_dry_run_and_reset_remove_only_concord_state(tmp_path, monkeypatch):

@@ -309,3 +309,39 @@ def test_doctor_warns_when_profile_selection_is_pending(profile_environment):
     check = next(item for item in report.checks if item.name == "Activación local")
 
     assert check.state == "warning"
+
+
+def test_doctor_scopes_local_checks_to_active_profile(profile_environment):
+    targets, profiles, add_target = profile_environment
+    active = add_target("active")
+    inactive = add_target("inactive")
+    profiles.create("base")
+    profiles.update("base", targets=["active"])
+    profiles.activate("base")
+    inactive.paths[0].local_path.unlink()
+
+    report = Doctor().run()
+    local_check = next(item for item in report.checks if item.name == "Rutas locales")
+    sync_check = next(item for item in report.checks if item.name == "Sincronización")
+
+    assert local_check.state == "pass"
+    assert "perfil activo 'base'" in local_check.message
+    assert sync_check.state == "pass"
+
+    all_report = Doctor().run(all_targets=True)
+    all_local = next(item for item in all_report.checks if item.name == "Rutas locales")
+    assert all_local.state == "warning"
+    assert "inactive" in all_local.message
+
+
+def test_doctor_reports_missing_active_route_as_out_of_sync(profile_environment):
+    targets, profiles, add_target = profile_environment
+    active = add_target("active")
+    profiles.create("base")
+    profiles.update("base", targets=["active"])
+    profiles.activate("base")
+    active.paths[0].local_path.unlink()
+
+    sync_check = next(item for item in Doctor().run().checks if item.name == "Sincronización")
+    assert sync_check.state == "warning"
+    assert "no coinciden" in sync_check.message

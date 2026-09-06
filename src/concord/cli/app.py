@@ -1599,6 +1599,11 @@ def render_git_status(git_status) -> None:
 @app.command()
 def doctor(
     fetch: bool = typer.Option(False, "--fetch", help="Comprueba también el estado remoto."),
+    all_targets: bool = typer.Option(
+        False,
+        "--all",
+        help="Comprueba el estado local de todos los targets, incluso los inactivos.",
+    ),
     strict: bool = typer.Option(False, "--strict", help="Trata las advertencias como errores."),
     timings: bool = typer.Option(
         False,
@@ -1608,7 +1613,7 @@ def doctor(
 ) -> None:
     """Diagnostica la instalación de Concord sin modificarla."""
     heading("DIAGNÓSTICO", "Comprobando que Concord está listo para trabajar")
-    report = Doctor().run(fetch=fetch)
+    report = Doctor().run(fetch=fetch, all_targets=all_targets)
     labels = {
         "pass": ("✓ Correcto", "#A3BE8C"),
         "warning": ("! Advertencia", "#EBCB8B"),
@@ -2058,6 +2063,7 @@ def bootstrap(
         )
         if clone.returncode:
             execute(lambda: (_ for _ in ()).throw(ValueError(clone.stderr.strip() or "No fue posible clonar.")))
+        GitManager(destination).set_remote(remote_url)
         config = execute(
             lambda: config_manager.load_from_repository(destination),
             hint="El repositorio debe contener el manifiesto administrado por Concord.",
@@ -2431,7 +2437,7 @@ def repo_remote_set(url: str, name: str = typer.Option("origin", "--name")) -> N
     """Crea o reemplaza el remoto configurado."""
     git, _ = execute(active_git, hint="Ejecuta primero: concord init")
     execute(lambda: git.set_remote(url, name))
-    success(f"Remoto '{name}' configurado: {url}")
+    success(f"Remoto '{name}' configurado: {git.remote_url(name)}")
 
 
 @remote_app.command("remove")

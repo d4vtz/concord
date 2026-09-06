@@ -9,7 +9,9 @@ from time import perf_counter
 from concord import application as concord
 from concord.application.comparison import paths_equal
 from concord.application.config import CONCORD_TARGET, Config, ConfigManager
+from concord.application.database import Database
 from concord.application.git import GitManager
+from concord.application.profile_manager import ProfileManager
 
 
 @dataclass(frozen=True)
@@ -53,11 +55,20 @@ class DoctorReport:
         return sum(timing.seconds for timing in self.timings)
 
 
+@dataclass(frozen=True)
+class DoctorScope:
+    target_names: set[str] | None
+    label: str
+
+    def includes(self, target_name: str) -> bool:
+        return self.target_names is None or target_name in self.target_names
+
+
 class Doctor:
     def __init__(self, config_manager: ConfigManager | None = None) -> None:
         self.config_manager = config_manager or ConfigManager()
 
-    def run(self, *, fetch: bool = False) -> DoctorReport:
+    def run(self, *, fetch: bool = False, all_targets: bool = False) -> DoctorReport:
         checks: list[DoctorCheck] = []
         timings: list[DoctorTiming] = []
         config = self._timed(
@@ -69,15 +80,33 @@ class Doctor:
             return DoctorReport(checks, timings)
         self._timed(timings, "SQLite", lambda: self._database_checks(config, checks))
         self._timed(timings, "Perfiles", lambda: self._profile_checks(config, checks))
+        scope = self._operational_scope(all_targets=all_targets)
         self._timed(timings, "Secretos", lambda: self._secret_checks(config, checks))
         self._timed(
             timings,
             "Dependencias",
-            lambda: self._dependency_checks(config, checks),
+            lambda: self._dependency_checks(config, checks, scope),
         )
-        self._timed(timings, "Targets", lambda: self._target_checks(config, checks))
+        self._timed(timings, "Targets", lambda: self._target_checks(config, checks, scope))
         self._timed(timings, "Git", lambda: self._git_checks(config, checks, fetch=fetch))
         return DoctorReport(checks, timings)
+
+    def _operational_scope(self, *, all_targets: bool) -> DoctorScope:
+        if all_targets:
+            return DoctorScope(None, "todos los targets")
+        try:
+            profile_manager = ProfileManager(Database(), self.config_manager)
+            if profile_manager.selection_mode() == "all":
+                return DoctorScope(None, "todos los targets")
+            resolution = profile_manager.resolve_active()
+            if resolution is not None:
+                return DoctorScope(
+                    set(resolution.target_names),
+                    f"perfil activo '{resolution.activation.primary}'",
+                )
+        except (KeyError, OSError, sqlite3.Error, ValueError):
+            pass
+        return DoctorScope(set(), "sin selección activa válida")
 
     def _timed(self, timings: list[DoctorTiming], name: str, operation):
         started = perf_counter()
@@ -324,7 +353,12 @@ class Doctor:
                 "Ejecuta: concord import --replace",
             )
 
-    def _dependency_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
+    def _dependency_checks(
+        self,
+        config: Config,
+        checks: list[DoctorCheck],
+        scope: DoctorScope,
+    ) -> None:
         grouped: dict[str, dict[str, object]] = {}
         conflicts: list[str] = []
         invalid: list[str] = []
@@ -377,6 +411,19 @@ class Doctor:
             "pass",
             f"{len(grouped)} paquete(s) únicos declarados.",
         )
+        selected_grouped: dict[str, dict[str, object]] = {}
+        for target in config.targets:
+            if not scope.includes(target.name):
+                continue
+            for dependency in target.dependencies:
+                current = selected_grouped.get(dependency.package)
+                if current is None:
+                    current = {
+                        "manager": dependency.manager,
+                        "optional": dependency.optional,
+                    }
+                    selected_grouped[dependency.package] = current
+                current["optional"] = bool(current["optional"]) and dependency.optional
         pacman = shutil.which("pacman")
         if pacman is None:
             self._add(
@@ -395,7 +442,9 @@ class Doctor:
             "pass",
             pacman,
         )
-        aur_declared = any(item["manager"] == "aur" for item in grouped.values())
+        aur_declared = any(
+            item["manager"] == "aur" for item in selected_grouped.values()
+        )
         if aur_declared:
             available = [helper for helper in ("paru", "yay") if shutil.which(helper)]
             configured = None
@@ -435,7 +484,24 @@ class Doctor:
                     "No se encontró paru ni yay.",
                     "Prepáralo con: concord deps helper install",
                 )
-        packages = sorted(grouped)
+        packages = sorted(selected_grouped)
+        if not packages:
+            scope_name = scope.label.capitalize()
+            self._add(
+                checks,
+                "Dependencias",
+                "Obligatorias",
+                "pass",
+                f"{scope_name} no declara paquetes obligatorios.",
+            )
+            self._add(
+                checks,
+                "Dependencias",
+                "Opcionales",
+                "pass",
+                f"{scope_name} no declara paquetes opcionales.",
+            )
+            return
         try:
             result = subprocess.run(
                 [pacman, "-T", *packages],
@@ -466,17 +532,17 @@ class Doctor:
         missing = {
             package
             for package in result.stdout.splitlines()
-            if package in grouped
+            if package in selected_grouped
         }
         missing_required = sorted(
             package
             for package in missing
-            if not bool(grouped[package]["optional"])
+            if not bool(selected_grouped[package]["optional"])
         )
         missing_optional = sorted(
             package
             for package in missing
-            if bool(grouped[package]["optional"])
+            if bool(selected_grouped[package]["optional"])
         )
         if missing_required:
             self._add(
@@ -484,7 +550,7 @@ class Doctor:
                 "Dependencias",
                 "Obligatorias",
                 "warning",
-                f"Faltan: {', '.join(missing_required)}.",
+                f"Faltan en {scope.label}: {', '.join(missing_required)}.",
                 "Instálalas con concord deps install o concord profile deps install.",
             )
         else:
@@ -507,7 +573,12 @@ class Doctor:
             ),
         )
 
-    def _target_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
+    def _target_checks(
+        self,
+        config: Config,
+        checks: list[DoctorCheck],
+        scope: DoctorScope,
+    ) -> None:
         missing_local: list[str] = []
         missing_copy: list[str] = []
         modified: list[str] = []
@@ -532,10 +603,12 @@ class Doctor:
                 label = f"{target.name}:{path.relative_path}"
                 local_exists = os.path.lexists(local)
                 stored_exists = os.path.lexists(stored)
-                if not local_exists:
-                    missing_local.append(label)
                 if not stored_exists:
                     missing_copy.append(label)
+                if not scope.includes(target.name):
+                    continue
+                if not local_exists:
+                    missing_local.append(label)
                 # Doctor no pide contraseñas. La estructura cifrada se valida en
                 # _secret_checks; comparar plaintext con .age siempre sería falso.
                 if (
@@ -558,23 +631,33 @@ class Doctor:
         if missing_local:
             self._add(
                 checks, "Targets", "Rutas locales", "warning",
-                f"No existen: {', '.join(missing_local)}.",
+                f"No existen en {scope.label}: {', '.join(missing_local)}.",
                 "Revísalas con concord status o usa concord restore."
             )
         else:
             self._add(
                 checks, "Targets", "Rutas locales", "pass",
-                "Todos los targets existen en HOME."
+                f"Todas las rutas de {scope.label} existen en HOME."
             )
         if modified:
             self._add(
                 checks, "Targets", "Sincronización", "warning",
-                f"Cambios locales en: {', '.join(modified)}.", "Revísalos con: concord diff"
+                f"Cambios locales en {scope.label}: {', '.join(modified)}.",
+                "Revísalos con: concord diff"
+            )
+        elif missing_local:
+            self._add(
+                checks,
+                "Targets",
+                "Sincronización",
+                "warning",
+                f"Faltan rutas locales en {scope.label}; HOME y el repositorio no coinciden.",
+                "Restaura los targets indicados o retíralos del perfil activo.",
             )
         elif not missing_copy:
             self._add(
                 checks, "Targets", "Sincronización", "pass",
-                "HOME y el repositorio coinciden."
+                f"HOME y el repositorio coinciden para {scope.label}."
             )
 
     def _secret_checks(self, config: Config, checks: list[DoctorCheck]) -> None:
