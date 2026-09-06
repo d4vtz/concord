@@ -651,6 +651,12 @@ class TargetManager:
                         if os.path.lexists(temporary):
                             self._remove_local(temporary)
                         temporaries.append(temporary)
+                    # El destino puede pertenecer a un directorio aún inexistente
+                    # (por ejemplo ~/.ssh en un equipo recién configurado). Tanto
+                    # los descifrados como las copias normales se escriben primero
+                    # en `desired`, por lo que su padre debe existir antes de
+                    # preparar la restauración atómica.
+                    desired.parent.mkdir(parents=True, exist_ok=True)
                     if self.secret_manager.for_target(target.id):
                         self.secret_manager.stage_restore_path(target, path, source, desired)
                     else:
